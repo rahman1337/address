@@ -1,51 +1,96 @@
 #!/usr/bin/env python3
-import secrets
-import hashlib
-import binascii
-import argparse
-import time
-import sys
 
-# Try fast C-backed lib (coincurve). If not present, fall back to ecdsa.
+# btc2.py - faster: use coincurve if present for ECC (private -> compressed pubkey)
+# Same behavior as previous: prints matches as WIF / ADDRESS and live progress.
+
+import os, time, sys, argparse, hashlib
 try:
     from coincurve import PublicKey
     HAVE_COINCURVE = True
 except Exception:
     HAVE_COINCURVE = False
-    import ecdsa
 
-# --- Base58 / Bech32 helpers ---
+# If coincurve not present, fall back to pure-Python EC (previous implementation).
+# We'll import that implementation only if needed to avoid overhead.
+if not HAVE_COINCURVE:
+    # lightweight pure-Python ECC functions (same as before)
+    # Put minimal implementation here (we import the same code from previous script)
+    P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+    N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    Gx = 55066263022277343669578718895168534326250603453777594175500187360389116729240
+    Gy = 3267051002075881697808308513050704318447127338065924327593890433575733741481
+
+    def modinv(a: int, p: int = P) -> int:
+        return pow(a, p - 2, p)
+
+    def ec_point_add(x1, y1, x2, y2):
+        if x1 is None:
+            return x2, y2
+        if x2 is None:
+            return x1, y1
+        if x1 == x2 and (y1 + y2) % P == 0:
+            return None, None
+        if x1 == x2 and y1 == y2:
+            lam = (3 * x1 * x1) * modinv(2 * y1, P) % P
+        else:
+            lam = (y2 - y1) * modinv(x2 - x1, P) % P
+        x3 = (lam * lam - x1 - x2) % P
+        y3 = (lam * (x1 - x3) - y1) % P
+        return x3, y3
+
+    def ec_point_mul(k: int, x: int = Gx, y: int = Gy):
+        k = k % N
+        if k == 0:
+            return None, None
+        rx = None
+        ry = None
+        px, py = x, y
+        while k:
+            if k & 1:
+                rx, ry = ec_point_add(rx, ry, px, py)
+            px, py = ec_point_add(px, py, px, py)
+            k >>= 1
+        return rx, ry
+
+# BASE58 / BECH32 constants (same as before)
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+BECH32_GEN = [0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3]
 
-# small micro-optimizations: localize frequently used functions later
-def hash160(data):
-    return hashlib.new('ripemd160', hashlib.sha256(data).digest()).digest()
+def sha256(b: bytes) -> bytes:
+    return hashlib.sha256(b).digest()
 
-def base58check(data):
-    # faster integer conversion + reuse locals
-    checksum = hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4]
+def ripemd160(b: bytes) -> bytes:
+    h = hashlib.new("ripemd160")
+    h.update(b)
+    return h.digest()
+
+def hash160(b: bytes) -> bytes:
+    return ripemd160(sha256(b))
+
+def int_to_bytes(i: int, length: int) -> bytes:
+    return i.to_bytes(length, "big")
+
+def bytes_to_int(b: bytes) -> int:
+    return int.from_bytes(b, "big")
+
+def base58check(data: bytes) -> str:
+    checksum = sha256(sha256(data))[:4]
     data_cs = data + checksum
-    num = int.from_bytes(data_cs, 'big')
-    res = []
-    alphabet = BASE58_ALPHABET
+    num = int.from_bytes(data_cs, "big")
+    res_chars = []
     while num > 0:
         num, mod = divmod(num, 58)
-        res.append(alphabet[mod])
-    res = ''.join(reversed(res))
-    # preserve leading zeros (0x00 bytes)
+        res_chars.append(BASE58_ALPHABET[mod])
+    res = ''.join(reversed(res_chars))
     n_pad = len(data) - len(data.lstrip(b'\0'))
     if n_pad:
         return '1' * n_pad + res
     return res
 
-def encode_bech32(hrp, witver, witprog):
-    # keep as-is but micro-optimized locals
+def encode_bech32(hrp: str, witver: int, witprog: bytes) -> str:
     def convertbits(data, frombits, tobits, pad=True):
-        acc = 0
-        bits = 0
-        ret = []
-        maxv = (1 << tobits) - 1
+        acc = 0; bits = 0; ret = []; maxv = (1 << tobits) - 1
         for b in data:
             acc = (acc << frombits) | b
             bits += frombits
@@ -55,153 +100,137 @@ def encode_bech32(hrp, witver, witprog):
         if pad and bits:
             ret.append((acc << (tobits - bits)) & maxv)
         return ret
-
     def polymod(values):
-        GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
         chk = 1
         for v in values:
             top = chk >> 25
             chk = ((chk & 0x1ffffff) << 5) ^ v
             for i in range(5):
                 if (top >> i) & 1:
-                    chk ^= GEN[i]
+                    chk ^= BECH32_GEN[i]
         return chk
-
     def hrp_expand(hrp):
         return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
-
     def create_checksum(hrp, data):
         values = hrp_expand(hrp) + data + [0] * 6
-        polymod_result = polymod(values) ^ 1
-        return [(polymod_result >> 5 * (5 - i)) & 31 for i in range(6)]
-
+        pm = polymod(values) ^ 1
+        return [(pm >> (5 * (5 - i))) & 31 for i in range(6)]
     data = [witver] + convertbits(witprog, 8, 5)
-    combined = data + create_checksum(hrp, data)
+    checksum = create_checksum(hrp, data)
+    combined = data + checksum
     return hrp + "1" + ''.join([BECH32_CHARSET[d] for d in combined])
 
-# --- Address generation (two implementations) ---
+def p2pkh_from_pub(pub_compressed: bytes) -> str:
+    return base58check(b'\x00' + hash160(pub_compressed))
 
-def generate_addresses_coincurve(priv_bytes, hrp="bc"):
-    # fast path using coincurve (libsecp256k1)
-    # pub compressed: 33 bytes
-    pub = PublicKey.from_valid_secret(priv_bytes).format(compressed=True)
-    h160 = hash160(pub)
+def p2wpkh_from_pub(pub_compressed: bytes, hrp="bc") -> str:
+    return encode_bech32(hrp, 0, hash160(pub_compressed))
 
-    # P2PKH
-    addr_p2pkh = base58check(b'\x00' + h160)
-    # P2SH-P2WPKH: redeem script is 0x00 0x14 <h160>; P2SH address uses HASH160(redeem)
-    redeem = b'\x00\x14' + h160
-    addr_p2sh = base58check(b'\x05' + hash160(redeem))
-    # Bech32
-    addr_bech32 = encode_bech32(hrp, 0, h160)
-    # WIF compressed
-    wif = base58check(b'\x80' + priv_bytes + b'\x01')
-    return wif, addr_p2pkh, addr_p2sh, addr_bech32
+def p2wpkh_in_p2sh_from_pub(pub_compressed: bytes) -> str:
+    redeem = b'\x00\x14' + hash160(pub_compressed)
+    return base58check(b'\x05' + hash160(redeem))
 
-# Optimized pure-Python fallback using ecdsa with reduced overhead
-def generate_addresses_ecdsa(priv_bytes, hrp="bc"):
-    sk = ecdsa.SigningKey.from_string(priv_bytes, curve=ecdsa.SECP256k1)
-    vk = sk.verifying_key
-    vs = vk.to_string()
-    # compressed pubkey: choose prefix based on last byte's parity
-    prefix = b'\x02' if (vs[32] & 1) == 0 else b'\x03'
-    pub_compressed = prefix + vs[:32]
-    h160 = hash160(pub_compressed)
+def wif_from_priv(priv_bytes: bytes) -> str:
+    return base58check(b'\x80' + priv_bytes + b'\x01')
 
-    addr_p2pkh = base58check(b'\x00' + h160)
-    redeem = b'\x00\x14' + h160
-    addr_p2sh = base58check(b'\x05' + hash160(redeem))
-    addr_bech32 = encode_bech32(hrp, 0, h160)
-    wif = base58check(b'\x80' + priv_bytes + b'\x01')
-    return wif, addr_p2pkh, addr_p2sh, addr_bech32
-
-def generate_addresses(priv_bytes, hrp="bc"):
+# derive compressed pubkey using coincurve if available, else fallback to Python EC
+def pubkey_compressed_from_priv_bytes(priv_bytes: bytes) -> bytes:
     if HAVE_COINCURVE:
-        return generate_addresses_coincurve(priv_bytes, hrp)
+        return PublicKey.from_valid_secret(priv_bytes).format(compressed=True)
     else:
-        return generate_addresses_ecdsa(priv_bytes, hrp)
+        priv_int = bytes_to_int(priv_bytes)
+        x, y = ec_point_mul(priv_int)
+        prefix = b'\x02' if (y & 1) == 0 else b'\x03'
+        return prefix + int_to_bytes(x, 32)
 
-# --- Targets loader ---
+# load targets (lowercased)
 def load_targets(paths):
-    targets = set()
+    targ = set()
     for path in paths:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip().lower()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("0x"):
-                    line = line[2:]
-                targets.add(line)
-    return targets
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    targ.add(s.lower())
+        except Exception as e:
+            print("Warning: failed to open", path, ":", e, file=sys.stderr)
+    return targ
 
-# --- Main loop (kept CLI unchanged; optimized inner loop) ---
 def main():
-    parser = argparse.ArgumentParser(description="Fast Bitcoin scanner (optimized)")
-    parser.add_argument("--file", "-f", nargs="+", required=True)
-    parser.add_argument("--report-every", "-r", type=int, default=1000)
-    parser.add_argument("--max", "-m", type=int, default=0)
-    parser.add_argument("--show-each", action="store_true")
-    parser.add_argument("--network", choices=["mainnet","testnet"], default="mainnet")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Random-key -> addresses; use coincurve if available")
+    p.add_argument("-f", "--file", nargs="+", required=True, help="target address file(s)")
+    p.add_argument("--report-interval", type=float, default=1.0, help="progress print interval (seconds)")
+    args = p.parse_args()
 
-    hrp = "bc" if args.network=="mainnet" else "tb"
     targets = load_targets(args.file)
     if not targets:
-        print("No valid addresses loaded.")
+        print("No valid addresses loaded. Provide -f btc*.txt")
         return
-    print(f"Loaded {len(targets):,} target addresses.\nStarting generation loop...")
+
+    print(f"Loaded {len(targets):,} target addresses. Using {'coincurve' if HAVE_COINCURVE else 'pure-Python EC fallback'}")
+    OUTFILE = "btc.txt"
 
     total = 0
     start = time.time()
-
-    # localize for speed
-    targ = targets
-    gen = generate_addresses
-    rpt = args.report_every
-    mx = args.max
+    last_report = start
+    last_total = 0
 
     try:
         while True:
+            # use os.urandom (slightly faster than secrets)
+            priv_bytes = os.urandom(32)
             total += 1
-            priv = secrets.token_bytes(32)
-            wif, p2pkh, p2sh, bc1 = gen(priv, hrp)
 
-            if args.show_each:
-                print(f"[{total}] WIF:{wif} P2PKH:{p2pkh} P2SH:{p2sh} Bech32:{bc1}")
+            # compressed pubkey via native coincurve (if available)
+            try:
+                pubc = pubkey_compressed_from_priv_bytes(priv_bytes)
+            except Exception:
+                continue
 
-            checks = (p2pkh.lower(), p2sh.lower(), bc1.lower())
-            # direct membership test against set
-            hit = checks[0] if checks[0] in targ else (checks[1] if checks[1] in targ else (checks[2] if checks[2] in targ else None))
-            if hit:
+            p2pkh = p2pkh_from_pub(pubc)
+            p2wpkh = p2wpkh_from_pub(pubc)
+            p2sh_nested = p2wpkh_in_p2sh_from_pub(pubc)
+            wif = wif_from_priv(priv_bytes)
+
+            found_addr = None
+            if p2pkh.lower() in targets:
+                found_addr = p2pkh
+            elif p2sh_nested.lower() in targets:
+                found_addr = p2sh_nested
+            elif p2wpkh.lower() in targets:
+                found_addr = p2wpkh
+
+            if found_addr:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
                 print("\n=== MATCH FOUND ===")
+                print(ts)
                 print("WIF")
                 print(wif)
                 print("ADDRESS")
-                print(hit)
+                print(found_addr)
                 print("===================\n")
+                try:
+                    with open(OUTFILE, "a", encoding="utf-8") as fo:
+                        fo.write(f"{ts}\nWIF:{wif}\nADDRESS:{found_addr}\n\n")
+                except Exception as e:
+                    print("Failed to append to", OUTFILE, ":", e, file=sys.stderr)
+
+            now = time.time()
+            if now - last_report >= args.report_interval:
+                elapsed = now - start
+                recent = total - last_total
+                avg = total / elapsed if elapsed > 0 else 0.0
+                sys.stdout.write(f"[{total:,} keys checked — {avg:,.1f} keys/s]".ljust(60) + "\r")
                 sys.stdout.flush()
-                return
-
-            if rpt > 0 and total % rpt == 0:
-                elapsed = time.time() - start
-                rate = total / elapsed if elapsed > 0 else 0
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Tried {total:,} keys — {rate:,.1f} keys/s (elapsed {int(elapsed)}s)")
-
-            if mx > 0 and total >= mx:
-                print(f"Reached max attempts ({mx}). Exiting.")
-                return
+                last_report = now
+                last_total = total
 
     except KeyboardInterrupt:
         elapsed = time.time() - start
-        print("\nInterrupted by user.")
-        print(f"Total tried: {total:,}")
-        if elapsed > 0:
-            print(f"Average speed: {total/elapsed:,.1f} keys/s")
+        avg = total / elapsed if elapsed > 0 else 0.0
+        print(f"\nStopped. Total: {total:,} keys in {elapsed:.1f}s ({avg:,.1f} keys/s)")
 
 if __name__ == "__main__":
-    if HAVE_COINCURVE:
-        print("Using coincurve (fast native secp256k1).")
-    else:
-        print("coincurve not found — using fallback ecdsa (slower).")
     main()
