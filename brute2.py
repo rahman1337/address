@@ -2,7 +2,7 @@
 # brute2.py
 # Modified from provided script for synchronous, iSH-friendly use.
 # Defaults: dictionary.txt, found.txt
-# Checks only balances (no 'received'). Uses blockchain.info, insight (bitpay), blockexplorer.
+# Checks only balances (no 'received'). Uses blockchair, blockstream, mempool.space
 
 from __future__ import annotations
 import io, sys, argparse, logging, time, binascii, hashlib, json, os, random
@@ -194,7 +194,8 @@ class BaseBlockExplorer(object):
     def open_session(self):
         logging.info("Opening new session")
         self.session = requests.Session()
-        # do not perform GET to base url (some providers block/limit)
+        # set a reasonable user-agent to avoid some blocks
+        self.session.headers.update({"User-Agent": "brute2/1.0 (+https://example)"})
         return
 
     def close_session(self):
@@ -208,25 +209,32 @@ class BaseBlockExplorer(object):
 
     def _get(self, url, timeout=15):
         r = self.session.get(url, timeout=timeout)
+        # if HTML return, raise to avoid mis-parsing
+        ctype = r.headers.get("Content-Type", "")
+        text = r.text.strip()
+        if "text/html" in ctype or (text.startswith("<!DOCTYPE") or text.startswith("<html")):
+            raise Exception("HTML response received (likely blocked or changed API): " + (text[:200] if len(text) < 200 else text[:200]))
         r.raise_for_status()
         return r
 
     def _parse_numeric_from_response(self, response):
         text = response.text.strip()
+        # try direct float/int
         try:
             return float(text)
         except Exception:
             pass
+        # try JSON
         try:
             j = response.json()
             # try common keys
-            for key in ("final_balance", "finalBalance", "balance", "balanceSat", "balance_satoshi", "received"):
+            for key in ("total_received", "totalReceived", "final_balance", "finalBalance", "balance", "balanceSat", "balance_satoshi", "received"):
                 v = None
                 if isinstance(j, dict):
                     v = j.get(key)
                 if v is not None:
                     return float(v)
-            # blockchair / nested formats
+            # blockchair format: {"data": { "ADDRESS": {"address": {"received": ...}}}}
             if isinstance(j, dict) and "data" in j:
                 try:
                     inner = next(iter(j["data"].values()))
@@ -256,86 +264,110 @@ class BaseBlockExplorer(object):
         num = self._parse_numeric_from_response(r)
         return num
 
-class BlockchainInfo(BaseBlockExplorer):
-    STRING_TYPE = "blockchaininfo"
+# --- New explorer implementations: Blockchair, Blockstream, Mempool.space ---
+
+class Blockchair(BaseBlockExplorer):
+    STRING_TYPE = "blockchair"
     def __init__(self):
         super().__init__()
-        self._api_limit_seconds = 1  # conservative: blockchain.info rate-limit behavior
-        self._base_url = "https://blockchain.info"
-        self._base_url_balance = "{}/q/addressbalance".format(self._base_url)
+        # blockchair dashboard endpoint
+        self._base_url = "https://api.blockchair.com/bitcoin"
+        self._base_url_balance = "{}/dashboards/address".format(self._base_url)
+        self._balance_suffix = ""  # complete url: /dashboards/address/{address}
 
     def get_balance(self, public_address):
-        time.sleep(self._api_limit_seconds)  # keep conservative delay
-        val = super().get_balance(public_address)
-        # blockchain.info returns satoshis
+        url = "{}/{}{}".format(self._base_url_balance, public_address, self._balance_suffix)
+        r = self._get(url)
         try:
-            if val > 1000000000:
-                return float(val) / 1e8
-            # If integer-like and >1 -> probably satoshis
-            if val > 1 and float(val).is_integer():
-                return float(val) / 1e8
-        except Exception:
-            pass
-        return float(val)
+            j = r.json()
+            # blockchair: j['data'][ADDRESS]['address']['balance'] (satoshis)
+            data = j.get("data", {})
+            if public_address in data:
+                addrobj = data[public_address].get("address", {})
+                # common keys
+                for k in ("balance", "balance_sat", "balance_satoshi"):
+                    if k in addrobj:
+                        return float(addrobj[k])
+                # fallback: maybe 'received' etc
+                for k in ("received","total_received"):
+                    if k in addrobj:
+                        return float(addrobj[k])
+            # fallback to generic parser
+            return self._parse_numeric_from_response(r)
+        except Exception as e:
+            raise
 
-class BlockExplorerCom(BaseBlockExplorer):
-    STRING_TYPE = "blockexplorercom"
+class Blockstream(BaseBlockExplorer):
+    STRING_TYPE = "blockstream"
     def __init__(self):
         super().__init__()
-        self._base_url = "https://blockexplorer.com"
-        self._base_url_balance = "{}/api/addr".format(self._base_url)
-        self._balance_suffix = "/balance"
+        self._base_url = "https://blockstream.info/api"
+        self._base_url_balance = "{}/address".format(self._base_url)  # /address/{address}
+        self._balance_suffix = ""  # we'll compute from chain_stats
 
     def get_balance(self, public_address):
-        val = super().get_balance(public_address)
-        # returns satoshis
+        url = "{}/{}{}".format(self._base_url_balance, public_address, self._balance_suffix)
+        r = self._get(url)
         try:
-            if val > 1000000000:
-                return float(val) / 1e8
-            if val > 1 and float(val).is_integer():
-                return float(val) / 1e8
+            j = r.json()
+            # blockstream returns chain_stats: funded_txo_sum, spent_txo_sum
+            cs = j.get("chain_stats", {})
+            funded = cs.get("funded_txo_sum")
+            spent = cs.get("spent_txo_sum")
+            if funded is not None and spent is not None:
+                bal = float(funded) - float(spent)  # satoshis
+                return bal
+            # fallback keys
+            for k in ("balance","balanceSat","balance_satoshi"):
+                if k in j:
+                    return float(j[k])
+            return self._parse_numeric_from_response(r)
         except Exception:
-            pass
-        return float(val)
+            return self._parse_numeric_from_response(r)
 
-class Insight(BaseBlockExplorer):
-    STRING_TYPE = "insight"
+class MempoolSpace(BaseBlockExplorer):
+    STRING_TYPE = "mempool"
     def __init__(self):
         super().__init__()
-        self._base_url = "https://insight.bitpay.com"
-        self._base_url_balance = "{}/api/addr".format(self._base_url)
-        self._balance_suffix = "/balance"
+        # Use public mempool.space API for BTC mainnet
+        self._base_url = "https://mempool.space"
+        self._base_url_balance = "{}/api/address".format(self._base_url)  # /api/address/{address}
+        self._balance_suffix = ""  # we'll compute from chain_stats
 
     def get_balance(self, public_address):
-        val = super().get_balance(public_address)
-        # returns satoshis
+        url = "{}/{}{}".format(self._base_url_balance, public_address, self._balance_suffix)
+        r = self._get(url)
         try:
-            if val > 1000000000:
-                return float(val) / 1e8
-            if val > 1 and float(val).is_integer():
-                return float(val) / 1e8
+            j = r.json()
+            cs = j.get("chain_stats", {})
+            funded = cs.get("funded_txo_sum")
+            spent = cs.get("spent_txo_sum")
+            if funded is not None and spent is not None:
+                bal = float(funded) - float(spent)
+                return bal
+            # fallback
+            return self._parse_numeric_from_response(r)
         except Exception:
-            pass
-        return float(val)
+            return self._parse_numeric_from_response(r)
 
 # ------------------ Helper to create explorers ------------------
 
 def create_explorer(kind):
     k = kind.lower().strip()
-    if k == 'blockchaininfo':
-        return BlockchainInfo()
-    if k == 'insight':
-        return Insight()
-    if k == 'blockexplorercom':
-        return BlockExplorerCom()
+    if k == 'blockchair':
+        return Blockchair()
+    if k == 'blockstream':
+        return Blockstream()
+    if k in ('mempool','mempoolspace'):
+        return MempoolSpace()
     raise ValueError("Unsupported explorer: " + kind)
 
 # ------------------ Main scanning CLI ------------------
 
 def main():
     parser = argparse.ArgumentParser(description='iSH-friendly bruteforce scanner (brute2).')
-    parser.add_argument('-t', '--types', default='blockchaininfo,insight,blockexplorercom',
-                        help='Comma list of explorers to use in order (default: blockchaininfo,insight,blockexplorercom)')
+    parser.add_argument('-t', '--types', default='blockchair,blockstream,mempool',
+                        help='Comma list of explorers to use in order (default: blockchair,blockstream,mempool)')
     parser.add_argument('-d', '--dict_file', default='dictionary.txt', help='Dictionary file (utf-8 lines). Default: dictionary.txt')
     parser.add_argument('-o', '--output_file', default='found.txt', help='Output CSV file. Default: found.txt')
     parser.add_argument('-k', '--is_private_key', action='store_true', help='Treat lines as private keys (hex or WIF)')
@@ -418,17 +450,12 @@ def main():
                 got_balance = None
                 while retry < max_retries:
                     try:
-                        # single balance call per explorer (conservative)
                         logging.debug("Query %s for %s (%s) attempt %d", ename, addr, atype, retry+1)
-                        # set timeout per call
-                        # monkey-patch explorer._get to pass timeout? Instead pass via session.get override in explorer._get
-                        # But our BaseBlockExplorer._get respects timeout param; call explorer.get_balance which calls that.
                         bal_raw = explorer.get_balance(addr)
                         # Convert heuristics (some explorers return sats)
-                        if bal_raw > 1000000000:
+                        if bal_raw > 1000000000:  # huge -> sats
                             bal = float(bal_raw) / 1e8
                         elif bal_raw > 1 and bal_raw < 1000000000:
-                            # integer-like probably sats
                             if float(bal_raw).is_integer():
                                 bal = float(bal_raw) / 1e8
                             else:
