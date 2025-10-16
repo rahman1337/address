@@ -14,7 +14,7 @@ except Exception:
 # ===== CONFIG =====
 REPORT_EVERY = 300         # per-worker status print interval
 BATCH_SIZE = 4             # mnemonics per inner loop
-OUTFILE = "btc_hits.txt"   # append matches here
+OUTFILE = "btc.txt"   # append matches here
 MNEMONIC_GEN = Mnemonic("english")
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
@@ -96,15 +96,13 @@ def load_targets(paths):
     return s
 
 # ===== WORKER =====
-def worker(proc_id, targets, counter, stop_event):
+def worker(proc_id, targets):
     hrp="bc"
     total=0
     start=time.time()
-    while not stop_event.is_set():
+    while True:
         for _ in range(BATCH_SIZE):
             total += 1
-            with counter.get_lock():
-                counter.value += 1
             mnemonic = MNEMONIC_GEN.generate(strength=128)
             seed = hashlib.pbkdf2_hmac("sha512", mnemonic.encode(), b"mnemonic", 2048)
             priv = seed[:32]
@@ -128,21 +126,15 @@ def worker(proc_id, targets, counter, stop_event):
             rate = total / (time.time() - start) if (time.time()-start)>0 else 0.0
             print(f"[Worker {proc_id}] {total:,} mnemonics tried — {rate:,.1f}/s")
 
-# ===== MONITOR (GLOBAL SPEED) =====
-def monitor(counter, start, stop_event):
-    last_count = 0
-    while not stop_event.is_set():
-        time.sleep(5)
-        elapsed = time.time() - start
-        total = counter.value
-        diff = total - last_count
-        speed = diff / 5.0
-        avg = total / elapsed if elapsed>0 else 0.0
-        print(f"\033[93m[GLOBAL] {total:,} total — {speed:,.1f}/s (avg {avg:,.1f}/s)\033[0m")
-        last_count = total
-
 # ===== MAIN =====
 def main():
+    # Ensure spawn start method for iSH compatibility
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        # already set
+        pass
+
     p=argparse.ArgumentParser(description="Mnemonic BTC address scanner (multi-worker, continuous)")
     p.add_argument("-f","--file",nargs="+",required=True,help="target btc*.txt files (shell usually expands glob)")
     p.add_argument("--workers","-w",type=int,default=None,help="override number of worker processes")
@@ -158,47 +150,31 @@ def main():
     # determine CPU/worker count; user override allowed
     cpu = args.workers if args.workers and args.workers>0 else max(1, os.cpu_count() or 1)
 
-    # iSH-specific: if running in iSH (Alpine on iOS), default to 1 worker for stability
-    try:
-        if "ALPINE" in os.uname().version and cpu > 1:
-            # keep it, but let user override with -w
-            pass
-    except Exception:
-        pass
-
     print(f"Launching {cpu} worker(s)...\n")
 
-    manager = multiprocessing.Manager()
-    stop_event = manager.Event()
-
-    # shared counter (atomic via get_lock)
-    counter = multiprocessing.Value("i", 0)
-
-    start = time.time()
-
-    # start monitor
-    mon = multiprocessing.Process(target=monitor, args=(counter, start, stop_event))
-    mon.daemon = True
-    mon.start()
-
-    # start workers
     procs = []
     for i in range(cpu):
-        p = multiprocessing.Process(target=worker, args=(i, targets, counter, stop_event))
+        p = multiprocessing.Process(target=worker, args=(i, targets))
         p.daemon = True
         p.start()
         procs.append(p)
 
     def handle_sigint(signum, frame):
         print("\nShutting down...")
-        stop_event.set()
         for p in procs:
-            p.terminate()
-        mon.terminate()
+            try:
+                p.terminate()
+            except Exception:
+                pass
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_sigint)
-    signal.pause()  # wait here until SIGINT
+    # keep main process alive while workers run
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        handle_sigint(None, None)
 
 if __name__=="__main__":
     main()
