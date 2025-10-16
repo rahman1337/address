@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # brute2.py
-# Modified from provided script for synchronous, iSH-friendly use.
-# Defaults: dictionary.txt, found.txt
-# Checks only balances (no 'received'). Uses blockchair, blockstream, mempool.space
+# Synchronous, iSH-friendly bruteforce scanner.
+# Uses Blockstream + Mempool.space (Blockstream tried first; if it fails once, immediately try Mempool; if both fail, enter retries).
 
 from __future__ import annotations
 import io, sys, argparse, logging, time, binascii, hashlib, json, os, random
@@ -213,7 +212,7 @@ class BaseBlockExplorer(object):
         ctype = r.headers.get("Content-Type", "")
         text = r.text.strip()
         if "text/html" in ctype or (text.startswith("<!DOCTYPE") or text.startswith("<html")):
-            raise Exception("HTML response received (likely blocked or changed API): " + (text[:200] if len(text) < 200 else text[:200]))
+            raise requests.exceptions.HTTPError("HTML response received (likely blocked or changed API)", response=r)
         r.raise_for_status()
         return r
 
@@ -234,7 +233,7 @@ class BaseBlockExplorer(object):
                     v = j.get(key)
                 if v is not None:
                     return float(v)
-            # blockchair format: {"data": { "ADDRESS": {"address": {"received": ...}}}}
+            # blockchair-like format: {"data": { "ADDRESS": {"address": {"received": ...}}}}
             if isinstance(j, dict) and "data" in j:
                 try:
                     inner = next(iter(j["data"].values()))
@@ -247,7 +246,7 @@ class BaseBlockExplorer(object):
                     pass
         except Exception:
             pass
-        # fallback: if it's just a number-like string inside text
+        # fallback: extract digits/dot
         try:
             num = ''.join(ch for ch in text if (ch.isdigit() or ch in "."))
             if num:
@@ -264,38 +263,7 @@ class BaseBlockExplorer(object):
         num = self._parse_numeric_from_response(r)
         return num
 
-# --- New explorer implementations: Blockchair, Blockstream, Mempool.space ---
-
-class Blockchair(BaseBlockExplorer):
-    STRING_TYPE = "blockchair"
-    def __init__(self):
-        super().__init__()
-        # blockchair dashboard endpoint
-        self._base_url = "https://api.blockchair.com/bitcoin"
-        self._base_url_balance = "{}/dashboards/address".format(self._base_url)
-        self._balance_suffix = ""  # complete url: /dashboards/address/{address}
-
-    def get_balance(self, public_address):
-        url = "{}/{}{}".format(self._base_url_balance, public_address, self._balance_suffix)
-        r = self._get(url)
-        try:
-            j = r.json()
-            # blockchair: j['data'][ADDRESS]['address']['balance'] (satoshis)
-            data = j.get("data", {})
-            if public_address in data:
-                addrobj = data[public_address].get("address", {})
-                # common keys
-                for k in ("balance", "balance_sat", "balance_satoshi"):
-                    if k in addrobj:
-                        return float(addrobj[k])
-                # fallback: maybe 'received' etc
-                for k in ("received","total_received"):
-                    if k in addrobj:
-                        return float(addrobj[k])
-            # fallback to generic parser
-            return self._parse_numeric_from_response(r)
-        except Exception as e:
-            raise
+# --- Blockstream and Mempool.space implementations ---
 
 class Blockstream(BaseBlockExplorer):
     STRING_TYPE = "blockstream"
@@ -303,24 +271,18 @@ class Blockstream(BaseBlockExplorer):
         super().__init__()
         self._base_url = "https://blockstream.info/api"
         self._base_url_balance = "{}/address".format(self._base_url)  # /address/{address}
-        self._balance_suffix = ""  # we'll compute from chain_stats
 
     def get_balance(self, public_address):
-        url = "{}/{}{}".format(self._base_url_balance, public_address, self._balance_suffix)
+        url = "{}/{}".format(self._base_url_balance, public_address)
         r = self._get(url)
         try:
             j = r.json()
-            # blockstream returns chain_stats: funded_txo_sum, spent_txo_sum
             cs = j.get("chain_stats", {})
             funded = cs.get("funded_txo_sum")
             spent = cs.get("spent_txo_sum")
             if funded is not None and spent is not None:
-                bal = float(funded) - float(spent)  # satoshis
-                return bal
-            # fallback keys
-            for k in ("balance","balanceSat","balance_satoshi"):
-                if k in j:
-                    return float(j[k])
+                return float(funded) - float(spent)  # satoshis
+            # fallback
             return self._parse_numeric_from_response(r)
         except Exception:
             return self._parse_numeric_from_response(r)
@@ -329,13 +291,11 @@ class MempoolSpace(BaseBlockExplorer):
     STRING_TYPE = "mempool"
     def __init__(self):
         super().__init__()
-        # Use public mempool.space API for BTC mainnet
         self._base_url = "https://mempool.space"
         self._base_url_balance = "{}/api/address".format(self._base_url)  # /api/address/{address}
-        self._balance_suffix = ""  # we'll compute from chain_stats
 
     def get_balance(self, public_address):
-        url = "{}/{}{}".format(self._base_url_balance, public_address, self._balance_suffix)
+        url = "{}/{}".format(self._base_url_balance, public_address)
         r = self._get(url)
         try:
             j = r.json()
@@ -343,9 +303,7 @@ class MempoolSpace(BaseBlockExplorer):
             funded = cs.get("funded_txo_sum")
             spent = cs.get("spent_txo_sum")
             if funded is not None and spent is not None:
-                bal = float(funded) - float(spent)
-                return bal
-            # fallback
+                return float(funded) - float(spent)
             return self._parse_numeric_from_response(r)
         except Exception:
             return self._parse_numeric_from_response(r)
@@ -354,11 +312,9 @@ class MempoolSpace(BaseBlockExplorer):
 
 def create_explorer(kind):
     k = kind.lower().strip()
-    if k == 'blockchair':
-        return Blockchair()
-    if k == 'blockstream':
+    if k.startswith('blockstream'):
         return Blockstream()
-    if k in ('mempool','mempoolspace'):
+    if k.startswith('mempool'):
         return MempoolSpace()
     raise ValueError("Unsupported explorer: " + kind)
 
@@ -366,15 +322,15 @@ def create_explorer(kind):
 
 def main():
     parser = argparse.ArgumentParser(description='iSH-friendly bruteforce scanner (brute2).')
-    parser.add_argument('-t', '--types', default='blockchair,blockstream,mempool',
-                        help='Comma list of explorers to use in order (default: blockchair,blockstream,mempool)')
+    parser.add_argument('-t', '--types', default='blockstream,mempool',
+                        help='Comma list of explorers to use in order (default: blockstream,mempool)')
     parser.add_argument('-d', '--dict_file', default='dictionary.txt', help='Dictionary file (utf-8 lines). Default: dictionary.txt')
     parser.add_argument('-o', '--output_file', default='found.txt', help='Output CSV file. Default: found.txt')
     parser.add_argument('-k', '--is_private_key', action='store_true', help='Treat lines as private keys (hex or WIF)')
     parser.add_argument('--sleep', type=float, default=0.05, help='sleep (s) between requests (default 0.05)')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     parser.add_argument('--max-retries', type=int, default=3, help='Max retries per request (default 3)')
-    parser.add_argument('--timeout', type=float, default=10.0, help='HTTP timeout seconds (default 10)')
+    parser.add_argument('--timeout', type=float, default=10.0, help='HTTP timeout seconds (default 10) - note: currently not passed to explorers explicitly')
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
@@ -387,7 +343,7 @@ def main():
         try:
             ex = create_explorer(name)
             ex.open_session()
-            explorers.append((name, ex))
+            explorers.append((name.lower(), ex))
             logging.info("Using explorer: %s", name)
         except Exception as e:
             logging.error("Failed to create/open explorer %s: %s", name, e)
@@ -431,7 +387,7 @@ def main():
             logging.warning("Failed to create wallet for '%s': %s", word, e)
             continue
 
-        # check each address family in priority order (we keep same default ordering as your old script)
+        # check each address family in priority order
         wanted_families = ['p2wpkh', 'p2sh-p2wpkh', 'p2pkh', 'p2tr']
         for atype in wanted_families:
             addr = wallet.addresses.get(atype)
@@ -439,68 +395,163 @@ def main():
                 logging.debug("address type %s not available for %s", atype, word)
                 continue
 
-            # For each explorer in order, attempt to get balance.
-            # We will not mark as unused lightly: if an explorer errors we retry with backoff up to max_retries.
-            # If any explorer returns balance>0 we record it immediately (and still attempt to write details).
+            # === BEGIN: New Blockstream-first then Mempool logic ===
+
             balance_found = 0.0
             explorer_success = False
-            for ename, explorer in explorers:
-                retry = 0
-                backoff = base_backoff
-                got_balance = None
-                while retry < max_retries:
-                    try:
-                        logging.debug("Query %s for %s (%s) attempt %d", ename, addr, atype, retry+1)
-                        bal_raw = explorer.get_balance(addr)
-                        # Convert heuristics (some explorers return sats)
-                        if bal_raw > 1000000000:  # huge -> sats
-                            bal = float(bal_raw) / 1e8
-                        elif bal_raw > 1 and bal_raw < 1000000000:
-                            if float(bal_raw).is_integer():
-                                bal = float(bal_raw) / 1e8
-                            else:
-                                bal = float(bal_raw)
-                        else:
-                            bal = float(bal_raw)
-                        got_balance = bal
-                        explorer_success = True
-                        logging.debug("Explorer %s returned balance %f for %s", ename, bal, addr)
-                        break
-                    except Exception as e:
-                        retry += 1
-                        sleep = min(max_backoff_sleep, backoff * (2 ** (retry-1)) * (0.5 + random.random()))
-                        logging.warning("Error fetching balance from %s for %s (%s): %s — retry %d/%d sleeping %.2fs",
-                                        ename, addr, atype, e, retry, max_retries, sleep)
-                        time.sleep(sleep)
-                # polite sleep between explorers to reduce rate-limit risk
-                time.sleep(args.sleep)
-                if got_balance is None:
-                    logging.debug("Explorer %s failed entirely for %s; continuing to next explorer", ename, addr)
-                    continue
-                # if any explorer reports > 0, accept as found.
+
+            # pick blockstream and mempool explorer instances if available
+            bs_ex = None
+            mp_ex = None
+            for ename, ex in explorers:
+                if ename.startswith("blockstream"):
+                    bs_ex = (ename, ex)
+                elif ename.startswith("mempool"):
+                    mp_ex = (ename, ex)
+
+            # helper to call an explorer once (may raise)
+            def try_once(ex_tuple):
+                ename_local, ex_local = ex_tuple
+                bal_raw_local = ex_local.get_balance(addr)  # may raise
+                # heuristics to convert sats->btc if needed
+                if bal_raw_local > 1000000000:
+                    bal_local = float(bal_raw_local) / 1e8
+                elif bal_raw_local > 1 and bal_raw_local < 1000000000:
+                    if float(bal_raw_local).is_integer():
+                        bal_local = float(bal_raw_local) / 1e8
+                    else:
+                        bal_local = float(bal_raw_local)
+                else:
+                    bal_local = float(bal_raw_local)
+                return bal_local
+
+            first_pass_bs_failed = False
+            first_pass_mp_failed = False
+            got_balance = None
+
+            # FIRST PASS: try Blockstream once (if present)
+            if bs_ex:
+                try:
+                    logging.debug("First-pass Query blockstream for %s (%s) attempt 1", addr, atype)
+                    bal = try_once(bs_ex)
+                    got_balance = bal
+                    explorer_success = True
+                    logging.debug("Blockstream returned balance %f for %s", bal, addr)
+                except Exception as e:
+                    first_pass_bs_failed = True
+                    logging.warning("Blockstream first-pass error for %s (%s): %s", addr, atype, e)
+
+            # If Blockstream failed (or not present), immediately try Mempool once
+            if got_balance is None and mp_ex:
+                try:
+                    logging.debug("First-pass Query mempool for %s (%s) attempt 1", addr, atype)
+                    bal = try_once(mp_ex)
+                    got_balance = bal
+                    explorer_success = True
+                    logging.debug("Mempool returned balance %f for %s", bal, addr)
+                except Exception as e:
+                    first_pass_mp_failed = True
+                    logging.warning("Mempool first-pass error for %s (%s): %s", addr, atype, e)
+
+            # If either returned (even 0.0) we have a result; process it
+            if got_balance is not None:
                 if got_balance > 0.0:
                     balance_found = got_balance
-                    # write out and print
                     out_line = "{word},{atype},{addr},{balance:.8f},{priv},{wif}".format(
                         word=word, atype=atype, addr=addr,
                         balance=balance_found, priv=wallet.private_key, wif=wallet.wif)
                     logging.info("FOUND: %s", out_line)
                     print("FOUND:", out_line)
                     fout.write(out_line + '\n'); fout.flush()
-                    # polite sleep after found
                     time.sleep(args.sleep)
-                    break  # stop checking other explorers for this address family
+                    # stop checking other explorers for this address family
+                    continue
                 else:
-                    # got zero from this explorer; continue to next explorer to be sure
-                    logging.debug("Explorer %s reported zero for %s", ename, addr)
+                    # got zero — treat as checked and continue to next address family
+                    logging.debug("Explorer reported zero balance for %s (%s)", addr, atype)
                     continue
 
-            # If we found a positive balance for this address family, optionally skip other families for this word.
-            # You asked "dont skip anything" but also "no skip unless sure". We will not skip other families automatically:
-            # keep checking remaining families (they could also have balance).
-            # (If you want to stop after first found for a word, uncomment the next two lines)
-            # if balance_found > 0.0:
-            #     break
+            # SECOND PHASE: both failed on first-pass (or neither present). perform retries (blockstream then mempool each retry)
+            if not bs_ex and not mp_ex:
+                logging.error("No blockstream or mempool explorer available to query for %s", addr)
+                continue
+
+            retry = 0
+            backoff = base_backoff
+            got_balance = None
+            while retry < max_retries:
+                retry += 1
+                # TRY blockstream (if present)
+                if bs_ex:
+                    try:
+                        logging.debug("Retry %d: Query blockstream for %s (%s)", retry, addr, atype)
+                        bal = try_once(bs_ex)
+                        got_balance = bal
+                        explorer_success = True
+                        logging.debug("Blockstream returned balance %f for %s (retry %d)", bal, addr, retry)
+                        if got_balance > 0.0:
+                            balance_found = got_balance
+                            out_line = "{word},{atype},{addr},{balance:.8f},{priv},{wif}".format(
+                                word=word, atype=atype, addr=addr,
+                                balance=balance_found, priv=wallet.private_key, wif=wallet.wif)
+                            logging.info("FOUND: %s", out_line)
+                            print("FOUND:", out_line)
+                            fout.write(out_line + '\n'); fout.flush()
+                            time.sleep(args.sleep)
+                            break
+                        else:
+                            logging.debug("Blockstream reported zero for %s on retry %d", addr, retry)
+                            got_balance = 0.0
+                            break
+                    except Exception as e:
+                        logging.warning("Retry %d: Blockstream error for %s: %s", retry, addr, e)
+
+                # TRY mempool (if present)
+                if mp_ex:
+                    try:
+                        logging.debug("Retry %d: Query mempool for %s (%s)", retry, addr, atype)
+                        bal = try_once(mp_ex)
+                        got_balance = bal
+                        explorer_success = True
+                        logging.debug("Mempool returned balance %f for %s (retry %d)", bal, addr, retry)
+                        if got_balance > 0.0:
+                            balance_found = got_balance
+                            out_line = "{word},{atype},{addr},{balance:.8f},{priv},{wif}".format(
+                                word=word, atype=atype, addr=addr,
+                                balance=balance_found, priv=wallet.private_key, wif=wallet.wif)
+                            logging.info("FOUND: %s", out_line)
+                            print("FOUND:", out_line)
+                            fout.write(out_line + '\n'); fout.flush()
+                            time.sleep(args.sleep)
+                            break
+                        else:
+                            logging.debug("Mempool reported zero for %s on retry %d", addr, retry)
+                            got_balance = 0.0
+                            break
+                    except Exception as e:
+                        logging.warning("Retry %d: Mempool error for %s: %s", retry, addr, e)
+
+                # if neither returned a usable result on this retry, sleep backoff then loop
+                if got_balance is None:
+                    sleep = min(max_backoff_sleep, backoff * (2 ** (retry-1)) * (0.5 + random.random()))
+                    logging.debug("Retry %d: both explorers failed for %s — sleeping %.2fs", retry, addr, sleep)
+                    time.sleep(sleep)
+                    continue
+                else:
+                    # got_balance set to 0.0 by one explorer -> treat as checked and break
+                    break
+
+            # end retry loop
+
+            if got_balance is None:
+                logging.error("All attempts failed for %s (%s) after %d retries — moving on", addr, atype, max_retries)
+                continue
+
+            if got_balance == 0.0:
+                logging.debug("Confirmed zero balance for %s (%s)", addr, atype)
+                continue
+
+            # === END: New Blockstream-first then Mempool logic ===
 
     # cleanup
     for _, ex in explorers:
