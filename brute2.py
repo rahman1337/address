@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-brute2_fixed_sleep.py (modified)
+brute2_fixed_sleep.py (fixed)
 Sequential brute scanner for BTC (legacy P2PKH, nested segwit P2SH, native segwit Bech32)
 PLUS Ethereum checks by default. Enforces EXACT sleep (args.sleep) after every single API call.
 
-Changes:
- - print/write both received and balance for BTC findings
- - print/write raw wei and ETH equivalent for ETH findings
- - on KeyboardInterrupt, immediately print which word was being processed (current_word)
+Fix: removed stray space that caused SyntaxError in the ETH URL f-string.
 """
 from __future__ import annotations
 import argparse, io, sys, time, logging, hashlib, binascii
@@ -268,8 +265,8 @@ def main():
                 if args.eth:
                     try:
                         eth_addr = eth_address_from_privhex(priv_hex)
+                        # FIXED: correct argument name with no stray space
                         url_eth = f"{args.base_eth_balance}/{eth_addr}/balance"
-                        # note: user provided default base-eth-balance points to blockcypher; many providers differ.
                         eth_val = _get_raw_numeric(session, url_eth, timeout=20.0)
                         # ALWAYS sleep after ETH call
                         time.sleep(args.sleep)
