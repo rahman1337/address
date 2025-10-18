@@ -268,7 +268,7 @@ def main():
                 if args.eth:
                     try:
                         eth_addr = eth_address_from_privhex(priv_hex)
-                        url_eth = f"{args.base_eth_balan ce}/{eth_addr}/balance"
+                        url_eth = f"{args.base_eth_balance}/{eth_addr}/balance"
                         # note: user provided default base-eth-balance points to blockcypher; many providers differ.
                         eth_val = _get_raw_numeric(session, url_eth, timeout=20.0)
                         # ALWAYS sleep after ETH call
