@@ -3,10 +3,13 @@
 seed.py
 Sequential scanner: generates valid 12-word BIP39 mnemonics using seed.txt as wordlist,
 derives BTC addresses (legacy, wrapped segwit, native segwit),
-checks blockchain.info /q endpoints.
+and now also derives Ethereum and Solana addresses,
+checks blockchain endpoints (configurable).
 
 Requirements:
     pip3 install coincurve requests base58 mnemonic
+Optional (for full ETH/SOL support):
+    pip3 install pynacl pysha3 pycryptodome
 """
 from __future__ import annotations
 import argparse, io, sys, time, random, logging, hmac
@@ -15,8 +18,40 @@ import requests, base58
 from coincurve import PrivateKey
 from mnemonic import Mnemonic
 
+# Optional imports for Ethereum and Solana support
+try:
+    import sha3 as _sha3  # pysha3 (provides keccak_256)
+    def keccak_256(x: bytes) -> bytes:
+        k = _sha3.keccak_256()
+        k.update(x)
+        return k.digest()
+except Exception:
+    try:
+        # pycryptodome style
+        from Crypto.Hash import keccak as _keccak
+        def keccak_256(x: bytes) -> bytes:
+            k = _keccak.new(digest_bits=256)
+            k.update(x)
+            return k.digest()
+    except Exception:
+        try:
+            # rare Python builds expose keccak through hashlib.new
+            def keccak_256(x: bytes) -> bytes:
+                k = hashlib.new("keccak256")
+                k.update(x)
+                return k.digest()
+        except Exception:
+            keccak_256 = None  # will check later
+
+try:
+    import nacl.signing, nacl.encoding
+    PYNACL_AVAILABLE = True
+except Exception:
+    PYNACL_AVAILABLE = False
+
 # ---------- constants ----------
 BIP32_SEED_KEY = b"Bitcoin seed"
+SLIP10_ED25519_SEED_KEY = b"ed25519 seed"
 CURVE_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
@@ -89,7 +124,7 @@ def p2wpkh_bech32_from_pubkey(pub: bytes, hrp: str='bc') -> str:
     data = [0] + convertbits(prog,8,5)
     return bech32_encode(hrp, data)
 
-# ---------- BIP32 ----------
+# ---------- BIP32 (secp256k1) ----------
 def bip32_master_from_seed(seed: bytes) -> tuple[bytes, bytes]:
     I = hmac_sha512(BIP32_SEED_KEY, seed)
     return I[:32], I[32:]
@@ -113,6 +148,28 @@ def derive_path(master_k: bytes, master_c: bytes, path: str) -> tuple[bytes, byt
         k, c = bip32_ckd_priv(k, c, idx)
     return k, c
 
+# ---------- SLIP-0010 for ed25519 (Solana) ----------
+def slip10_master_from_seed(seed: bytes) -> tuple[bytes, bytes]:
+    I = hmac_sha512(SLIP10_ED25519_SEED_KEY, seed)
+    return I[:32], I[32:]
+
+def slip10_ckd_priv_ed25519(k_par: bytes, c_par: bytes, index: int) -> tuple[bytes, bytes]:
+    # ed25519 SLIP-0010 supports *only* hardened derivation
+    if not (index & 0x80000000):
+        raise ValueError("ed25519 derivation only supports hardened indexes")
+    data = b'\x00' + k_par + ser32(index)
+    I = hmac_sha512(c_par, data)
+    return I[:32], I[32:]
+
+def derive_path_ed25519(master_k: bytes, master_c: bytes, path: str) -> tuple[bytes, bytes]:
+    k, c = master_k, master_c
+    for e in path.lstrip("m/").split("/"):
+        if not e.endswith("'"):
+            raise ValueError("ed25519 path must use hardened notation (') for each level")
+        idx = int(e[:-1]) | 0x80000000
+        k, c = slip10_ckd_priv_ed25519(k, c, idx)
+    return k, c
+
 # ---------- address builders ----------
 def p2pkh_from_privkey_bytes(priv32: bytes) -> str:
     pk = PrivateKey(priv32)
@@ -127,6 +184,31 @@ def p2wpkh_bech32_from_privkey_bytes(priv32: bytes) -> str:
     pk = PrivateKey(priv32)
     return p2wpkh_bech32_from_pubkey(pk.public_key.format(compressed=True))
 
+def ethereum_address_from_privkey(priv32: bytes) -> str | None:
+    # returns 0x-prefixed hex address, lowercase (no EIP-55 checks)
+    if keccak_256 is None:
+        logging.debug("keccak_256 not available; cannot compute Ethereum address")
+        return None
+    pk = PrivateKey(priv32)
+    # get uncompressed public key (65 bytes, 0x04 prefix)
+    pub_uncompressed = pk.public_key.format(compressed=False)
+    # drop 0x04 prefix
+    pub_raw = pub_uncompressed[1:]
+    h = keccak_256(pub_raw)
+    addr = h[-20:]
+    return "0x" + binascii.hexlify(addr).decode()
+
+def solana_address_from_ed25519_privkey(ed_priv32: bytes) -> str | None:
+    if not PYNACL_AVAILABLE:
+        logging.debug("PyNaCl not available; cannot compute Solana address")
+        return None
+    # ed_priv32 is 32 bytes seed for the signing key (SLIP-0010 IL)
+    sk = nacl.signing.SigningKey(ed_priv32)
+    vk = sk.verify_key
+    pub = vk.encode()  # 32 bytes
+    # Solana address is base58 of the 32-byte public key
+    return base58.b58encode(pub).decode()
+
 # ---------- blockchain fetch ----------
 def _get_raw_numeric(session: requests.Session, url: str, timeout: float = 15.0, max_retries: int = 3) -> float:
     for attempt in range(max_retries):
@@ -139,7 +221,7 @@ def _get_raw_numeric(session: requests.Session, url: str, timeout: float = 15.0,
             except Exception:
                 try:
                     j = r.json()
-                    for key in ("total_received","totalReceived","final_balance","finalBalance","balance","received"):
+                    for key in ("total_received","totalReceived","final_balance","finalBalance","balance","received","lamports","amount"):
                         if isinstance(j, dict) and key in j:
                             return float(j[key])
                 except Exception:
@@ -152,14 +234,17 @@ def _get_raw_numeric(session: requests.Session, url: str, timeout: float = 15.0,
 
 # ---------- main ----------
 def main():
-    ap = argparse.ArgumentParser(description="Valid 12-word BIP39 mnemonic BTC scanner")
+    ap = argparse.ArgumentParser(description="Valid 12-word BIP39 mnemonic BTC/Ethereum/Solana scanner")
     ap.add_argument("--dict", "-d", default="seed.txt", help="BIP39 wordlist (1 word per line)")
     ap.add_argument("--out", "-o", default="found.txt")
     ap.add_argument("--sleep", type=float, default=0.6)
     ap.add_argument("--jitter", type=float, default=0.05)
     ap.add_argument("--debug", action="store_true")
-    ap.add_argument("--base-received", default="https://blockchain.info/q/getreceivedbyaddress")
-    ap.add_argument("--base-balance", default="https://blockchain.info/q/addressbalance")
+    ap.add_argument("--base-btc-received", default="https://blockchain.info/q/getreceivedbyaddress")
+    ap.add_argument("--base-btc-balance", default="https://blockchain.info/q/addressbalance")
+    # simple default endpoints (replace with your APIs if desired)
+    ap.add_argument("--base-eth-balance", default="https://api.blockcypher.com/v1/eth/main/addrs")
+    ap.add_argument("--base-sol-balance", default="https://public-api.solscan.io/account")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -204,37 +289,115 @@ def main():
             except Exception:
                 continue
 
-            # derive 3 addresses
+            # derive BTC addresses (BIP44, BIP49, BIP84)
             try:
                 k44,_ = derive_path(master_k, master_c, "m/44'/0'/0'/0/0")
                 k49,_ = derive_path(master_k, master_c, "m/49'/0'/0'/0/0")
                 k84,_ = derive_path(master_k, master_c, "m/84'/0'/0'/0/0")
-                addr_list = [
-                    ("p2pkh", p2pkh_from_privkey_bytes(k44), k44),
-                    ("p2sh-p2wpkh", p2sh_p2wpkh_from_privkey_bytes(k49), k49),
-                    ("p2wpkh", p2wpkh_bech32_from_privkey_bytes(k84), k84)
+                btc_addrs = [
+                    ("BTC-p2pkh", p2pkh_from_privkey_bytes(k44), k44),
+                    ("BTC-p2sh-p2wpkh", p2sh_p2wpkh_from_privkey_bytes(k49), k49),
+                    ("BTC-p2wpkh", p2wpkh_bech32_from_privkey_bytes(k84), k84)
                 ]
             except Exception:
                 continue
 
+            # derive Ethereum (BIP44 m/44'/60'/0'/0/0)
+            eth_addr = None
+            eth_wif = ""
+            try:
+                k_eth, _ = derive_path(master_k, master_c, "m/44'/60'/0'/0/0")
+                eth_addr = ethereum_address_from_privkey(k_eth)
+                try:
+                    eth_wif = wif_from_privhex(binascii.hexlify(k_eth).decode())  # WIF isn't standard for ETH but we keep similar form
+                except Exception:
+                    eth_wif = ""
+            except Exception:
+                eth_addr = None
+
+            # derive Solana (ed25519 using SLIP-0010) m/44'/501'/0'/0'
+            sol_addr = None
+            sol_seed_hex = ""
+            try:
+                if PYNACL_AVAILABLE:
+                    ed_master_k, ed_master_c = slip10_master_from_seed(seed)
+                    ed_k, ed_c = derive_path_ed25519(ed_master_k, ed_master_c, "m/44'/501'/0'/0'")
+                    sol_addr = solana_address_from_ed25519_privkey(ed_k)
+                    sol_seed_hex = binascii.hexlify(ed_k).decode()
+                else:
+                    sol_addr = None
+            except Exception as e:
+                logging.debug("Solana derivation failed: %s", e)
+                sol_addr = None
+
+            # assemble addr_list mixing BTC, ETH, SOL
+            addr_list = []
+            addr_list.extend(btc_addrs)
+            if eth_addr:
+                addr_list.append(("ETH", eth_addr, k_eth))
+            if sol_addr:
+                # store ed25519 seed in place of "priv32" for SOL entry (different curve)
+                addr_list.append(("SOL", sol_addr, sol_seed_hex.encode()))
+
             # check addresses sequentially
             for atype, addr, priv32 in addr_list:
                 try:
-                    wif = wif_from_privhex(binascii.hexlify(priv32).decode())
+                    if atype.startswith("BTC"):
+                        wif = wif_from_privhex(binascii.hexlify(priv32).decode())
+                    elif atype == "ETH":
+                        try:
+                            wif = wif_from_privhex(binascii.hexlify(priv32).decode())
+                        except Exception:
+                            wif = ""
+                    elif atype == "SOL":
+                        # priv32 here is hex-encoded ed25519 seed bytes saved above
+                        try:
+                            wif = priv32.decode()
+                        except Exception:
+                            wif = ""
+                    else:
+                        wif = ""
                 except Exception:
                     wif = ""
 
-                received = _get_raw_numeric(session, f"{args.base_received}/{addr}")
-                checked += 1
-                if received == 0.0:
-                    time.sleep(args.sleep + random.random()*args.jitter)
-                    continue
-
-                balance = _get_raw_numeric(session, f"{args.base_balance}/{addr}")
+                # choose the appropriate balance endpoint
+                received = 0.0
+                balance = 0.0
+                if atype.startswith("BTC"):
+                    received = _get_raw_numeric(session, f"{args.base_btc_received}/{addr}")
+                    checked += 1
+                    if received == 0.0:
+                        time.sleep(args.sleep + random.random()*args.jitter)
+                        continue
+                    balance = _get_raw_numeric(session, f"{args.base_btc_balance}/{addr}")
+                elif atype == "ETH":
+                    # BlockCypher returns JSON; for convenience use route: {base}/{addr}/balance
+                    received = _get_raw_numeric(session, f"{args.base_eth_balan ce}/{addr}/balance".replace(" ", ""))
+                    # if API doesn't support "received", we try balance endpoint
+                    if received == 0.0:
+                        received = 0.0
+                    checked += 1
+                    if received == 0.0:
+                        # also try direct balance query (some providers)
+                        balance = _get_raw_numeric(session, f"{args.base_eth_balance}/{addr}/balance")
+                        if balance == 0.0:
+                            time.sleep(args.sleep + random.random()*args.jitter)
+                            continue
+                elif atype == "SOL":
+                    # Solscan public API example: https://public-api.solscan.io/account?address={addr}
+                    checked += 1
+                    received = _get_raw_numeric(session, f"{args.base_sol_balance}?address={addr}")
+                    if received == 0.0:
+                        # some Solana APIs return lamports in JSON -> 'lamports'
+                        balance = _get_raw_numeric(session, f"{args.base_sol_balance}?address={addr}")
+                        if balance == 0.0:
+                            time.sleep(args.sleep + random.random()*args.jitter)
+                            continue
 
                 # print & append block line-by-line
                 block_lines = [
                     "============================",
+                    f"coin: {atype}",
                     mnemonic,
                     addr,
                     wif,
