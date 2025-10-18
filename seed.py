@@ -384,15 +384,26 @@ def main():
                             time.sleep(args.sleep + random.random()*args.jitter)
                             continue
                 elif atype == "SOL":
-                    # Solscan public API example: https://public-api.solscan.io/account?address={addr}
-                    checked += 1
-                    received = _get_raw_numeric(session, f"{args.base_sol_balance}?address={addr}")
-                    if received == 0.0:
-                        # some Solana APIs return lamports in JSON -> 'lamports'
-                        balance = _get_raw_numeric(session, f"{args.base_sol_balance}?address={addr}")
-                        if balance == 0.0:
-                            time.sleep(args.sleep + random.random()*args.jitter)
-                            continue
+    # Check via Solana JSON-RPC
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [addr]
+        }
+        r = session.post("https://api.mainnet-beta.solana.com", json=payload, timeout=10)
+        j = r.json()
+        lamports = j.get("result", {}).get("value", 0)
+        received = lamports / 1e9  # convert lamports to SOL
+        checked += 1
+        if received == 0.0:
+            time.sleep(args.sleep + random.random() * args.jitter)
+            continue
+        balance = received
+    except Exception as e:
+        logging.debug("Solana balance check failed: %s", e)
+        continue
 
                 # print & append block line-by-line
                 block_lines = [
