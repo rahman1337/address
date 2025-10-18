@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """
-brute_p2pkh_seq_blockchain.py
+brute2.py
 Sequential brute scanner for BTC (legacy P2PKH, nested segwit P2SH, native segwit Bech32)
 PLUS Ethereum checks by default. Exact sleep (seconds) is applied per address check.
 
-Requirements:
+Dependencies:
     pip3 install coincurve requests base58 pycryptodome bech32
 
-Notes:
-    - ETH checks are enabled by default. Use --no-eth to disable.
-    - Sleep is applied per-address check (default 0.6s). Use --sleep to change.
-    - BTC endpoints: blockchain.info /q endpoints (getreceivedbyaddress, addressbalance)
-    - ETH endpoint default: BlockCypher /v1/eth/main/addrs/{addr}/balance (returns wei)
+Usage:
+    python3 brute2.py --dict dictionary.txt --out found.txt [--no-eth] [--sleep 0.6] [--debug]
 """
 from __future__ import annotations
-import argparse, io, sys, time, logging, hashlib, binascii
+import argparse, io, sys, time, logging, hashlib, binascii, random
 import requests, base58
 from coincurve import PrivateKey
 
@@ -24,10 +21,13 @@ try:
 except Exception:
     keccak = None
 
+# try to import bech32 functions from common bech32 package
 try:
-    import bech32
+    # many bech32 packages expose bech32_encode and convertbits
+    from bech32 import bech32_encode, convertbits
+    _HAS_BECH32 = True
 except Exception:
-    bech32 = None
+    _HAS_BECH32 = False
 
 # ---------------- crypto helpers ----------------
 def sha256(b: bytes) -> bytes:
@@ -61,14 +61,19 @@ def btc_p2sh_p2wpkh(pub_bytes: bytes) -> str:
     return base58check(b'\x05', hash160(redeem_script))
 
 def btc_bech32(pub_bytes: bytes) -> str:
-    """Native segwit bc1q... using bech32 lib"""
-    if bech32 is None:
-        raise RuntimeError("bech32 library required for native segwit (pip install bech32)")
+    """Native segwit bc1q... using bech32.convertbits + bech32_encode"""
+    if not _HAS_BECH32:
+        raise RuntimeError("bech32 library not available (pip install bech32)")
     # witness program is HASH160(pub) for a P2WPKH (version 0, 20 bytes)
     witprog = hash160(pub_bytes)
-    # convert to 5-bit groups
-    conv = bech32.convertbits(witprog, 8, 5)
-    return bech32.bech32_encode("bc", [0] + conv)  # 0 = witness version
+    # convert from 8-bit to 5-bit groups
+    data = convertbits(witprog, 8, 5, True)
+    if data is None:
+        raise RuntimeError("bech32.convertbits failed")
+    # prepend witness version 0
+    data5 = [0] + data
+    addr = bech32_encode("bc", data5)
+    return addr
 
 # ---------------- Ethereum helpers ----------------
 def _keccak_256(data: bytes) -> bytes:
@@ -77,17 +82,6 @@ def _keccak_256(data: bytes) -> bytes:
     k = keccak.new(digest_bits=256)
     k.update(data)
     return k.digest()
-
-def eth_address_from_privhex(priv_hex: str) -> str:
-    """Return 0x + EIP-55 checksummed address"""
-    priv_bytes = bytes.fromhex(priv_hex)
-    pk = PrivateKey(priv_bytes)
-    pub_uncompressed = pk.public_key.format(compressed=False)  # 65 bytes, 0x04 prefix
-    pub_no_prefix = pub_uncompressed[1:]
-    digest = _keccak_256(pub_no_prefix)
-    addr_bytes = digest[-20:]
-    addr_hex = addr_bytes.hex()
-    return "0x" + to_checksum_address(addr_hex)
 
 def to_checksum_address(addr_hex_lower: str) -> str:
     if len(addr_hex_lower) != 40:
@@ -101,6 +95,17 @@ def to_checksum_address(addr_hex_lower: str) -> str:
         else:
             out.append(c.upper() if int(h[i], 16) >= 8 else c)
     return ''.join(out)
+
+def eth_address_from_privhex(priv_hex: str) -> str:
+    """Return 0x + EIP-55 checksummed address"""
+    priv_bytes = bytes.fromhex(priv_hex)
+    pk = PrivateKey(priv_bytes)
+    pub_uncompressed = pk.public_key.format(compressed=False)  # 65 bytes, 0x04 prefix
+    pub_no_prefix = pub_uncompressed[1:]
+    digest = _keccak_256(pub_no_prefix)
+    addr_bytes = digest[-20:]
+    addr_hex = addr_bytes.hex()
+    return "0x" + to_checksum_address(addr_hex)
 
 # ---------------- generic numeric fetcher ----------------
 def _get_raw_numeric(session: requests.Session, url: str, timeout: float = 15.0) -> float:
@@ -117,7 +122,6 @@ def _get_raw_numeric(session: requests.Session, url: str, timeout: float = 15.0)
         j = r.json()
         for key in ("total_received","totalReceived","final_balance","finalBalance","balance","received","result"):
             if isinstance(j, dict) and key in j:
-                # result from etherscan etc. often string
                 try:
                     return float(j[key])
                 except Exception:
@@ -127,7 +131,29 @@ def _get_raw_numeric(session: requests.Session, url: str, timeout: float = 15.0)
                         pass
     except Exception:
         pass
-    raise ValueError("Unable to parse numeric from response (first 200 chars): " + (text[:200] if text else "<empty>"))
+    # if nothing parsed, return 0.0 (no funds) instead of raising to be resilient
+    return 0.0
+
+# ---------------- helpers to print/write ----------------
+def print_used_btc(word, label, addr, wif, raw_value, fout):
+    print("\n=== USED BTC WALLET FOUND ===")
+    print(f"WORD: {word}")
+    print(f"TYPE: {label}")
+    print(f"ADDRESS: {addr}")
+    print(f"WIF: {wif}")
+    print(f"VALUE RAW: {raw_value}")
+    print("============================\n")
+    fout.write(f"{word},BTC,{label},{addr},{wif},{raw_value}\n")
+    fout.flush()
+
+def print_used_eth(word, eth_addr, raw_wei, fout):
+    print("\n=== USED ETH WALLET FOUND ===")
+    print(f"WORD: {word}")
+    print(f"ETH ADDRESS: {eth_addr}")
+    print(f"BALANCE RAW (wei): {raw_wei}")
+    print("===========================\n")
+    fout.write(f"{word},ETH,,{eth_addr},,{raw_wei}\n")
+    fout.flush()
 
 # ---------------- main loop ----------------
 def main():
@@ -157,7 +183,7 @@ def main():
     if args.eth and keccak is None:
         logging.error("ETH checks enabled but Crypto.Hash.keccak (pycryptodome) not found. Install: pip install pycryptodome")
         sys.exit(1)
-    if bech32 is None:
+    if not _HAS_BECH32:
         logging.warning("bech32 library not found; bc1q address generation will be skipped. Install: pip install bech32")
 
     # open files
@@ -198,7 +224,7 @@ def main():
                 ("P2PKH", btc_p2pkh(pub_compressed)),
                 ("P2SH-P2WPKH", btc_p2sh_p2wpkh(pub_compressed))
             ]
-            if bech32 is not None:
+            if _HAS_BECH32:
                 try:
                     btc_addresses.append(("Bech32", btc_bech32(pub_compressed)))
                 except Exception as e:
@@ -215,8 +241,6 @@ def main():
                         logging.info("Found used BTC address (received) %s %s", label, addr)
                         print_used_btc(word, label, addr, wif, val, fout)
                         found += 1
-                        # sleep per-address then continue to next address
-                    # else no received, check balance endpoint too
                     else:
                         url2 = f"{args.base_balance}/{addr}"
                         val2 = _get_raw_numeric(session, url2, timeout=20.0)
@@ -226,6 +250,7 @@ def main():
                             found += 1
                 except Exception as e:
                     logging.debug("BTC check error for %s (%s): %s", addr, label, e)
+
                 # sleep exactly args.sleep plus optional jitter
                 sleep_time = args.sleep + (random.random() * args.jitter if args.jitter > 0 else 0.0)
                 time.sleep(sleep_time)
@@ -235,8 +260,7 @@ def main():
                 try:
                     eth_addr = eth_address_from_privhex(priv_hex)
                     # BlockCypher style: /v1/eth/main/addrs/{addr}/balance
-                    url = f"{args.base_eth_balan ce if False else args.base_eth_balance}/{eth_addr}/balance"
-                    # (we used args.base-eth-balance arg name so above is safe)
+                    url = f"{args.base_eth_balance}/{eth_addr}/balance"
                     eth_val = _get_raw_numeric(session, url, timeout=20.0)
                     if eth_val > 0:
                         logging.info("Found used ETH address %s", eth_addr)
@@ -244,6 +268,7 @@ def main():
                         found += 1
                 except Exception as e:
                     logging.debug("ETH check error: %s", e)
+
                 # sleep exactly args.sleep plus optional jitter
                 sleep_time = args.sleep + (random.random() * args.jitter if args.jitter > 0 else 0.0)
                 time.sleep(sleep_time)
@@ -263,28 +288,5 @@ def main():
         elapsed = time.time() - start_time
         logging.info("Finished. Total read: %d, checked:%d found:%d, elapsed %.1fs", total, checked, found, elapsed)
 
-# ---------------- helpers to print/write ----------------
-def print_used_btc(word, label, addr, wif, raw_value, fout):
-    print("\n=== USED BTC WALLET FOUND ===")
-    print(f"WORD: {word}")
-    print(f"TYPE: {label}")
-    print(f"ADDRESS: {addr}")
-    print(f"WIF: {wif}")
-    print(f"VALUE RAW: {raw_value}")
-    print("============================\n")
-    fout.write(f"{word},BTC,{label},{addr},{wif},{raw_value}\n")
-    fout.flush()
-
-def print_used_eth(word, eth_addr, raw_wei, fout):
-    print("\n=== USED ETH WALLET FOUND ===")
-    print(f"WORD: {word}")
-    print(f"ETH ADDRESS: {eth_addr}")
-    print(f"BALANCE RAW (wei): {raw_wei}")
-    print("===========================\n")
-    fout.write(f"{word},ETH,,{eth_addr},,{raw_wei}\n")
-    fout.flush()
-
-# ---------------- run ----------------
 if __name__ == "__main__":
-    import random  # local import for jitter calc
     main()
