@@ -81,14 +81,15 @@ def convertbits(data: bytes, frombits: int, tobits: int, pad: bool=True):
     maxv=(1<<tobits)-1
     for b in data:
         acc=(acc<<frombits)|b; bits+=frombits
-        while bits>=tobits: bits-=tobits; ret.append((acc>>bits)&maxv)
+        while bits>=tobits:
+            bits-=tobits; ret.append((acc>>bits)&maxv)
     if pad and bits: ret.append((acc<<(tobits-bits))&maxv)
     return ret
 
 def p2wpkh_bech32_from_pubkey(pub: bytes, hrp: str='bc') -> str:
     prog = hash160(pub)
-    data = [0]+convertbits(prog,8,5)
-    return bech32_encode(hrp,data)
+    data = [0] + convertbits(prog,8,5)
+    return bech32_encode(hrp, data)
 
 # ---------- BIP32 ----------
 def bip32_master_from_seed(seed: bytes) -> tuple[bytes, bytes]:
@@ -98,86 +99,194 @@ def bip32_master_from_seed(seed: bytes) -> tuple[bytes, bytes]:
 def ser32(i: int) -> bytes: return struct.pack(">I", i)
 
 def bip32_ckd_priv(k_par: bytes, c_par: bytes, index: int) -> tuple[bytes, bytes]:
-    if index & 0x80000000: data=b'\x00'+k_par+ser32(index)
-    else: data=PrivateKey(k_par).public_key.format(compressed=True)+ser32(index)
-    I = hmac_sha512(c_par,data); IL,IR=I[:32],I[32:]
-    child=(int_from_bytes(IL)+int_from_bytes(k_par))%CURVE_ORDER
-    return bytes_from_int(child,32), IR
+    if index & 0x80000000:
+        data = b'\x00' + k_par + ser32(index)
+    else:
+        data = PrivateKey(k_par).public_key.format(compressed=True) + ser32(index)
+    I = hmac_sha512(c_par, data)
+    IL, IR = I[:32], I[32:]
+    child = (int_from_bytes(IL) + int_from_bytes(k_par)) % CURVE_ORDER
+    return bytes_from_int(child, 32), IR
 
 def derive_path(master_k: bytes, master_c: bytes, path: str) -> tuple[bytes, bytes]:
-    k,c=master_k, master_c
+    k, c = master_k, master_c
     for e in path.lstrip("m/").split("/"):
-        idx=int(e[:-1])|0x80000000 if e.endswith("'") else int(e)
-        k,c=bip32_ckd_priv(k,c,idx)
-    return k,c
+        idx = int(e[:-1]) | 0x80000000 if e.endswith("'") else int(e)
+        k, c = bip32_ckd_priv(k, c, idx)
+    return k, c
 
 # ---------- address builders ----------
 def p2pkh_from_privkey_bytes(priv32: bytes) -> str:
-    pk=PrivateKey(priv32); return base58check_encode(b'\x00', hash160(pk.public_key.format(compressed=True)))
+    pk = PrivateKey(priv32)
+    return base58check_encode(b'\x00', hash160(pk.public_key.format(compressed=True)))
 
 def p2sh_p2wpkh_from_privkey_bytes(priv32: bytes) -> str:
-    pk=PrivateKey(priv32); redeem=b'\x00\x14'+hash160(pk.public_key.format(compressed=True))
+    pk = PrivateKey(priv32)
+    redeem = b'\x00\x14' + hash160(pk.public_key.format(compressed=True))
     return base58check_encode(b'\x05', hash160(redeem))
 
 def p2wpkh_bech32_from_privkey_bytes(priv32: bytes) -> str:
-    pk=PrivateKey(priv32); return p2wpkh_bech32_from_pubkey(pk.public_key.format(compressed=True))
+    pk = PrivateKey(priv32)
+    return p2wpkh_bech32_from_pubkey(pk.public_key.format(compressed=True))
 
-# ---------- blockchain fetch ----------
-def _get_raw_numeric(session: requests.Session, url: str, timeout: float = 15.0) -> float:
-    r = session.get(url,timeout=timeout); r.raise_for_status()
-    try: return float(r.text.strip())
-    except: return 0.0
+# ---------- blockchain fetch (with simple retries) ----------
+def _get_raw_numeric(session: requests.Session, url: str, timeout: float = 15.0, max_retries: int = 3) -> float:
+    for attempt in range(max_retries):
+        try:
+            r = session.get(url, timeout=timeout)
+            r.raise_for_status()
+            text = r.text.strip()
+            try:
+                return float(text)
+            except Exception:
+                # fallback parse JSON-like responses (very defensive)
+                try:
+                    j = r.json()
+                    for key in ("total_received","totalReceived","final_balance","finalBalance","balance","received"):
+                        if isinstance(j, dict) and key in j:
+                            return float(j[key])
+                except Exception:
+                    pass
+                # if parsing fails, raise to trigger retry
+                raise ValueError("Unable to parse numeric from response")
+        except Exception:
+            backoff = (0.5 + random.random()) * (2 ** attempt)
+            time.sleep(backoff)
+    return 0.0
 
 # ---------- main ----------
 def main():
-    ap=argparse.ArgumentParser(description="Seed scanner (1 word->12-word BIP39)")
-    ap.add_argument("--dict","-d",default="seed.txt")
-    ap.add_argument("--out","-o",default="found.txt")
-    ap.add_argument("--sleep",type=float,default=0.6)
-    ap.add_argument("--jitter",type=float,default=0.05)
-    ap.add_argument("--debug",action="store_true")
-    args=ap.parse_args()
+    ap = argparse.ArgumentParser(description="Seed scanner (1 word per line -> 12-word BIP39) with P2PKH/P2SH-P2WPKH/P2WPKH")
+    ap.add_argument("--dict", "-d", default="seed.txt")
+    ap.add_argument("--out", "-o", default="found.txt")
+    ap.add_argument("--sleep", type=float, default=0.6)
+    ap.add_argument("--jitter", type=float, default=0.05)
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--base-received", default="https://blockchain.info/q/getreceivedbyaddress")
+    ap.add_argument("--base-balance", default="https://blockchain.info/q/addressbalance")
+    args = ap.parse_args()
+
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    
+
+    # quick check coincurve
+    try:
+        _ = PrivateKey(b'\x01' * 32)
+    except Exception as e:
+        logging.error("coincurve not available or failing: %s", e)
+        sys.exit(1)
+
     session = requests.Session()
-    with open(args.dict,"r",encoding="utf-8") as fdict, open(args.out,"a",encoding="utf-8",buffering=1) as fout:
-        total=checked=found=0; start_time=time.time()
-        for line in fdict:
-            word=line.strip()
-            if not word: continue
-            total+=1
-            mnemonic=" ".join([word]*12)
+    try:
+        fdict = io.open(args.dict, "rt", encoding="utf-8", errors="ignore")
+    except Exception as e:
+        logging.error("Cannot open input file '%s': %s", args.dict, e)
+        sys.exit(1)
+
+    try:
+        fout = open(args.out, "a", encoding="utf-8", buffering=1)
+    except Exception as e:
+        logging.error("Cannot open output file '%s': %s", args.out, e)
+        sys.exit(1)
+
+    total = checked = found = 0
+    start_time = time.time()
+
+    try:
+        for raw in fdict:
+            word = raw.strip()
+            if not word:
+                continue
+            total += 1
+
+            # create a 12-word mnemonic by repeating the single word (keeps it deterministic)
+            mnemonic = " ".join([word] * 12)
+
+            # derive seed / master
             try:
-                seed=mnemonic_to_seed(mnemonic)
-                master_k,master_c=bip32_master_from_seed(seed)
-                k44,_=derive_path(master_k,master_c,"m/44'/0'/0'/0/0")
-                k49,_=derive_path(master_k,master_c,"m/49'/0'/0'/0/0")
-                k84,_=derive_path(master_k,master_c,"m/84'/0'/0'/0/0")
-                addr_list=[
-                    ("p2pkh",p2pkh_from_privkey_bytes(k44),k44),
-                    ("p2sh-p2wpkh",p2sh_p2wpkh_from_privkey_bytes(k49),k49),
-                    ("p2wpkh",p2wpkh_bech32_from_privkey_bytes(k84),k84)
-                ]
+                seed = mnemonic_to_seed(mnemonic)
+                master_k, master_c = bip32_master_from_seed(seed)
             except Exception as e:
-                logging.debug("Derivation failed for '%s': %s",mnemonic,e)
+                logging.debug("Seed->master failed for '%s': %s", mnemonic, e)
                 continue
 
+            # derive the three addresses
+            try:
+                k44, _ = derive_path(master_k, master_c, "m/44'/0'/0'/0/0")
+                k49, _ = derive_path(master_k, master_c, "m/49'/0'/0'/0/0")
+                k84, _ = derive_path(master_k, master_c, "m/84'/0'/0'/0/0")
+                addr_list = [
+                    ("p2pkh", p2pkh_from_privkey_bytes(k44), k44),
+                    ("p2sh-p2wpkh", p2sh_p2wpkh_from_privkey_bytes(k49), k49),
+                    ("p2wpkh", p2wpkh_bech32_from_privkey_bytes(k84), k84),
+                ]
+            except Exception as e:
+                logging.debug("Derivation failed for '%s': %s", mnemonic, e)
+                continue
+
+            # check each address sequentially
             for atype, addr, priv32 in addr_list:
-                try: wif=wif_from_privhex(binascii.hexlify(priv32).decode())
-                except: wif=""
-                received=0.0
-                try: received=_get_raw_numeric(session,f"https://blockchain.info/q/getreceivedbyaddress/{addr}")
-                except: pass
-                checked+=1
-                if received==0.0:
-                    time.sleep(args.sleep+random.random()*args.jitter)
+                try:
+                    wif = wif_from_privhex(binascii.hexlify(priv32).decode())
+                except Exception:
+                    wif = ""
+
+                received = _get_raw_numeric(session, f"{args.base_received}/{addr}")
+                checked += 1
+                if received == 0.0:
+                    time.sleep(args.sleep + random.random() * args.jitter)
                     continue
-                print(f"\nFOUND: {atype} {addr} | WIF: {wif} | RECEIVED: {received}\n")
-                fout.write(f"{mnemonic},{atype},{addr},{wif},{received}\n"); fout.flush(); found+=1
-                time.sleep(args.sleep+random.random()*args.jitter)
 
-            if total%100==0: logging.info("Processed %d words, checked:%d, found:%d", total, checked, found)
-        logging.info("Done. Total words:%d, checked:%d, found:%d", total, checked, found)
+                balance = _get_raw_numeric(session, f"{args.base_balance}/{addr}")
 
-if __name__=="__main__":
+                # Print block line-by-line and append same block to found.txt
+                block_lines = [
+                    "============================",
+                    mnemonic,
+                    wif,
+                    str(received),
+                    str(balance),
+                    "============================",
+                ]
+                # print to stdout
+                for line in block_lines:
+                    print(line)
+                print()  # extra newline for readability
+
+                # append to output file
+                try:
+                    for line in block_lines:
+                        fout.write(line + "\n")
+                    fout.write("\n")
+                    fout.flush()
+                except Exception:
+                    logging.debug("Failed to write found block to file for %s", addr)
+
+                found += 1
+                # sleep after a found address to avoid hammering
+                time.sleep(args.sleep + random.random() * args.jitter)
+
+            # periodic logging
+            if total % 100 == 0:
+                elapsed = time.time() - start_time
+                logging.info("Processed %d words — addresses checked:%d found:%d — avg %.2f words/s",
+                             total, checked, found, total / max(1.0, elapsed))
+
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user")
+
+    finally:
+        try:
+            fdict.close()
+        except Exception:
+            pass
+        try:
+            fout.close()
+        except Exception:
+            pass
+        session.close()
+        elapsed = time.time() - start_time
+        logging.info("Finished. Total words read: %d, addresses checked:%d found:%d, elapsed %.1fs",
+                     total, checked, found, elapsed)
+
+if __name__ == "__main__":
     main()
