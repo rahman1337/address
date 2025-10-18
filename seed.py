@@ -385,7 +385,6 @@ def main():
                             continue
                 elif atype == "SOL":
     # Check via Solana JSON-RPC
-    try:
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -400,10 +399,6 @@ def main():
         if received == 0.0:
             time.sleep(args.sleep + random.random() * args.jitter)
             continue
-        balance = received
-    except Exception as e:
-        logging.debug("Solana balance check failed: %s", e)
-        continue
 
                 # print & append block line-by-line
                 block_lines = [
