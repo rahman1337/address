@@ -372,7 +372,6 @@ def main():
                     balance = _get_raw_numeric(session, f"{args.base_btc_balance}/{addr}")
                 elif atype == "ETH":
                     # BlockCypher returns JSON; for convenience use route: {base}/{addr}/balance
-                    received = _get_raw_numeric(session, f"{args.base_eth_balance}/{addr}/balance".replace(" ", ""))
                     # if API doesn't support "received", we try balance endpoint
                     if received == 0.0:
                         received = 0.0
