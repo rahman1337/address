@@ -1,180 +1,183 @@
 #!/usr/bin/env python3
-# btc2.py - mnemonic -> addresses scanner (multi-worker, continuous, clean output)
-import os, sys, time, hashlib, multiprocessing, argparse, signal
-from mnemonic import Mnemonic
+"""
+seed.py
+Sequential scanner: reads seed.txt (1 word per line),
+generates 12-word BIP39 mnemonic, derives BTC addresses (legacy, wrapped segwit, native segwit),
+checks blockchain.info /q endpoints.
 
-# Try to use coincurve (faster); fallback to ecdsa
-try:
-    from coincurve import PublicKey
-    HAVE_COINCURVE = True
-except Exception:
-    import ecdsa
-    HAVE_COINCURVE = False
+Requirements:
+    pip3 install coincurve requests base58
 
-# ===== CONFIG =====
-REPORT_EVERY = 300         # per-worker status print interval
-BATCH_SIZE = 4             # mnemonics per inner loop
-OUTFILE = "btc.txt"   # append matches here
-MNEMONIC_GEN = Mnemonic("english")
-BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-GEN = [0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3]
+Usage:
+    python3 seed.py --out found.txt
+"""
+from __future__ import annotations
+import argparse, io, sys, time, random, logging, hmac
+import binascii, hashlib, struct
+import requests, base58
+from coincurve import PrivateKey
 
-# ===== HELPERS =====
-def sha256(x): return hashlib.sha256(x).digest()
-def ripemd160(x): return hashlib.new('ripemd160', x).digest()
-def hash160(x): return ripemd160(sha256(x))
+# ---------- constants ----------
+BIP32_SEED_KEY = b"Bitcoin seed"
+CURVE_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
-def base58check(data):
-    checksum = sha256(sha256(data))[:4]
-    data_cs = data + checksum
-    num = int.from_bytes(data_cs, "big")
-    out = ""
-    while num > 0:
-        num, mod = divmod(num, 58)
-        out = BASE58_ALPHABET[mod] + out
-    pad = 0
-    for c in data_cs:
-        if c == 0: pad += 1
-        else: break
-    return "1"*pad + out
+# ---------- crypto helpers ----------
+def pbkdf2_hmac_sha512(password: str, salt: str, iterations: int = 2048, dklen: int = 64) -> bytes:
+    return hashlib.pbkdf2_hmac("sha512", password.encode("utf-8"), salt.encode("utf-8"), iterations, dklen)
 
-def encode_bech32(hrp, witver, witprog):
-    def convertbits(data, frombits, tobits, pad=True):
-        acc = bits = 0; ret=[]; maxv=(1<<tobits)-1
-        for b in data:
-            acc=(acc<<frombits)|b; bits+=frombits
-            while bits>=tobits:
-                bits-=tobits; ret.append((acc>>bits)&maxv)
-        if pad and bits: ret.append((acc<<(tobits-bits))&maxv)
-        return ret
-    def polymod(v):
-        chk=1
-        for val in v:
-            top=chk>>25
-            chk=((chk&0x1ffffff)<<5)^val
-            for i in range(5):
-                if (top>>i)&1: chk^=GEN[i]
-        return chk
-    def hrp_expand(h): return [ord(x)>>5 for x in h]+[0]+[ord(x)&31 for x in h]
-    def create_checksum(hrp, data):
-        vals=hrp_expand(hrp)+data+[0]*6
-        pm=polymod(vals)^1
-        return [(pm>>(5*(5-i)))&31 for i in range(6)]
-    data=[witver]+convertbits(witprog,8,5)
-    comb=data+create_checksum(hrp,data)
-    return hrp+"1"+"".join([BECH32_CHARSET[d] for d in comb])
+def mnemonic_to_seed(mnemonic: str, passphrase: str = "") -> bytes:
+    return pbkdf2_hmac_sha512(mnemonic, "mnemonic"+passphrase)
 
-def generate_addresses(priv_bytes, hrp="bc"):
-    if HAVE_COINCURVE:
-        pub = PublicKey.from_valid_secret(priv_bytes).format(compressed=True)
-    else:
-        sk = ecdsa.SigningKey.from_string(priv_bytes, curve=ecdsa.SECP256k1)
-        vk = sk.verifying_key
-        vs = vk.to_string()
-        prefix = b'\x02' if (vs[32]&1)==0 else b'\x03'
-        pub = prefix + vs[:32]
-    h160 = hash160(pub)
-    p2pkh = base58check(b'\x00'+h160)
-    redeem = b'\x00\x14'+h160
-    p2sh = base58check(b'\x05'+hash160(redeem))
-    bech = encode_bech32(hrp,0,h160)
-    wif = base58check(b'\x80'+priv_bytes+b'\x01')
-    return wif, p2pkh, p2sh, bech
+def hmac_sha512(key: bytes, data: bytes) -> bytes:
+    return hmac.new(key, data, hashlib.sha512).digest()
 
-def load_targets(paths):
-    s=set()
-    for path in paths:
-        try:
-            with open(path,"r",encoding="utf-8",errors="ignore") as f:
-                for line in f:
-                    l=line.strip()
-                    if not l: continue
-                    s.add(l.lower())
-        except Exception as e:
-            print(f"Warning: failed to open {path}: {e}", file=sys.stderr)
-    return s
+def int_from_bytes(b: bytes) -> int:
+    return int.from_bytes(b, "big")
 
-# ===== WORKER =====
-def worker(proc_id, targets):
-    hrp="bc"
-    total=0
-    start=time.time()
-    while True:
-        for _ in range(BATCH_SIZE):
-            total += 1
-            mnemonic = MNEMONIC_GEN.generate(strength=128)
-            seed = hashlib.pbkdf2_hmac("sha512", mnemonic.encode(), b"mnemonic", 2048)
-            priv = seed[:32]
-            wif,p2pkh,p2sh,bech = generate_addresses(priv,hrp)
-            for addr in (p2pkh.lower(),p2sh.lower(),bech.lower()):
-                if addr in targets:
-                    ts=time.strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"\n\033[92m{'='*50}")
-                    print(f"🎯 MATCH FOUND (Worker {proc_id} @ {ts})")
-                    print(f"{'='*50}\033[0m")
-                    print(f"\033[96mMnemonic :\033[0m {mnemonic}")
-                    print(f"\033[96mWIF      :\033[0m {wif}")
-                    print(f"\033[96mAddress  :\033[0m {addr}")
-                    print(f"\033[92m{'='*50}\033[0m\n")
-                    try:
-                        with open(OUTFILE,"a",encoding="utf-8") as f:
-                            f.write(f"{ts}\nMNEMONIC:{mnemonic}\nWIF:{wif}\nADDRESS:{addr}\n\n")
-                    except Exception as e:
-                        print("Failed to write hit:", e, file=sys.stderr)
-        if total % REPORT_EVERY == 0:
-            rate = total / (time.time() - start) if (time.time()-start)>0 else 0.0
-            print(f"[Worker {proc_id}] {total:,} mnemonics tried — {rate:,.1f}/s")
+def bytes_from_int(i: int, length: int) -> bytes:
+    return i.to_bytes(length, "big")
 
-# ===== MAIN =====
+def hash160(b: bytes) -> bytes:
+    return hashlib.new("ripemd160", hashlib.sha256(b).digest()).digest()
+
+def base58check_encode(prefix: bytes, payload20: bytes) -> str:
+    raw = prefix + payload20
+    checksum = hashlib.sha256(hashlib.sha256(raw).digest()).digest()[:4]
+    return base58.b58encode(raw + checksum).decode()
+
+def wif_from_privhex(priv_hex: str, compressed: bool = True) -> str:
+    b = binascii.unhexlify(priv_hex)
+    payload = b'\x80' + b
+    if compressed:
+        payload += b'\x01'
+    checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    return base58.b58encode(payload + checksum).decode()
+
+# ---------- bech32 ----------
+def bech32_polymod(values):
+    GENERATORS = [0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3]
+    chk=1
+    for v in values:
+        top=chk>>25
+        chk=((chk & 0x1ffffff)<<5)^v
+        for i in range(5):
+            if (top>>i)&1:
+                chk ^= GENERATORS[i]
+    return chk
+
+def bech32_hrp_expand(hrp): return [ord(x)>>5 for x in hrp]+[0]+[ord(x)&31 for x in hrp]
+
+def bech32_create_checksum(hrp,data):
+    values=bech32_hrp_expand(hrp)+data
+    polymod=bech32_polymod(values+[0]*6)^1
+    return [(polymod>>(5*(5-i)))&31 for i in range(6)]
+
+def bech32_encode(hrp,data):
+    return hrp+'1'+''.join([CHARSET[d] for d in data+bech32_create_checksum(hrp,data)])
+
+def convertbits(data: bytes, frombits: int, tobits: int, pad: bool=True):
+    acc=bits=0; ret=[]
+    maxv=(1<<tobits)-1
+    for b in data:
+        acc=(acc<<frombits)|b; bits+=frombits
+        while bits>=tobits: bits-=tobits; ret.append((acc>>bits)&maxv)
+    if pad and bits: ret.append((acc<<(tobits-bits))&maxv)
+    return ret
+
+def p2wpkh_bech32_from_pubkey(pub: bytes, hrp: str='bc') -> str:
+    prog = hash160(pub)
+    data = [0]+convertbits(prog,8,5)
+    return bech32_encode(hrp,data)
+
+# ---------- BIP32 ----------
+def bip32_master_from_seed(seed: bytes) -> tuple[bytes, bytes]:
+    I = hmac_sha512(BIP32_SEED_KEY, seed)
+    return I[:32], I[32:]
+
+def ser32(i: int) -> bytes: return struct.pack(">I", i)
+
+def bip32_ckd_priv(k_par: bytes, c_par: bytes, index: int) -> tuple[bytes, bytes]:
+    if index & 0x80000000: data=b'\x00'+k_par+ser32(index)
+    else: data=PrivateKey(k_par).public_key.format(compressed=True)+ser32(index)
+    I = hmac_sha512(c_par,data); IL,IR=I[:32],I[32:]
+    child=(int_from_bytes(IL)+int_from_bytes(k_par))%CURVE_ORDER
+    return bytes_from_int(child,32), IR
+
+def derive_path(master_k: bytes, master_c: bytes, path: str) -> tuple[bytes, bytes]:
+    k,c=master_k, master_c
+    for e in path.lstrip("m/").split("/"):
+        idx=int(e[:-1])|0x80000000 if e.endswith("'") else int(e)
+        k,c=bip32_ckd_priv(k,c,idx)
+    return k,c
+
+# ---------- address builders ----------
+def p2pkh_from_privkey_bytes(priv32: bytes) -> str:
+    pk=PrivateKey(priv32); return base58check_encode(b'\x00', hash160(pk.public_key.format(compressed=True)))
+
+def p2sh_p2wpkh_from_privkey_bytes(priv32: bytes) -> str:
+    pk=PrivateKey(priv32); redeem=b'\x00\x14'+hash160(pk.public_key.format(compressed=True))
+    return base58check_encode(b'\x05', hash160(redeem))
+
+def p2wpkh_bech32_from_privkey_bytes(priv32: bytes) -> str:
+    pk=PrivateKey(priv32); return p2wpkh_bech32_from_pubkey(pk.public_key.format(compressed=True))
+
+# ---------- blockchain fetch ----------
+def _get_raw_numeric(session: requests.Session, url: str, timeout: float = 15.0) -> float:
+    r = session.get(url,timeout=timeout); r.raise_for_status()
+    try: return float(r.text.strip())
+    except: return 0.0
+
+# ---------- main ----------
 def main():
-    # Ensure spawn start method for iSH compatibility
-    try:
-        multiprocessing.set_start_method("spawn")
-    except RuntimeError:
-        # already set
-        pass
-
-    p=argparse.ArgumentParser(description="Mnemonic BTC address scanner (multi-worker, continuous)")
-    p.add_argument("-f","--file",nargs="+",required=True,help="target btc*.txt files (shell usually expands glob)")
-    p.add_argument("--workers","-w",type=int,default=None,help="override number of worker processes")
-    args=p.parse_args()
-
-    targets=load_targets(args.file)
-    if not targets:
-        print("No targets loaded; provide at least one target file with addresses.")
-        return
-    print(f"Loaded {len(targets):,} target addresses.")
-    print("Using coincurve" if HAVE_COINCURVE else "Using ecdsa fallback")
-
-    # determine CPU/worker count; user override allowed
-    cpu = args.workers if args.workers and args.workers>0 else max(1, os.cpu_count() or 1)
-
-    print(f"Launching {cpu} worker(s)...\n")
-
-    procs = []
-    for i in range(cpu):
-        p = multiprocessing.Process(target=worker, args=(i, targets))
-        p.daemon = True
-        p.start()
-        procs.append(p)
-
-    def handle_sigint(signum, frame):
-        print("\nShutting down...")
-        for p in procs:
+    ap=argparse.ArgumentParser(description="Seed scanner (1 word->12-word BIP39)")
+    ap.add_argument("--dict","-d",default="seed.txt")
+    ap.add_argument("--out","-o",default="found.txt")
+    ap.add_argument("--sleep",type=float,default=0.6)
+    ap.add_argument("--jitter",type=float,default=0.05)
+    ap.add_argument("--debug",action="store_true")
+    args=ap.parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    
+    session = requests.Session()
+    with open(args.dict,"r",encoding="utf-8") as fdict, open(args.out,"a",encoding="utf-8",buffering=1) as fout:
+        total=checked=found=0; start_time=time.time()
+        for line in fdict:
+            word=line.strip()
+            if not word: continue
+            total+=1
+            mnemonic=" ".join([word]*12)
             try:
-                p.terminate()
-            except Exception:
-                pass
-        sys.exit(0)
+                seed=mnemonic_to_seed(mnemonic)
+                master_k,master_c=bip32_master_from_seed(seed)
+                k44,_=derive_path(master_k,master_c,"m/44'/0'/0'/0/0")
+                k49,_=derive_path(master_k,master_c,"m/49'/0'/0'/0/0")
+                k84,_=derive_path(master_k,master_c,"m/84'/0'/0'/0/0")
+                addr_list=[
+                    ("p2pkh",p2pkh_from_privkey_bytes(k44),k44),
+                    ("p2sh-p2wpkh",p2sh_p2wpkh_from_privkey_bytes(k49),k49),
+                    ("p2wpkh",p2wpkh_bech32_from_privkey_bytes(k84),k84)
+                ]
+            except Exception as e:
+                logging.debug("Derivation failed for '%s': %s",mnemonic,e)
+                continue
 
-    signal.signal(signal.SIGINT, handle_sigint)
-    # keep main process alive while workers run
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        handle_sigint(None, None)
+            for atype, addr, priv32 in addr_list:
+                try: wif=wif_from_privhex(binascii.hexlify(priv32).decode())
+                except: wif=""
+                received=0.0
+                try: received=_get_raw_numeric(session,f"https://blockchain.info/q/getreceivedbyaddress/{addr}")
+                except: pass
+                checked+=1
+                if received==0.0:
+                    time.sleep(args.sleep+random.random()*args.jitter)
+                    continue
+                print(f"\nFOUND: {atype} {addr} | WIF: {wif} | RECEIVED: {received}\n")
+                fout.write(f"{mnemonic},{atype},{addr},{wif},{received}\n"); fout.flush(); found+=1
+                time.sleep(args.sleep+random.random()*args.jitter)
+
+            if total%100==0: logging.info("Processed %d words, checked:%d, found:%d", total, checked, found)
+        logging.info("Done. Total words:%d, checked:%d, found:%d", total, checked, found)
 
 if __name__=="__main__":
     main()
