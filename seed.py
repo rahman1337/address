@@ -1,4 +1,16 @@
-import os, sys, time, json, math
+#!/usr/bin/env python3
+"""
+scanner.py - bip32utils + pure-ed25519 Solana derivation (no PyNaCl)
+Generates 12-word BIP39 mnemonics (using seed.txt wordlist), derives:
+ - BTC (legacy 1..., P2SH nested segwit 3..., bech32 bc1q...)
+ - ETH (m/44'/60'/0'/0/0)
+ - BNB (same derivation as ETH)
+ - SOL (m/44'/501'/0'/0/0) using pure-python Ed25519 derivation (no PyNaCl)
+
+Checks balances with public endpoints. Sleeps 0.7s per request.
+Writes hits to found.txt, prints only "Tried N" normally; --debug shows addresses/APIs.
+"""
+import os, sys, time, json
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from mnemonic import Mnemonic
@@ -18,8 +30,9 @@ SLEEP_TIME = 0.7
 THREADS = 4
 DEBUG = "--debug" in sys.argv
 
+# Use a public ETH RPC — you can replace with another if you prefer
+ETH_RPC = "https://rpc.ankr.com/eth"   # fallback to a generally reliable public RPC
 BTC_API = "https://blockchain.info/q/addressbalance/"
-ETH_RPC = "https://cloudflare-eth.com"
 SOL_RPC = "https://api.mainnet-beta.solana.com"
 BNB_RPC = "https://bsc-dataseed.binance.org"
 
@@ -39,47 +52,33 @@ HARDEN = 0x80000000
 
 # ---------- BTC derivation using bip32utils ----------
 def derive_btc_addresses_from_seed(seed_bytes: bytes) -> Tuple[str,str,str]:
-    """
-    Derive BIP44 (legacy 1...), BIP49 (3...), BIP84 (bc1q...) first address
-    using bip32utils for BIP32 child derivation and constructing scripts manually.
-    """
-    # bip32utils expects entropy-like seed for fromEntropy; use HMAC-SHA512 seed as entropy input
-    # But bip32utils.BIP32Key.fromEntropy expects raw entropy (not BIP39 seed). However many examples
-    # pass Mnemonic.to_seed(mnemonic) directly to BIP32Key.fromEntropy(). Works in practice for many libs.
     root = BIP32Key.fromEntropy(seed_bytes)
 
     # Derive m/44'/0'/0'/0/0 (legacy P2PKH)
     k = root.ChildKey(44 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0).ChildKey(0)
     legacy = k.Address()
 
-    # For nested segwit (P2SH-P2WPKH): m/49'/0'/0'/0/0 -> get compressed pubkey then build redeemscript
+    # Nested segwit (P2SH-P2WPKH) m/49'/0'/0'/0/0
     k49 = root.ChildKey(49 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0).ChildKey(0)
-    pubkey49 = k49.PublicKey()  # compressed pubkey bytes
-    # Build witness program: OP_0 <20-byte HASH160(pubkey)>
+    pubkey49 = k49.PublicKey()
     h160 = hashlib.new("ripemd160", hashlib.sha256(pubkey49).digest()).digest()
-    redeem_script = b'\x00\x14' + h160  # 0x0014{20}
-    # P2SH address is base58check(0x05 + HASH160(redeem_script))
+    redeem_script = b'\x00\x14' + h160
     redeem_hash = hashlib.new("ripemd160", hashlib.sha256(redeem_script).digest()).digest()
     p2sh = base58.b58encode_check(b'\x05' + redeem_hash).decode()
 
-    # For bech32 native segwit (BIP84) m/84'/0'/0'/0/0 -> witness v0 program is HASH160(pubkey)
+    # Bech32 native segwit (BIP84) m/84'/0'/0'/0/0
     k84 = root.ChildKey(84 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0).ChildKey(0)
     pubkey84 = k84.PublicKey()
     h160_84 = hashlib.new("ripemd160", hashlib.sha256(pubkey84).digest()).digest()
-    # Convert to 5-bit words and bech32 encode (witness version 0)
-    witver = 0
     conv = bech32.convertbits(h160_84, 8, 5)
-    bech32_addr = bech32.bech32_encode("bc", [witver] + conv)
+    bech32_addr = bech32.bech32_encode("bc", [0] + conv)
     return legacy, p2sh, bech32_addr
 
 # ---------- ETH / BNB derivation ----------
 def derive_eth_address_from_seed(seed_bytes: bytes) -> str:
-    """
-    ETH: m/44'/60'/0'/0/0 -> take private key, compute address keccak(pubkey)[-20:], checksumed.
-    """
     root = BIP32Key.fromEntropy(seed_bytes)
     k = root.ChildKey(44 + HARDEN).ChildKey(60 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0).ChildKey(0)
-    priv = k.PrivateKey()  # bytes
+    priv = k.PrivateKey()
     sk = ecdsa.SigningKey.from_string(priv, curve=ecdsa.SECP256k1)
     vk = sk.get_verifying_key()
     uncompressed = b'\x04' + vk.to_string()
@@ -87,7 +86,6 @@ def derive_eth_address_from_seed(seed_bytes: bytes) -> str:
     keccak.update(uncompressed[1:])  # drop 0x04 prefix
     addr = keccak.hexdigest()[-40:]
     addr = "0x" + addr
-    # EIP-55 checksum
     checksum = checksum_eth_address(addr)
     return checksum
 
@@ -105,44 +103,37 @@ def checksum_eth_address(addr: str) -> str:
     return out
 
 # ---------- SOL derivation (pure Python, no PyNaCl) ----------
-# We'll implement SLIP-0010 / ed25519-BIP32 style derivation for Solana:
 def slip10_ed25519_master_key(seed: bytes):
     I = hmac.new(b"ed25519 seed", seed, hashlib.sha512).digest()
-    return I[:32], I[32:]  # (k, c)
+    return I[:32], I[32:]
 
 def ed25519_ckd_priv(k_par: bytes, c_par: bytes, index: int):
-    # Only support hardened child derivation as per ed25519/BIP32-Ed25519
     data = b'\x00' + k_par + struct.pack(">L", index)
     I = hmac.new(c_par, data, hashlib.sha512).digest()
     return I[:32], I[32:]
 
 def derive_sol_pubkey_from_mnemonic(mnemonic: str) -> str:
-    # Seed per BIP39
     seed = mnemo.to_seed(mnemonic, passphrase="")  # bytes
     k, c = slip10_ed25519_master_key(seed)
-    # Derivation path: m/44'/501'/0'/0' -> indexes hardened
     for idx in (44 + HARDEN, 501 + HARDEN, 0 + HARDEN, 0 + HARDEN):
         k, c = ed25519_ckd_priv(k, c, idx)
-    # k is private key (32 bytes) -> ed25519 public key = point(k)
-    # Use pure-python ed25519 to compute public key (no PyNaCl)
-    # We'll use ecdsa library doesn't support ed25519; instead use 'ed25519' pure python if available
+    # compute ed25519 public key using available libs
     try:
-        import ed25519  # often pure python implementation
-        priv = k
-        signing_key = ed25519.SigningKey(priv)
+        import ed25519
+        signing_key = ed25519.SigningKey(k)
         verify_key = signing_key.get_verifying_key()
         pub = verify_key.to_bytes()
     except Exception:
-        # fallback to pure python implementation using pynacl-like operations is complex.
-        # Try using cryptography's ed25519 if available
         try:
             from cryptography.hazmat.primitives.asymmetric import ed25519 as crypto_ed
+            from cryptography.hazmat.primitives import serialization
             sk = crypto_ed.Ed25519PrivateKey.from_private_bytes(k)
-            pub = sk.public_key().public_bytes()
+            pub = sk.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw
+            )
         except Exception:
-            # Last resort: raise helpful error
             raise RuntimeError("No ed25519 implementation found. Install 'ed25519' or 'cryptography' packages.")
-    # Solana address = base58(pubkey)
     return base58.b58encode(pub).decode()
 
 # ---------- Balance checkers ----------
@@ -160,19 +151,48 @@ def check_btc(addr):
     finally:
         time.sleep(SLEEP_TIME)
 
-def check_eth(addr):
-    try:
-        payload = {"jsonrpc":"2.0","method":"eth_getBalance","params":[addr,"latest"],"id":1}
-        r = requests.post(ETH_RPC, json=payload, timeout=15)
-        r.raise_for_status()
-        resp = r.json()
-        if "result" not in resp: raise ValueError(f"No result: {resp}")
-        return int(resp["result"], 16) / 1e18
-    except Exception as e:
-        if DEBUG: print(f"[Error][ETH] {e}")
-        return None
-    finally:
-        time.sleep(SLEEP_TIME)
+def check_eth(addr, max_retries: int = 3):
+    """Try up to max_retries times to get a valid balance; returns float balance, 0.0, or None on final error."""
+    payload = {"jsonrpc":"2.0","method":"eth_getBalance","params":[addr,"latest"],"id":1}
+    backoffs = [0.5, 1.0, 2.0]
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(ETH_RPC, json=payload, timeout=15)
+            r.raise_for_status()
+            resp = r.json()
+            # Some RPCs return an 'error' dict; treat it as failure and retry
+            if "result" not in resp:
+                last_exc = ValueError(f"No result: {resp}")
+                if DEBUG:
+                    print(f"[Debug][ETH] attempt {attempt+1}/{max_retries} response missing result: {resp}")
+                raise last_exc
+            # parse and return
+            val = int(resp["result"], 16) / 1e18
+            return val
+        except Exception as e:
+            last_exc = e
+            if attempt < max_retries - 1:
+                # short backoff before next attempt
+                if DEBUG:
+                    print(f"[Debug][ETH] attempt {attempt+1} failed: {e}; backing off {backoffs[min(attempt, len(backoffs)-1)]}s")
+                time.sleep(backoffs[min(attempt, len(backoffs)-1)])
+                continue
+            else:
+                # final attempt failed
+                if DEBUG:
+                    print(f"[Error][ETH] final attempt failed: {e}")
+                return None
+        finally:
+            # enforce base per-address throttle once per call (only on final attempt we want the sleep to happen once)
+            # but to keep behavior consistent we sleep only after finishing retry loop (handled by outer finally below)
+            pass
+    # fallback
+    if DEBUG and last_exc:
+        print(f"[Error][ETH] giving up after {max_retries} attempts: {last_exc}")
+    # final throttle
+    time.sleep(SLEEP_TIME)
+    return None
 
 def check_sol(addr):
     try:
@@ -195,8 +215,10 @@ def check_bnb(addr):
         r = requests.post(BNB_RPC, json=payload, timeout=15)
         r.raise_for_status()
         resp = r.json()
-        if "result" not in resp: raise ValueError(f"No result: {resp}")
-        return int(resp["result"], 16) / 1e18
+        if "result" not in resp:
+            raise ValueError(f"No result: {resp}")
+        val = int(resp["result"], 16) / 1e18
+        return val
     except Exception as e:
         if DEBUG: print(f"[Error][BNB] {e}")
         return None
@@ -243,14 +265,12 @@ def main():
     try:
         while True:
             mnemonic = mnemo.generate(strength=128)
-            # seed bytes (BIP39)
             seed = mnemo.to_seed(mnemonic)
-            # derive addresses
             try:
                 btc_addrs = derive_btc_addresses_from_seed(seed)
                 eth_addr = derive_eth_address_from_seed(seed)
                 sol_addr = derive_sol_pubkey_from_mnemonic(mnemonic)
-                bnb_addr = derive_eth_address_from_seed(seed)  # same as ETH
+                bnb_addr = derive_eth_address_from_seed(seed)
             except Exception as e:
                 if DEBUG: print(f"[DEBUG][DerivationError] {e}")
                 tried += 1
