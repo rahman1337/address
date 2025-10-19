@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, io, sys, time, logging, hashlib, binascii
+import argparse, io, sys, time, logging, hashlib, binascii, json
 import requests, base58
 from coincurve import PrivateKey
 try:
@@ -134,6 +134,32 @@ def print_used_eth(word, eth_addr, raw_wei, fout):
     fout.write(f"{word},ETH,,{eth_addr},,{raw_wei},{eth_amount}\n")
     fout.flush()
 
+def _eth_rpc_ws_connect(url: str, timeout: float = 10.0):
+    try:
+        import websocket
+    except Exception:
+        return None, "websocket-client not installed"
+    try:
+        ws = websocket.create_connection(url, timeout=timeout)
+        return ws, None
+    except Exception as e:
+        return None, str(e)
+
+def _eth_get_balance_ws(ws, eth_addr: str, req_id: int = 1, timeout: float = 15.0) -> int:
+    payload = {"jsonrpc": "2.0", "id": req_id, "method": "eth_getBalance", "params": [eth_addr, "latest"]}
+    try:
+        ws.send(json.dumps(payload))
+        resp = ws.recv()
+        j = json.loads(resp)
+        if isinstance(j, dict) and "result" in j and j["result"]:
+            try:
+                return int(j["result"], 16)
+            except Exception:
+                return 0
+        return 0
+    except Exception:
+        raise
+
 def main():
     ap = argparse.ArgumentParser(description="Brute sequential scanner: BTC (1,3,bc1q) + ETH (default on).")
     ap.add_argument("--dict", "-d", default="dictionary.txt", help="wordlist (one passphrase per line)")
@@ -144,6 +170,7 @@ def main():
     ap.set_defaults(eth=True)
     ap.add_argument("--base-received", default="https://blockchain.info/q/getreceivedbyaddress")
     ap.add_argument("--base-balance", default="https://blockchain.info/q/addressbalance")
+    ap.add_argument("--alchemy-ws", default="wss://eth-mainnet.g.alchemy.com/v2/k5d8RoDGOyxZmVWy2UPNowQlqFoZM3TX")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -171,6 +198,17 @@ def main():
         sys.exit(1)
 
     session = requests.Session()
+    ws = None
+    ws_req_id = 1
+    if args.eth:
+        ws, ws_err = _eth_rpc_ws_connect(args.alchemy_ws)
+        if ws is None:
+            logging.error("Cannot open Alchemy websocket: %s", ws_err)
+            logging.error("Disabling ETH checks.")
+            args.eth = False
+        else:
+            logging.info("Connected to Alchemy WS")
+
     total = checked = found = 0
     start_time = time.time()
     current_word = None
@@ -218,15 +256,29 @@ def main():
                 if args.eth:
                     try:
                         eth_addr = eth_address_from_privhex(priv_hex)
-                        url_eth_recv = f"{args.base_received}/{eth_addr}"
-                        eth_recv = _get_raw_numeric(session, url_eth_recv, timeout=20.0)
+                        try:
+                            eth_wei = _eth_get_balance_ws(ws, eth_addr, req_id=ws_req_id)
+                            ws_req_id += 1
+                        except Exception:
+                            try:
+                                ws.close()
+                            except Exception:
+                                pass
+                            ws, ws_err = _eth_rpc_ws_connect(args.alchemy_ws)
+                            if ws is None:
+                                logging.error("Alchemy WS reconnect failed: %s", ws_err)
+                                args.eth = False
+                                eth_wei = 0
+                            else:
+                                try:
+                                    eth_wei = _eth_get_balance_ws(ws, eth_addr, req_id=ws_req_id)
+                                    ws_req_id += 1
+                                except Exception:
+                                    eth_wei = 0
                         time.sleep(args.sleep)
-                        if eth_recv > 0:
-                            url_eth_bal = f"{args.base_balance}/{eth_addr}"
-                            eth_val = _get_raw_numeric(session, url_eth_bal, timeout=20.0)
-                            time.sleep(args.sleep)
-                            logging.info("Found used ETH address %s (recv=%s wei=%s)", eth_addr, eth_recv, eth_val)
-                            print_used_eth(word, eth_addr, eth_val, fout)
+                        if eth_wei > 0:
+                            logging.info("Found used ETH address %s (wei=%s)", eth_addr, eth_wei)
+                            print_used_eth(word, eth_addr, eth_wei, fout)
                             found += 1
                     except Exception as e:
                         logging.debug("ETH check error for word '%s': %s", word, e)
@@ -250,6 +302,11 @@ def main():
         logging.info("Interrupted by user after processing %d words, checked %d, found %d", total, checked, found)
 
     finally:
+        try:
+            if ws is not None:
+                ws.close()
+        except Exception:
+            pass
         session.close()
         fdict.close()
         fout.close()
