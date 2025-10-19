@@ -103,9 +103,7 @@ arrow
 art
 artefact
 artist
-artistic
-as
-ash
+artwork
 ask
 aspect
 assault
@@ -208,10 +206,8 @@ book
 boost
 border
 boring
-born
 borrow
 boss
-bottle
 bottom
 bounce
 box
@@ -330,7 +326,7 @@ chuckle
 chunk
 churn
 cigar
-cinema
+cinnamon
 circle
 citizen
 city
@@ -361,7 +357,6 @@ cluster
 clutch
 coach
 coast
-coat
 coconut
 code
 coffee
@@ -470,6 +465,8 @@ delay
 deliver
 demand
 demise
+denial
+dentist
 deny
 depart
 depend
@@ -477,6 +474,7 @@ deposit
 depth
 deputy
 derive
+describe
 desert
 design
 desk
@@ -852,7 +850,7 @@ head
 health
 heart
 heavy
-hedge
+hedgehog
 height
 hello
 helmet
@@ -1051,7 +1049,6 @@ load
 loan
 lobster
 local
-locate
 lock
 logic
 lonely
@@ -1062,7 +1059,7 @@ loud
 lounge
 love
 loyal
-luck
+lucky
 luggage
 lumber
 lunar
@@ -1109,10 +1106,8 @@ meat
 mechanic
 medal
 media
-medical
-medium
-meet
-melon
+melody
+melt
 member
 memory
 mention
@@ -1151,7 +1146,6 @@ monitor
 monkey
 monster
 month
-mood
 moon
 moral
 more
@@ -1287,7 +1281,7 @@ paper
 parade
 parent
 park
-parcel
+parrot
 party
 pass
 patch
@@ -1337,9 +1331,11 @@ plate
 play
 please
 pledge
+pluck
 plug
 plunge
-poetry
+poem
+poet
 point
 polar
 pole
@@ -1389,6 +1385,7 @@ provide
 public
 pudding
 pull
+pulp
 pulse
 pumpkin
 punch
@@ -1432,6 +1429,7 @@ raven
 raw
 razor
 ready
+real
 reason
 rebel
 rebuild
@@ -1918,6 +1916,7 @@ urban
 urge
 usage
 use
+used
 useful
 useless
 usual
@@ -1931,7 +1930,6 @@ valve
 van
 vanish
 vapor
-variety
 various
 vast
 vault
@@ -1976,7 +1974,7 @@ walk
 wall
 walnut
 want
-war
+warfare
 warm
 warrior
 wash
