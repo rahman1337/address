@@ -4,20 +4,14 @@ scanner.py
 Continuous BIP39 (12-word) mnemonic scanner that derives exact addresses
 and checks balances for BTC (legacy/P2SH/bech32), ETH, SOL, BNB.
 
-This version:
- - Uses bip32utils + mnemonic (no bip-utils / no PyNaCl)
- - Derives SOL using SLIP-0010 / ed25519 (pure-python path) so addresses match Phantom/Solflare
- - Checks ETH via Guarda public endpoint (no API key)
- - Retries every balance check up to 3 times on error
- - Sleeps SLEEP_TIME once per address check to respect rate limiting
- - Prints only "Tried <n>" for progress and prints mnemonic + balances when a hit is found
+This variant:
+ - Uses bip32utils + mnemonic (no bip-utils)
+ - ETH balance via your QuikNode RPC (no Guarda)
+ - Retries each balance check up to 3 times on error
+ - Sleeps SLEEP_TIME seconds per address check
+ - Prints only "Tried <n>" normally; prints mnemonic + balances when a hit is found
  - Appends found hits to found.txt
-
-Requirements:
-    pip install bip32utils mnemonic requests ecdsa pysha3 base58 bech32 ed25519 cryptography
-(You only need either `ed25519` (pure python) or `cryptography` for ed25519 pubkey derivation.)
 """
-
 import os
 import sys
 import time
@@ -37,10 +31,10 @@ import base58
 import bech32
 import sha3  # pysha3 (keccak_256)
 
-# Try to prefer ed25519 pure-python; fall back to cryptography
+# Optional ed25519 implementations for Solana pubkey derivation
 _ED25519_IMPL = None
 try:
-    import ed25519  # pure python implementation (optional)
+    import ed25519
     _ED25519_IMPL = "ed25519"
 except Exception:
     try:
@@ -54,11 +48,12 @@ except Exception:
 BIP39_WORDLIST_PATH = "seed.txt"
 FOUND_FILE = "found.txt"
 SLEEP_TIME = 0.7          # seconds per address (as requested)
-THREADS = 4               # number of concurrent checks (we check 4 coins)
+THREADS = 4               # number of concurrent checks
 DEBUG = "--debug" in sys.argv
 
-# RPC / API endpoints
-ETH_GUARDA = "https://ethbook.guarda.co/api/v2/address/"  # no API key
+# Replace ETH_RPC with your QuikNode URL (as provided)
+ETH_RPC = "https://stylish-neat-scion.quiknode.pro/4e897c028407135cf67fe7b589d8d6f25945c1a0/"
+
 BTC_API = "https://blockchain.info/q/addressbalance/"     # returns satoshis as integer in body
 SOL_RPC = "https://api.mainnet-beta.solana.com"
 BNB_RPC = "https://bsc-dataseed.binance.org"
@@ -78,12 +73,12 @@ if len(wl) != 2048 and DEBUG:
 mnemo = Mnemonic("english")
 mnemo.wordlist = wl  # override internal wordlist to use seed.txt
 
-# === Derivation helpers (using bip32utils + manual SLIP-0010 for ed25519) ===
+# === Derivation helpers (using bip32utils + SLIP-0010 for ed25519) ===
 
 def derive_btc_addresses(seed_bytes):
     """
     Returns [legacy_p2pkh (1...), p2sh_nested_segwit (3...), bech32 (bc1q...)]
-    using bip32utils BIP32Key.fromEntropy(seed_bytes)
+    using bip32utils.BIP32Key.fromEntropy(seed_bytes)
     """
     root = bip32utils.BIP32Key.fromEntropy(seed_bytes)
 
@@ -140,7 +135,7 @@ def checksum_eth_address(addr: str) -> str:
 
 def derive_bnb_address(seed_bytes):
     """
-    BNB (BSC) uses the same address format as Ethereum (m/44'/60'/0'/0/0).
+    BNB (BSC) uses the same address format as Ethereum (m/44'/60'/0'/0/0)
     """
     return derive_eth_address(seed_bytes)
 
@@ -211,13 +206,17 @@ def _check_btc_once(addr):
 
 
 def _check_eth_once(addr):
-    # Guarda endpoint returns JSON where "balance" is in wei (string/int)
-    r = requests.get(ETH_GUARDA + addr, timeout=15)
+    # Use eth_getBalance via QuikNode JSON-RPC endpoint
+    payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [addr, "latest"], "id": 1}
+    r = requests.post(ETH_RPC, json=payload, timeout=15)
     r.raise_for_status()
-    data = r.json()
-    if "balance" not in data:
-        raise ValueError(f"Unexpected Guarda response: {data}")
-    return int(data["balance"]) / 1e18
+    resp = r.json()
+    # If provider returns an "error" object, raise to trigger retry
+    if "error" in resp:
+        raise ValueError(f"RPC error: {resp['error']}")
+    if "result" not in resp:
+        raise ValueError(f"Unexpected ETH RPC response: {resp}")
+    return int(resp["result"], 16) / 1e18
 
 
 def _check_sol_once(addr):
@@ -293,7 +292,6 @@ def check_all_balances(addresses):
                 if val is None:
                     results[coin] = None
                 else:
-                    # ensure float and zero-handling
                     results[coin] = float(val) if val > 0 else 0.0
             except Exception as e:
                 results[coin] = None
