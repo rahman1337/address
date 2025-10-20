@@ -2,6 +2,7 @@
 """
 Multiprocessing Bitcoin address scanner using libsecp256k1 (coincurve).
 Continuous mode: does NOT stop on first match — prints matches and continues.
+Shared state uses multiprocessing.Manager() to avoid /dev/shm issues.
 Default: 3 worker processes, keeps all features (P2PKH, P2SH, Bech32).
 """
 
@@ -12,16 +13,16 @@ import hashlib
 import binascii
 import argparse
 import tempfile
-from multiprocessing import Process, Value, Lock, get_context
+from multiprocessing import Process, Manager
 
-# --- FIX for /dev/shm errors ---
+# Small safety: prefer /tmp for tempfile (harmless)
 tempfile.tempdir = "/tmp"
 
-# --- Use coincurve (libsecp256k1 C backend) ---
+# Use coincurve (libsecp256k1 C backend)
 try:
     from coincurve import PrivateKey
 except Exception:
-    print("ERROR: coincurve is required. Install it with: pip install coincurve")
+    print("ERROR: coincurve is required. Install with: pip install coincurve")
     raise
 
 # --- Base58 / Bech32 helpers ---
@@ -115,8 +116,8 @@ def load_targets(paths):
           f"P2PKH={counts['p2pkh']} P2SH={counts['p2sh']} Bech32={counts['bech32']}")
     return targets
 
-# --- Worker process ---
-def worker_main(proc_index: int, targets, total_counter: Value, counter_lock: Lock,
+# --- Worker process (continuous) ---
+def worker_main(proc_index: int, targets, total_counter, counter_lock,
                 report_every: int, debug: bool, hrp: str):
     local_count = 0
     last_report = time.time()
@@ -149,6 +150,7 @@ def worker_main(proc_index: int, targets, total_counter: Value, counter_lock: Lo
         if local_count % report_every == 0:
             now = time.time()
             interval = now - last_report if last_report else 1.0
+            # update manager-shared counter
             with counter_lock:
                 total_counter.value += (local_count - last_local)
             elapsed = now - start_time_global
@@ -157,14 +159,14 @@ def worker_main(proc_index: int, targets, total_counter: Value, counter_lock: Lo
             interval_rate = (local_count - last_local) / interval if interval > 0 else 0.0
 
             if debug:
-                print(f"[{proc_name}] {local_count:,} keys — {interval_rate:,.1f} keys/s (total {total_keys:,} — {total_rate:,.1f} keys/s)")
+                print(f"[{proc_name}] {local_count:,} keys tried — {interval_rate:,.1f} keys/s (total {total_keys:,} — {total_rate:,.1f} keys/s)")
             else:
                 print(f"[{proc_name}] {local_count:,} keys — {interval_rate:,.1f} keys/s")
             last_report = now
             last_local = local_count
 
-# --- Reporter (prints global totals periodically) ---
-def reporter_main(total_counter: Value, counter_lock: Lock, refresh: float):
+# --- Reporter process (prints global totals periodically) ---
+def reporter_main(total_counter, counter_lock, refresh: float):
     prev = 0
     prev_t = time.time()
     while True:
@@ -181,7 +183,7 @@ def reporter_main(total_counter: Value, counter_lock: Lock, refresh: float):
 
 # --- Main ---
 def main():
-    parser = argparse.ArgumentParser(description="Multiprocess Bitcoin scanner (secp256k1 via coincurve) — continuous mode")
+    parser = argparse.ArgumentParser(description="Multiprocess Bitcoin scanner (secp256k1 via coincurve) — continuous mode, Manager-backed")
     parser.add_argument("--file", "-f", nargs="+", default=["btc1.txt", "btc2.txt", "btc3.txt"])
     parser.add_argument("--processes", "-p", type=int, default=3, help="Number of worker processes (default 3)")
     parser.add_argument("--report-every", "-r", type=int, default=2000, help="Local report interval per process")
@@ -194,17 +196,18 @@ def main():
         print("No valid addresses loaded.")
         return
 
-    ctx = get_context("fork")  # ensure no /dev/shm dependency
-    total_counter = ctx.Value('Q', 0)
-    counter_lock = ctx.Lock()
+    # Manager-backed shared objects (avoids /dev/shm issues)
+    manager = Manager()
+    total_counter = manager.Value('Q', 0)   # unsigned long long
+    counter_lock = manager.Lock()
 
     # reporter process
-    reporter_proc = ctx.Process(target=reporter_main, args=(total_counter, counter_lock, 2.0), daemon=True)
+    reporter_proc = Process(target=reporter_main, args=(total_counter, counter_lock, 2.0), daemon=True)
     reporter_proc.start()
 
     processes = []
     for i in range(args.processes):
-        p = ctx.Process(
+        p = Process(
             target=worker_main,
             args=(i+1, targets, total_counter, counter_lock, args.report_every, args.debug, args.hrp),
             daemon=True
@@ -234,6 +237,7 @@ def main():
         except Exception:
             pass
 
+        # final totals
         with counter_lock:
             final = total_counter.value
         elapsed = time.time() - start_time_global
