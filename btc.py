@@ -192,7 +192,7 @@ def main():
         print("No valid addresses loaded.")
         return
 
-    ctx = get_context()  # platform default
+    ctx = get_context("fork")  # platform default
     total_counter = ctx.Value('Q', 0)  # unsigned long long
     counter_lock = ctx.Lock()
 
