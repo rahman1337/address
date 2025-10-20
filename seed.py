@@ -1,49 +1,41 @@
 #!/usr/bin/env python3
-"""
-btc_scan_20permnemonic.py
-
-Generate 12-word mnemonics from seed.txt (2048 words). For each mnemonic:
- - scan indices i = 0..19 (20 indices) using strict paths:
-     m/44'/0'/0'/0/i   -> P2PKH (1...)
-     m/49'/0'/0'/0/i   -> P2SH-P2WPKH (3...)
-     m/84'/0'/0'/0/i   -> P2WPKH (bc1q...)
- - use 3 threads, partition indices by i % 3 == thread_id
- - check balance immediately via blockchain.info/q/addressbalance/<addr> (satoshis)
- - sleep 0.5s between checks
- - if balance > 0 print immediately:
-     PASSPHRASE
-     ADDRESS
-     BALANCE
- - quiet mode prints only hits and errors; -d prints debug info
-"""
 import os
 import sys
 import time
 import hashlib
 import requests
+import argparse
 from threading import Thread
 from mnemonic import Mnemonic
 import bip32utils
 import base58
 import bech32
-import argparse
 
-# ---------- Config ----------
+# ---------- Defaults (can be overridden via CLI) ----------
 WORDLIST_FILE = "seed.txt"    # 2048-word BIP39 list (one per line)
 THREAD_COUNT = 3
-INDICES_PER_MNEMONIC = 20     # scan i = 0..19 for each mnemonic
-SLEEP_BETWEEN_CHECKS = 0.5    # seconds
-BALANCE_API = "https://blockchain.info/q/addressbalance/"
+DEFAULT_INDICES_PER_MNEMONIC = 25   # recommended default (changeable)
+SLEEP_BETWEEN_CHECKS = 0.5    # seconds (between each address check)
+RECEIVED_API = "https://blockchain.info/q/receivedbyaddress/"
+BALANCE_API  = "https://blockchain.info/q/addressbalance/"
 HARDEN = 0x80000000
 FOUND_FILE = "found.txt"
-# ----------------------------
+# ---------------------------------------------------------
 
-ap = argparse.ArgumentParser()
-ap.add_argument("-d", "--debug", action="store_true", help="debug mode: print each address checked and HTTP responses")
-args = ap.parse_args()
+def parse_args():
+    ap = argparse.ArgumentParser(description="Scan 3 address types for N indices per generated mnemonic (received-first).")
+    ap.add_argument("-d", "--debug", action="store_true", help="debug mode: print each address and HTTP responses")
+    ap.add_argument("--indices", type=int, default=DEFAULT_INDICES_PER_MNEMONIC,
+                    help=f"how many indices to scan per mnemonic (default {DEFAULT_INDICES_PER_MNEMONIC})")
+    ap.add_argument("--wordlist", type=str, default=WORDLIST_FILE, help="path to 2048-word BIP39 wordlist (default seed.txt)")
+    return ap.parse_args()
+
+args = parse_args()
 DEBUG = args.debug
+INDICES_PER_MNEMONIC = args.indices
+WORDLIST_FILE = args.wordlist
 
-# Load custom wordlist
+# Load and validate wordlist
 if not os.path.exists(WORDLIST_FILE):
     sys.exit(f"Missing {WORDLIST_FILE} (should contain 2048 BIP39 words, one per line)")
 
@@ -57,8 +49,9 @@ mnemo = Mnemonic("english")
 mnemo.wordlist = wl
 
 session = requests.Session()
-session.headers.update({"User-Agent": "btc-scan-20permnemonic/1.0"})
+session.headers.update({"User-Agent": "btc-scan-per-mnemonic/1.0"})
 
+# Helpers
 def hash160(data: bytes) -> bytes:
     return hashlib.new("ripemd160", hashlib.sha256(data).digest()).digest()
 
@@ -89,65 +82,27 @@ def derive_btc_addresses_from_seed(seed_bytes, index):
 
     return addr_p2pkh, addr_p2sh, addr_bech
 
+def check_received_sats(addr):
+    url = RECEIVED_API + addr
+    r = session.get(url, timeout=12)
+    if DEBUG:
+        body = (r.text or "").strip()
+        if len(body) > 200:
+            body = body[:200] + "..."
+        print(f"[DEBUG] GET {url} -> {r.status_code} | {body}", flush=True)
+    r.raise_for_status()
+    return int(r.text.strip())
+
 def check_balance_sats(addr):
-    """
-    Query blockchain.info/q/addressbalance/<addr>
-    Returns integer satoshis (>=0) or raises.
-    """
     url = BALANCE_API + addr
     r = session.get(url, timeout=12)
     if DEBUG:
         body = (r.text or "").strip()
-        if len(body) > 300:
-            body = body[:300] + "..."
+        if len(body) > 200:
+            body = body[:200] + "..."
         print(f"[DEBUG] GET {url} -> {r.status_code} | {body}", flush=True)
     r.raise_for_status()
-    txt = r.text.strip()
-    return int(txt)
-
-def worker_scan_indices(thread_id, seed_bytes, mnemonic, indices_part, found_flag_container):
-    """
-    Each worker processes its assigned indices (a list) for the given seed/mnemonic.
-    found_flag_container is a single-item list used as a shared flag (mutable) to note finds.
-    """
-    for index in indices_part:
-        # derive 3 addresses for this index
-        try:
-            addr1, addr2, addr3 = derive_btc_addresses_from_seed(seed_bytes, index)
-        except Exception as e:
-            print(f"[Error][Derive] idx={index} thread={thread_id} exception: {e}", flush=True)
-            continue
-
-        for addr in (addr1, addr2, addr3):
-            try:
-                sats = check_balance_sats(addr)
-            except Exception as e:
-                # print errors even in quiet mode per your requirement
-                print(f"[Error][Balance] {addr}: {e}", flush=True)
-                time.sleep(SLEEP_BETWEEN_CHECKS)
-                continue
-
-            if sats and sats > 0:
-                # immediate print: PASSPHRASE\nADDRESS\nBALANCE (satoshis)
-                print(mnemonic, flush=True)
-                print(addr, flush=True)
-                print(str(sats), flush=True)
-                # record to file (best-effort)
-                try:
-                    with open(FOUND_FILE, "a", encoding="utf-8") as fh:
-                        fh.write(f"Mnemonic: {mnemonic}\nAddress: {addr}\nBalance(sats): {sats}\n\n")
-                except Exception:
-                    pass
-                # set shared flag so main could (optionally) react
-                try:
-                    found_flag_container[0] = True
-                except Exception:
-                    pass
-            else:
-                if DEBUG:
-                    print(f"[DEBUG] idx={index} addr={addr} -> {sats} sats", flush=True)
-
-            time.sleep(SLEEP_BETWEEN_CHECKS)
+    return int(r.text.strip())
 
 def partition_indices(n_indices, n_parts):
     parts = [[] for _ in range(n_parts)]
@@ -155,43 +110,83 @@ def partition_indices(n_indices, n_parts):
         parts[i % n_parts].append(i)
     return parts
 
-def main():
+def worker_scan_partition(thread_id, seed_bytes, mnemonic, indices_part):
+    """
+    Worker scans the provided list of indices for the given seed/mnemonic.
+    For each derived address: check received first, only check balance if received>0.
+    Sleep SLEEP_BETWEEN_CHECKS after each address check.
+    """
+    for index in indices_part:
+        try:
+            addr1, addr2, addr3 = derive_btc_addresses_from_seed(seed_bytes, index)
+        except Exception as e:
+            print(f"[Error][Derive] idx={index} thread={thread_id}: {e}", flush=True)
+            continue
+
+        for addr in (addr1, addr2, addr3):
+            try:
+                received = check_received_sats(addr)
+            except Exception as e:
+                print(f"[Error][Received] {addr}: {e}", flush=True)
+                time.sleep(SLEEP_BETWEEN_CHECKS)
+                continue
+
+            # always sleep between address checks (as requested)
+            time.sleep(SLEEP_BETWEEN_CHECKS)
+
+            if received and received > 0:
+                try:
+                    balance = check_balance_sats(addr)
+                except Exception as e:
+                    print(f"[Error][Balance] {addr}: {e}", flush=True)
+                    # still continue scanning
+                    continue
+
+                # Immediate print PASSPHRASE\nADDRESS\nBALANCE (sats)
+                print(mnemonic, flush=True)
+                print(addr, flush=True)
+                print(str(balance), flush=True)
+
+                # write to found file as best-effort
+                try:
+                    with open(FOUND_FILE, "a", encoding="utf-8") as fh:
+                        fh.write(f"Mnemonic: {mnemonic}\nAddress: {addr}\nBalance(sats): {balance}\n\n")
+                except Exception:
+                    pass
+            else:
+                if DEBUG:
+                    print(f"[DEBUG] idx={index} addr={addr} -> received=0", flush=True)
+
+def main_loop():
     round_ctr = 0
     while True:
         round_ctr += 1
-        # 1) generate a new 12-word mnemonic
+        # generate new mnemonic per round
         mnemonic = mnemo.generate(strength=128)  # 12 words
         seed_bytes = mnemo.to_seed(mnemonic, passphrase="")
 
         if DEBUG:
             print(f"[DEBUG] Round {round_ctr}: mnemonic={mnemonic}", flush=True)
 
-        # 2) build index partitions for THREAD_COUNT threads
+        # partition indices 0..INDICES_PER_MNEMONIC-1 across threads
         parts = partition_indices(INDICES_PER_MNEMONIC, THREAD_COUNT)
 
-        # shared flag container to indicate if any positive found this round
-        found_flag = [False]
-
-        # 3) spawn threads, each scanning its partition of indices for this mnemonic
         threads = []
         for t in range(THREAD_COUNT):
-            th = Thread(target=worker_scan_indices, args=(t, seed_bytes, mnemonic, parts[t], found_flag), daemon=False)
+            th = Thread(target=worker_scan_partition, args=(t, seed_bytes, mnemonic, parts[t]), daemon=False)
             threads.append(th)
             th.start()
 
-        # wait for all threads to finish scanning these 20 indices
+        # wait for threads to finish scanning the indices for this mnemonic
         for th in threads:
             th.join()
 
         if DEBUG:
-            print(f"[DEBUG] Completed round {round_ctr}. found_any={found_flag[0]}", flush=True)
-
-        # after scanning INDICES_PER_MNEMONIC indices for this mnemonic, move on to next mnemonic
-        # (per your spec). repeat.
+            print(f"[DEBUG] Completed round {round_ctr} (scanned {INDICES_PER_MNEMONIC} indices).", flush=True)
 
 if __name__ == "__main__":
     try:
-        main()
+        main_loop()
     except KeyboardInterrupt:
         print("\nStopped by user.", flush=True)
         sys.exit(0)
