@@ -57,7 +57,7 @@ def privkey_to_wif(privkey_bytes: bytes, compressed: bool = True) -> str:
     return base58check_encode(prefix)
 
 # ---------------------------
-# P2PKH (1...), P2SH(P2WPKH) (3...), Bech32 (bc1q...)
+# Addresses
 # ---------------------------
 def pubkey_to_p2pkh_address(pubkey_bytes: bytes) -> str:
     h160 = hash160(pubkey_bytes)
@@ -71,9 +71,8 @@ def pubkey_to_p2sh_p2wpkh_address(pubkey_bytes: bytes) -> str:
     prefix = b'\x05' + redeem_h160
     return base58check_encode(prefix)
 
-# Bech32 helpers (minimal for v0 P2WPKH)
+# Bech32 (v0 P2WPKH only)
 BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-BECH32_CHARSET_MAP = {c: i for i, c in enumerate(BECH32_CHARSET)}
 
 def bech32_polymod(values):
     GENERATORS = [
@@ -133,7 +132,7 @@ def pubkey_to_bech32_p2wpkh(pubkey_bytes: bytes, hrp='bc') -> str:
     return bech32_encode(hrp, data)
 
 # ---------------------------
-# API base
+# API base & sleep
 # ---------------------------
 API_BASE = "https://blockchain.info/q"
 SLEEP_BETWEEN_CHECKS = 0.5
@@ -155,30 +154,24 @@ def print_found(text):
 def worker(worker_id: int, args, stop_event: threading.Event):
     session = requests.Session()
     while not stop_event.is_set():
-        # generate valid private key
+        # generate a valid private key
         while True:
             priv_bytes = secrets.token_bytes(32)
             try:
                 priv = PrivateKey(priv_bytes)
                 break
             except Exception:
-                # improbable but be resilient
                 continue
 
-        # compressed pubkey
         pub_compressed = priv.public_key.format(compressed=True)
 
-        # WIF (compressed)
         try:
-            # coincurve PrivateKey exposes secret attribute (bytes) in many versions
             secret_bytes = priv.secret
         except Exception:
-            # fallback: use the original priv_bytes if needed
             secret_bytes = priv_bytes
 
         wif = privkey_to_wif(secret_bytes, compressed=True)
 
-        # derive addresses
         addr_p2pkh = pubkey_to_p2pkh_address(pub_compressed)
         addr_p2sh = pubkey_to_p2sh_p2wpkh_address(pub_compressed)
         addr_bech32 = pubkey_to_bech32_p2wpkh(pub_compressed, hrp='bc')
@@ -193,23 +186,27 @@ def worker(worker_id: int, args, stop_event: threading.Event):
             if args.debug:
                 print(f"[T{worker_id}] Checking {a_type} {addr} ...", flush=True)
 
-            # 1) check received
+            # check received (plain-text endpoint)
+            url_received = f"{API_BASE}/getreceivedbyaddress/{addr}"
             try:
-                r = session.get(f"{API_BASE}/getreceivedbyaddress?address={addr}", timeout=10)
+                r = session.get(url_received, timeout=10)
             except requests.RequestException as e:
-                print_error(f"API error checking received for {addr}: {e}")
+                print_error(f"network error when checking received for {addr}: {e}")
                 time.sleep(SLEEP_BETWEEN_CHECKS)
                 continue
 
+            # debug output: show status and body (first 300 chars)
             if args.debug:
                 body = r.text.strip()[:300].replace('\n',' ')
                 print(f"[T{worker_id}] Received API ({addr}) HTTP {r.status_code} -> {body}", flush=True)
 
             if r.status_code != 200:
+                # treat non-200 as API error (don't assume zero)
                 print_error(f"getreceivedbyaddress HTTP {r.status_code} for {addr}")
                 time.sleep(SLEEP_BETWEEN_CHECKS)
                 continue
 
+            # parse plain-text integer satoshis
             try:
                 received_sat = int(r.text.strip())
             except ValueError:
@@ -223,11 +220,12 @@ def worker(worker_id: int, args, stop_event: threading.Event):
                 time.sleep(SLEEP_BETWEEN_CHECKS)
                 continue
 
-            # received > 0 -> check balance
+            # received > 0 -> check balance (plain-text)
+            url_balance = f"{API_BASE}/addressbalance/{addr}"
             try:
-                r2 = session.get(f"{API_BASE}/addressbalance?address={addr}", timeout=10)
+                r2 = session.get(url_balance, timeout=10)
             except requests.RequestException as e:
-                print_error(f"API error checking balance for {addr}: {e}")
+                print_error(f"network error when checking balance for {addr}: {e}")
                 time.sleep(SLEEP_BETWEEN_CHECKS)
                 continue
 
@@ -251,10 +249,8 @@ def worker(worker_id: int, args, stop_event: threading.Event):
             out = f"{wif}\n{addr}\n{received_sat}\n{balance_sat}"
             print_found(out)
 
-            # sleep between checks (per your request)
             time.sleep(SLEEP_BETWEEN_CHECKS)
 
-    # thread ending
     if args.debug:
         print(f"[T{worker_id}] stopping.", flush=True)
 
@@ -275,13 +271,11 @@ def main():
             t.start()
             threads.append(t)
 
-        # Keep main alive until Ctrl+C
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nInterrupted by user. Stopping...", flush=True)
         stop_event.set()
-        # give threads a moment to finish
         for t in threads:
             t.join(timeout=1)
         print("Stopped.", flush=True)
