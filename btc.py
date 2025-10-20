@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-btc.py - threaded (3 threads) Bitcoin address scanner
-- Uses coincurve (libsecp256k1) if available
-- 3 threads by default (use --threads N to change)
+btc.py - threaded (5 threads default) Bitcoin address scanner
+- Uses coincurve (libsecp256k1) for fast pubkey derivation
+- 5 threads by default (change with --threads / -t)
 - --debug prints throughput every 5s
 - Default target files: btc1.txt, btc2.txt, btc3.txt
 - WIF generated only on match
@@ -43,30 +43,43 @@ def base58check_encode(payload_bytes, version_byte=0):
         res.append(B58_ALPHABET[r])
     n_pad = 0
     for b in full:
-        if b == 0: n_pad += 1
-        else: break
-    return '1'*n_pad + ''.join(reversed(res))
+        if b == 0:
+            n_pad += 1
+        else:
+            break
+    return '1' * n_pad + ''.join(reversed(res))
 
 def base58check_decode(s):
-    num = 0
-    for ch in s: num = num*58 + B58_MAP[ch]
-    full = num.to_bytes((num.bit_length()+7)//8, 'big') if num != 0 else b'\0'
-    n_pad = 0
-    for c in s:
-        if c == '1': n_pad += 1
-        else: break
-    data = b'\0'*n_pad + full
-    if len(data) < 5:
+    # Decode base58 string to payload and version, validating checksum.
+    # Handles leading '1' padding correctly.
+    n = 0
+    for ch in s:
+        if ch not in B58_MAP:
+            raise ValueError("Invalid Base58 character")
+        n = n * 58 + B58_MAP[ch]
+    # convert to minimal bytes
+    full = n.to_bytes((n.bit_length() + 7) // 8, 'big') if n != 0 else b''
+    # add leading zero bytes for each leading '1'
+    leading_ones = 0
+    for ch in s:
+        if ch == '1':
+            leading_ones += 1
+        else:
+            break
+    full = b'\x00' * leading_ones + full
+    if len(full) < 5:
         raise ValueError("Invalid base58 length")
-    payload, chk = data[:-4], data[-4:]
-    if sha256(sha256(payload))[:4] != chk:
-        raise ValueError("Invalid checksum")
-    return payload[0], payload[1:]
+    payload, checksum = full[:-4], full[-4:]
+    if sha256(sha256(payload))[:4] != checksum:
+        raise ValueError("Bad checksum")
+    version = payload[0]
+    return version, payload[1:]
 
 def convertbits(data, frombits, tobits, pad=True):
     acc = 0; bits = 0; ret = []; maxv = (1 << tobits) - 1
     for value in data:
-        if value < 0 or (value >> frombits): return None
+        if value < 0 or (value >> frombits):
+            return None
         acc = (acc << frombits) | value
         bits += frombits
         while bits >= tobits:
@@ -97,17 +110,25 @@ def bech32_verify_checksum(hrp, data):
 def bech32_decode(bech):
     bech = bech.strip()
     if bech.lower() != bech and bech.upper() != bech:
-        raise ValueError("Mixed case")
+        raise ValueError("Mixed case in bech32")
     bech = bech.lower()
-    if '1' not in bech: raise ValueError("No separator")
-    pos = bech.rfind('1'); hrp = bech[:pos]; data_part = bech[pos+1:]
+    if '1' not in bech:
+        raise ValueError("No separator")
+    pos = bech.rfind('1')
+    hrp = bech[:pos]
+    data_part = bech[pos+1:]
     data = [BECH32_CHAR_MAP.get(c, -1) for c in data_part]
-    if any(d == -1 for d in data): raise ValueError("Invalid char")
-    if not bech32_verify_checksum(hrp, data): raise ValueError("Invalid checksum")
+    if any(d == -1 for d in data):
+        raise ValueError("Invalid bech32 character")
+    if not bech32_verify_checksum(hrp, data):
+        raise ValueError("Invalid bech32 checksum")
     data = data[:-6]
-    if not data: raise ValueError("Empty data")
-    witver = data[0]; prog = convertbits(data[1:], 5, 8, False)
-    if prog is None: raise ValueError("Invalid prog")
+    if not data:
+        raise ValueError("Empty bech32 data")
+    witver = data[0]
+    prog = convertbits(data[1:], 5, 8, False)
+    if prog is None:
+        raise ValueError("Invalid witness program")
     return hrp, witver, bytes(prog)
 
 def encode_bech32(hrp, witver, witprog):
@@ -120,8 +141,8 @@ def encode_bech32(hrp, witver, witprog):
 
 def wif_from_priv(priv32, compressed=True, testnet=False):
     payload = priv32 + (b'\x01' if compressed else b'')
-    version = 0x80 if not testnet else 0xef
-    return base58check_encode(payload, version)
+    version_byte = 0x80 if not testnet else 0xef
+    return base58check_encode(payload, version_byte)
 
 # --- targets ---
 def load_targets(paths):
@@ -139,9 +160,12 @@ def load_targets(paths):
                             bech.add((hrp,witver,prog))
                         else:
                             version,payload = base58check_decode(s_low)
-                            if version in (0x00,0x6f): p2pkh.add(bytes(payload))
-                            elif version in (0x05,0xc4): p2sh.add(bytes(payload))
-                            else: p2pkh.add(bytes(payload))
+                            if version in (0x00,0x6f):
+                                p2pkh.add(bytes(payload))
+                            elif version in (0x05,0xc4):
+                                p2sh.add(bytes(payload))
+                            else:
+                                p2pkh.add(bytes(payload))
                     except Exception:
                         continue
         except FileNotFoundError:
@@ -235,7 +259,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--file","-f", nargs="+", default=default_files)
     parser.add_argument("--network", choices=["mainnet","testnet"], default="mainnet")
-    parser.add_argument("--threads","-t", type=int, default=3, help="number of threads (default 3)")
+    parser.add_argument("--threads","-t", type=int, default=5, help="number of threads (default 5)")
     parser.add_argument("--report-every","-r", type=int, default=100000)
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--debug", action="store_true", help="enable debug throughput every 5s")
@@ -291,7 +315,6 @@ def main():
         print("\nInterrupted by user — stopping threads")
         stop_evt.set()
     finally:
-        # give threads a moment to exit
         for t in threads:
             t.join(timeout=1)
         print("Threads stopped. Exiting.")
