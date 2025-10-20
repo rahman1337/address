@@ -2,7 +2,7 @@
 """
 Multiprocessing Bitcoin address scanner using libsecp256k1 (coincurve).
 Continuous mode: does NOT stop on first match — prints matches and continues.
-Default: 3 worker processes, keep All features (P2PKH, P2SH, Bech32).
+Default: 3 worker processes, keeps all features (P2PKH, P2SH, Bech32).
 """
 
 import sys
@@ -11,16 +11,20 @@ import secrets
 import hashlib
 import binascii
 import argparse
+import tempfile
 from multiprocessing import Process, Value, Lock, get_context
 
-# coincurve for secp256k1 (C-backed)
+# --- FIX for /dev/shm errors ---
+tempfile.tempdir = "/tmp"
+
+# --- Use coincurve (libsecp256k1 C backend) ---
 try:
     from coincurve import PrivateKey
 except Exception:
-    print("ERROR: coincurve is required. Install with `pip install coincurve`")
+    print("ERROR: coincurve is required. Install it with: pip install coincurve")
     raise
 
-# --- Base58 / Bech32 helpers (kept inline) ---
+# --- Base58 / Bech32 helpers ---
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
@@ -111,7 +115,7 @@ def load_targets(paths):
           f"P2PKH={counts['p2pkh']} P2SH={counts['p2sh']} Bech32={counts['bech32']}")
     return targets
 
-# --- Worker process (continuous) ---
+# --- Worker process ---
 def worker_main(proc_index: int, targets, total_counter: Value, counter_lock: Lock,
                 report_every: int, debug: bool, hrp: str):
     local_count = 0
@@ -123,7 +127,7 @@ def worker_main(proc_index: int, targets, total_counter: Value, counter_lock: Lo
         priv = secrets.token_bytes(32)
         p2pkh, p2sh, bech32 = generate_addresses(priv, hrp)
 
-        # if any of the generated addresses is in targets, print it — but KEEP RUNNING
+        # Check all three address types
         match = None
         if p2pkh in targets:
             match = p2pkh
@@ -139,11 +143,9 @@ def worker_main(proc_index: int, targets, total_counter: Value, counter_lock: Lo
             print(f"[{proc_name}] WIF : {wif}")
             print(f"[{proc_name}] ADDR: {match}")
             print("===============================\n")
-            # **DO NOT** exit; continue scanning
 
         local_count += 1
 
-        # batch update the shared total occasionally to reduce lock contention
         if local_count % report_every == 0:
             now = time.time()
             interval = now - last_report if last_report else 1.0
@@ -155,7 +157,7 @@ def worker_main(proc_index: int, targets, total_counter: Value, counter_lock: Lo
             interval_rate = (local_count - last_local) / interval if interval > 0 else 0.0
 
             if debug:
-                print(f"[{proc_name}] {local_count:,} keys tried — {interval_rate:,.1f} keys/s (total {total_keys:,} — {total_rate:,.1f} keys/s)")
+                print(f"[{proc_name}] {local_count:,} keys — {interval_rate:,.1f} keys/s (total {total_keys:,} — {total_rate:,.1f} keys/s)")
             else:
                 print(f"[{proc_name}] {local_count:,} keys — {interval_rate:,.1f} keys/s")
             last_report = now
@@ -192,25 +194,25 @@ def main():
         print("No valid addresses loaded.")
         return
 
-    ctx = get_context("fork")  # platform default
-    total_counter = ctx.Value('Q', 0)  # unsigned long long
+    ctx = get_context("fork")  # ensure no /dev/shm dependency
+    total_counter = ctx.Value('Q', 0)
     counter_lock = ctx.Lock()
 
-    # spawn reporter
+    # reporter process
     reporter_proc = ctx.Process(target=reporter_main, args=(total_counter, counter_lock, 2.0), daemon=True)
     reporter_proc.start()
 
-    # spawn workers
     processes = []
     for i in range(args.processes):
-        p = ctx.Process(target=worker_main,
-                        args=(i+1, targets, total_counter, counter_lock, args.report_every, args.debug, args.hrp),
-                        daemon=True)
+        p = ctx.Process(
+            target=worker_main,
+            args=(i+1, targets, total_counter, counter_lock, args.report_every, args.debug, args.hrp),
+            daemon=True
+        )
         processes.append(p)
         p.start()
 
     try:
-        # run until user interrupts
         while True:
             live = any(p.is_alive() for p in processes)
             if not live:
@@ -220,7 +222,6 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted by user. Stopping processes...")
     finally:
-        # ensure termination
         for p in processes:
             try:
                 p.terminate()
@@ -240,6 +241,5 @@ def main():
         print(f"\nFinished. Total keys tried: {final:,} — avg {avg:,.1f} keys/s over {elapsed:.1f}s")
 
 if __name__ == "__main__":
-    # global start time used by workers and reporter
     start_time_global = time.time()
     main()
