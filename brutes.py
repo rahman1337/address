@@ -22,6 +22,8 @@ RECEIVED_API = "https://blockchain.info/q/getreceivedbyaddress/"
 BALANCE_API = "https://blockchain.info/q/addressbalance/"
 FOUND_FILE = "found.txt"
 HARDEN = 0x80000000
+RETRY_LIMIT = 3
+RETRY_DELAY = 1.0
 # =============================
 
 # CLI args
@@ -78,12 +80,28 @@ def derive_addresses(seed_bytes, index):
 
     return [addr44, addr49, addr84]
 
+# --- API checkers with retries ---
+def http_get_with_retry(session, url):
+    """GET with retry on network/timeout errors."""
+    for attempt in range(1, RETRY_LIMIT + 1):
+        try:
+            r = session.get(url, timeout=12)
+            return r
+        except requests.RequestException as e:
+            if DEBUG:
+                print(f"[DEBUG] Retry {attempt}/{RETRY_LIMIT} for {url} due to {e}", flush=True)
+            if attempt < RETRY_LIMIT:
+                time.sleep(RETRY_DELAY)
+            else:
+                if DEBUG:
+                    print(f"[DEBUG] Gave up on {url} after {RETRY_LIMIT} retries", flush=True)
+                return None
+    return None
+
 def check_received(session, addr: str):
     url = RECEIVED_API + addr
-    try:
-        r = session.get(url, timeout=12)
-    except requests.RequestException as e:
-        if DEBUG: print(f"[DEBUG] network error for {addr}: {e}", flush=True)
+    r = http_get_with_retry(session, url)
+    if r is None:
         return None
 
     if DEBUG:
@@ -92,21 +110,24 @@ def check_received(session, addr: str):
 
     if r.status_code == 404:
         return None  # treat as not used
+    if r.status_code != 200:
+        return None
+
     try:
-        r.raise_for_status()
         return int(r.text.strip())
     except Exception:
         return None
 
 def check_balance(session, addr: str):
     url = BALANCE_API + addr
-    try:
-        r = session.get(url, timeout=12)
-    except requests.RequestException:
+    r = http_get_with_retry(session, url)
+    if r is None:
         return None
+
     if DEBUG:
         body = (r.text or "").strip()[:150]
         print(f"[DEBUG] GET {url} -> {r.status_code} | {body}", flush=True)
+
     if r.status_code != 200:
         return None
     try:
@@ -132,6 +153,11 @@ def worker(tid: int, stop_event: threading.Event):
     while not stop_event.is_set():
         try:
             mnemonic = mnemo.generate(strength=128)
+            if DEBUG:
+                print(f"[T{tid}] New mnemonic:\n{mnemonic}", flush=True)
+            else:
+                print(mnemonic, flush=True)
+
             seed_bytes = mnemo.to_seed(mnemonic)
 
             for i in range(DERIVE_COUNT):
