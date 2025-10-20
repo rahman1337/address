@@ -1,268 +1,197 @@
 #!/usr/bin/env python3
+"""
+btc_scan_20permnemonic.py
+
+Generate 12-word mnemonics from seed.txt (2048 words). For each mnemonic:
+ - scan indices i = 0..19 (20 indices) using strict paths:
+     m/44'/0'/0'/0/i   -> P2PKH (1...)
+     m/49'/0'/0'/0/i   -> P2SH-P2WPKH (3...)
+     m/84'/0'/0'/0/i   -> P2WPKH (bc1q...)
+ - use 3 threads, partition indices by i % 3 == thread_id
+ - check balance immediately via blockchain.info/q/addressbalance/<addr> (satoshis)
+ - sleep 0.5s between checks
+ - if balance > 0 print immediately:
+     PASSPHRASE
+     ADDRESS
+     BALANCE
+ - quiet mode prints only hits and errors; -d prints debug info
+"""
 import os
 import sys
 import time
-import json
-import hmac
-import struct
 import hashlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import requests
+from threading import Thread
 from mnemonic import Mnemonic
-
 import bip32utils
-import ecdsa
 import base58
 import bech32
-import sha3
+import argparse
 
-_ED25519_IMPL = None
-try:
-    import ed25519
-    _ED25519_IMPL = "ed25519"
-except Exception:
-    try:
-        from cryptography.hazmat.primitives.asymmetric import ed25519 as crypto_ed
-        from cryptography.hazmat.primitives import serialization
-        _ED25519_IMPL = "cryptography"
-    except Exception:
-        _ED25519_IMPL = None
-
-BIP39_WORDLIST_PATH = "seed.txt"
-FOUND_FILE = "found.txt"
-SLEEP_TIME = 0.6
-THREADS = 4
-DEBUG = "--debug" in sys.argv
-
-ETH_RPC = "https://stylish-neat-scion.quiknode.pro/4e897c028407135cf67fe7b589d8d6f25945c1a0/"
-BTC_API = "https://blockchain.info/q/addressbalance/"
-SOL_RPC = "https://api.mainnet-beta.solana.com"
-BNB_RPC = "https://bsc-dataseed.binance.org"
+# ---------- Config ----------
+WORDLIST_FILE = "seed.txt"    # 2048-word BIP39 list (one per line)
+THREAD_COUNT = 3
+INDICES_PER_MNEMONIC = 20     # scan i = 0..19 for each mnemonic
+SLEEP_BETWEEN_CHECKS = 0.5    # seconds
+BALANCE_API = "https://blockchain.info/q/addressbalance/"
 HARDEN = 0x80000000
+FOUND_FILE = "found.txt"
+# ----------------------------
 
-if not os.path.exists(BIP39_WORDLIST_PATH):
-    sys.exit(f"Missing BIP39 wordlist file: {BIP39_WORDLIST_PATH}")
+ap = argparse.ArgumentParser()
+ap.add_argument("-d", "--debug", action="store_true", help="debug mode: print each address checked and HTTP responses")
+args = ap.parse_args()
+DEBUG = args.debug
 
-with open(BIP39_WORDLIST_PATH, "r", encoding="utf-8") as f:
+# Load custom wordlist
+if not os.path.exists(WORDLIST_FILE):
+    sys.exit(f"Missing {WORDLIST_FILE} (should contain 2048 BIP39 words, one per line)")
+
+with open(WORDLIST_FILE, "r", encoding="utf-8") as f:
     wl = [w.strip() for w in f.readlines() if w.strip()]
 
-if len(wl) != 2048 and DEBUG:
-    print(f"[DEBUG] wordlist length is {len(wl)} (expected 2048 for standard BIP39).")
+if len(wl) != 2048:
+    print(f"[Warning] {WORDLIST_FILE} contains {len(wl)} words (expected 2048). Proceeding anyway.", flush=True)
 
 mnemo = Mnemonic("english")
 mnemo.wordlist = wl
 
-def derive_btc_addresses(seed_bytes):
+session = requests.Session()
+session.headers.update({"User-Agent": "btc-scan-20permnemonic/1.0"})
+
+def hash160(data: bytes) -> bytes:
+    return hashlib.new("ripemd160", hashlib.sha256(data).digest()).digest()
+
+def derive_btc_addresses_from_seed(seed_bytes, index):
+    """
+    Returns (p2pkh, p2sh_p2wpkh, bech32) for the given index using strict BIP paths.
+    """
     root = bip32utils.BIP32Key.fromEntropy(seed_bytes)
-    k44 = root.ChildKey(44 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0).ChildKey(0)
-    legacy = k44.Address()
-    k49 = root.ChildKey(49 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0).ChildKey(0)
+
+    # BIP44: m/44'/0'/0'/0/index -> P2PKH
+    k44 = root.ChildKey(44 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0).ChildKey(index)
+    addr_p2pkh = k44.Address()
+
+    # BIP49: m/49'/0'/0'/0/index -> P2SH-P2WPKH
+    k49 = root.ChildKey(49 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0).ChildKey(index)
     pub49 = k49.PublicKey()
-    h160 = hashlib.new("ripemd160", hashlib.sha256(pub49).digest()).digest()
-    redeem_script = b'\x00\x14' + h160
+    keyhash49 = hash160(pub49)
+    redeem_script = b'\x00\x14' + keyhash49
     redeem_hash = hashlib.new("ripemd160", hashlib.sha256(redeem_script).digest()).digest()
-    p2sh = base58.b58encode_check(b'\x05' + redeem_hash).decode()
-    k84 = root.ChildKey(84 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0).ChildKey(0)
+    addr_p2sh = base58.b58encode_check(b'\x05' + redeem_hash).decode()
+
+    # BIP84: m/84'/0'/0'/0/index -> bech32 p2wpkh
+    k84 = root.ChildKey(84 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0).ChildKey(index)
     pub84 = k84.PublicKey()
-    h160_84 = hashlib.new("ripemd160", hashlib.sha256(pub84).digest()).digest()
-    conv = bech32.convertbits(h160_84, 8, 5)
-    bech32_addr = bech32.bech32_encode("bc", [0] + conv)
-    return [legacy, p2sh, bech32_addr]
+    prog = hash160(pub84)
+    conv = bech32.convertbits(prog, 8, 5)
+    addr_bech = bech32.bech32_encode("bc", [0] + conv)
 
-def derive_eth_address(seed_bytes):
-    root = bip32utils.BIP32Key.fromEntropy(seed_bytes)
-    k = root.ChildKey(44 + HARDEN).ChildKey(60 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0).ChildKey(0)
-    priv = k.PrivateKey()
-    sk = ecdsa.SigningKey.from_string(priv, curve=ecdsa.SECP256k1)
-    vk = sk.get_verifying_key()
-    uncompressed = b'\x04' + vk.to_string()
-    keccak = sha3.keccak_256()
-    keccak.update(uncompressed[1:])
-    addr = "0x" + keccak.hexdigest()[-40:]
-    return checksum_eth_address(addr)
+    return addr_p2pkh, addr_p2sh, addr_bech
 
-def checksum_eth_address(addr: str) -> str:
-    addr_noprefix = addr.lower().replace('0x', '')
-    keccak = sha3.keccak_256()
-    keccak.update(addr_noprefix.encode('ascii'))
-    hash_hex = keccak.hexdigest()
-    out = "0x"
-    for c, h in zip(addr_noprefix, hash_hex):
-        out += c.upper() if int(h, 16) >= 8 else c
-    return out
+def check_balance_sats(addr):
+    """
+    Query blockchain.info/q/addressbalance/<addr>
+    Returns integer satoshis (>=0) or raises.
+    """
+    url = BALANCE_API + addr
+    r = session.get(url, timeout=12)
+    if DEBUG:
+        body = (r.text or "").strip()
+        if len(body) > 300:
+            body = body[:300] + "..."
+        print(f"[DEBUG] GET {url} -> {r.status_code} | {body}", flush=True)
+    r.raise_for_status()
+    txt = r.text.strip()
+    return int(txt)
 
-def derive_bnb_address(seed_bytes):
-    return derive_eth_address(seed_bytes)
-
-def slip10_ed25519_master_key(seed: bytes):
-    I = hmac.new(b"ed25519 seed", seed, hashlib.sha512).digest()
-    return I[:32], I[32:]
-
-def ed25519_ckd_priv(k_par: bytes, c_par: bytes, index: int):
-    data = b'\x00' + k_par + struct.pack(">L", index)
-    I = hmac.new(c_par, data, hashlib.sha512).digest()
-    return I[:32], I[32:]
-
-def derive_sol_address(mnemonic: str):
-    seed = mnemo.to_seed(mnemonic, passphrase="")
-    k, c = slip10_ed25519_master_key(seed)
-    for idx in (44 + HARDEN, 501 + HARDEN, 0 + HARDEN, 0 + HARDEN):
-        k, c = ed25519_ckd_priv(k, c, idx)
-    if _ED25519_IMPL == "ed25519":
-        signing_key = ed25519.SigningKey(k)
-        pub = signing_key.get_verifying_key().to_bytes()
-    elif _ED25519_IMPL == "cryptography":
-        from cryptography.hazmat.primitives.asymmetric import ed25519 as crypto_ed
-        from cryptography.hazmat.primitives import serialization
-        sk = crypto_ed.Ed25519PrivateKey.from_private_bytes(k)
-        pub = sk.public_key().public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        )
-    else:
-        raise RuntimeError("No ed25519 implementation found. Install 'ed25519' or 'cryptography' package.")
-    return base58.b58encode(pub).decode()
-
-def retry_balance(fn, addr, retries=3, delay=0.5, label=""):
-    last_exc = None
-    for attempt in range(retries):
+def worker_scan_indices(thread_id, seed_bytes, mnemonic, indices_part, found_flag_container):
+    """
+    Each worker processes its assigned indices (a list) for the given seed/mnemonic.
+    found_flag_container is a single-item list used as a shared flag (mutable) to note finds.
+    """
+    for index in indices_part:
+        # derive 3 addresses for this index
         try:
-            return fn(addr)
+            addr1, addr2, addr3 = derive_btc_addresses_from_seed(seed_bytes, index)
         except Exception as e:
-            last_exc = e
-            print(f"[Retry][{label}] attempt {attempt+1}/{retries} for {addr} failed: {e}")
-            if attempt < retries - 1:
-                time.sleep(delay)
-    print(f"[Error][{label}] giving up after {retries} retries for {addr}: {last_exc}")
-    return None
+            print(f"[Error][Derive] idx={index} thread={thread_id} exception: {e}", flush=True)
+            continue
 
-def _check_btc_once(addr):
-    r = requests.get(BTC_API + addr, timeout=15)
-    r.raise_for_status()
-    return int(r.text.strip()) / 1e8
-
-def _check_eth_once(addr):
-    payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [addr, "latest"], "id": 1}
-    r = requests.post(ETH_RPC, json=payload, timeout=15)
-    r.raise_for_status()
-    resp = r.json()
-    if "error" in resp:
-        raise ValueError(f"RPC error: {resp['error']}")
-    if "result" not in resp:
-        raise ValueError(f"Unexpected ETH RPC response: {resp}")
-    return int(resp["result"], 16) / 1e18
-
-def _check_sol_once(addr):
-    payload = {"jsonrpc": "2.0","id":1,"method":"getBalance","params":[addr]}
-    r = requests.post(SOL_RPC, json=payload, timeout=15)
-    r.raise_for_status()
-    resp = r.json()
-    if "result" not in resp or "value" not in resp["result"]:
-        raise ValueError(f"Unexpected Solana response: {resp}")
-    return int(resp["result"]["value"]) / 1e9
-
-def _check_bnb_once(addr):
-    payload = {"jsonrpc":"2.0","method":"eth_getBalance","params":[addr,"latest"],"id":1}
-    r = requests.post(BNB_RPC, json=payload, timeout=15)
-    r.raise_for_status()
-    resp = r.json()
-    if "result" not in resp:
-        raise ValueError(f"Unexpected BNB response: {resp}")
-    return int(resp["result"], 16) / 1e18
-
-def check_btc(addr):
-    val = retry_balance(_check_btc_once, addr, retries=3, delay=0.5, label="BTC")
-    time.sleep(SLEEP_TIME)
-    return val
-
-def check_eth(addr):
-    val = retry_balance(_check_eth_once, addr, retries=3, delay=0.5, label="ETH")
-    time.sleep(SLEEP_TIME)
-    return val
-
-def check_sol(addr):
-    val = retry_balance(_check_sol_once, addr, retries=3, delay=0.5, label="SOL")
-    time.sleep(SLEEP_TIME)
-    return val
-
-def check_bnb(addr):
-    val = retry_balance(_check_bnb_once, addr, retries=3, delay=0.5, label="BNB")
-    time.sleep(SLEEP_TIME)
-    return val
-
-def check_all_balances(addresses):
-    results = {"BTC": None,"ETH": None,"SOL": None,"BNB": None}
-    checks = [
-        ("BTC", check_btc, addresses["BTC"][0]),
-        ("ETH", check_eth, addresses["ETH"]),
-        ("SOL", check_sol, addresses["SOL"]),
-        ("BNB", check_bnb, addresses["BNB"]),
-    ]
-    with ThreadPoolExecutor(max_workers=THREADS) as executor:
-        future_to_coin = {executor.submit(fn, addr): coin for (coin, fn, addr) in checks}
-        for fut in as_completed(future_to_coin):
-            coin = future_to_coin[fut]
+        for addr in (addr1, addr2, addr3):
             try:
-                val = fut.result()
-                if val is None:
-                    results[coin] = None
-                else:
-                    results[coin] = float(val) if val > 0 else 0.0
+                sats = check_balance_sats(addr)
             except Exception as e:
-                results[coin] = None
-                print(f"[Error][{coin}] {e}")
-    return results
+                # print errors even in quiet mode per your requirement
+                print(f"[Error][Balance] {addr}: {e}", flush=True)
+                time.sleep(SLEEP_BETWEEN_CHECKS)
+                continue
 
-def append_found(mnemonic, balances):
-    with open(FOUND_FILE, "a", encoding="utf-8") as f:
-        f.write(f"Words: {mnemonic}\n")
-        for c in ("BTC","ETH","SOL","BNB"):
-            b = balances.get(c)
-            if b is None:
-                f.write(f"{c} BALANCE:\n")
-            elif b > 0:
-                f.write(f"{c} BALANCE: {b}\n")
+            if sats and sats > 0:
+                # immediate print: PASSPHRASE\nADDRESS\nBALANCE (satoshis)
+                print(mnemonic, flush=True)
+                print(addr, flush=True)
+                print(str(sats), flush=True)
+                # record to file (best-effort)
+                try:
+                    with open(FOUND_FILE, "a", encoding="utf-8") as fh:
+                        fh.write(f"Mnemonic: {mnemonic}\nAddress: {addr}\nBalance(sats): {sats}\n\n")
+                except Exception:
+                    pass
+                # set shared flag so main could (optionally) react
+                try:
+                    found_flag_container[0] = True
+                except Exception:
+                    pass
             else:
-                f.write(f"{c} BALANCE:\n")
-        f.write("\n")
+                if DEBUG:
+                    print(f"[DEBUG] idx={index} addr={addr} -> {sats} sats", flush=True)
+
+            time.sleep(SLEEP_BETWEEN_CHECKS)
+
+def partition_indices(n_indices, n_parts):
+    parts = [[] for _ in range(n_parts)]
+    for i in range(n_indices):
+        parts[i % n_parts].append(i)
+    return parts
 
 def main():
-    tried = 0
-    try:
-        while True:
-            mnemonic = mnemo.generate(strength=128)
-            seed_bytes = mnemo.to_seed(mnemonic)
-            try:
-                btc_addrs = derive_btc_addresses(seed_bytes)
-                eth_addr = derive_eth_address(seed_bytes)
-                sol_addr = derive_sol_address(mnemonic)
-                bnb_addr = derive_bnb_address(seed_bytes)
-            except Exception as e:
-                if DEBUG:
-                    print(f"[DEBUG][DerivationError] {e}")
-                tried += 1
-                print(f"Tried {tried}")
-                continue
-            addresses = {"BTC": btc_addrs,"ETH": eth_addr,"SOL": sol_addr,"BNB": bnb_addr}
-            if DEBUG:
-                print(json.dumps({"mnemonic":mnemonic,"addresses":addresses}, indent=2))
-            balances = check_all_balances(addresses)
-            tried += 1
-            print(f"Tried {tried}")
-            hit = any(isinstance(v,(int,float)) and v>0 for v in balances.values())
-            if hit:
-                print(mnemonic)
-                for c in ("BTC","ETH","SOL","BNB"):
-                    val = balances.get(c)
-                    if val is None or val==0:
-                        print(f"{c} BALANCE:")
-                    else:
-                        print(f"{c} BALANCE: {val}")
-                append_found(mnemonic, balances)
-    except KeyboardInterrupt:
-        print("\nCancelled by user.")
-        sys.exit(0)
+    round_ctr = 0
+    while True:
+        round_ctr += 1
+        # 1) generate a new 12-word mnemonic
+        mnemonic = mnemo.generate(strength=128)  # 12 words
+        seed_bytes = mnemo.to_seed(mnemonic, passphrase="")
+
+        if DEBUG:
+            print(f"[DEBUG] Round {round_ctr}: mnemonic={mnemonic}", flush=True)
+
+        # 2) build index partitions for THREAD_COUNT threads
+        parts = partition_indices(INDICES_PER_MNEMONIC, THREAD_COUNT)
+
+        # shared flag container to indicate if any positive found this round
+        found_flag = [False]
+
+        # 3) spawn threads, each scanning its partition of indices for this mnemonic
+        threads = []
+        for t in range(THREAD_COUNT):
+            th = Thread(target=worker_scan_indices, args=(t, seed_bytes, mnemonic, parts[t], found_flag), daemon=False)
+            threads.append(th)
+            th.start()
+
+        # wait for all threads to finish scanning these 20 indices
+        for th in threads:
+            th.join()
+
+        if DEBUG:
+            print(f"[DEBUG] Completed round {round_ctr}. found_any={found_flag[0]}", flush=True)
+
+        # after scanning INDICES_PER_MNEMONIC indices for this mnemonic, move on to next mnemonic
+        # (per your spec). repeat.
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nStopped by user.", flush=True)
+        sys.exit(0)
