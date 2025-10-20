@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-High-performance Bitcoin scanner with debug throughput monitoring.
-- Uses coincurve (libsecp256k1)
+High-performance Bitcoin scanner with optional debug mode
+- Uses coincurve (C-backed secp256k1) for fast pubkey derivation
 - Supports P2PKH, P2SH-P2WPKH, Bech32
 - WIF generated only on match
-- Debug mode shows total keys/sec and per-worker counts
+- Default target files: btc1.txt, btc2.txt, btc3.txt
+- Optional debug: total keys/sec & per-worker counts every 5s
 """
 
 import os
@@ -213,15 +214,18 @@ def worker_main(worker_id, stop_event, result_queue, targets_p2pkh, targets_p2sh
 # --- Main ---
 def main():
     default_files=["btc1.txt","btc2.txt","btc3.txt"]
-    parser=argparse.ArgumentParser(description="High-performance Bitcoin scanner with debug")
+    parser=argparse.ArgumentParser(description="High-performance Bitcoin scanner")
     parser.add_argument("--file","-f",nargs="+",default=default_files)
     parser.add_argument("--network",choices=["mainnet","testnet"],default="mainnet")
     parser.add_argument("--workers","-w",type=int,default=mp.cpu_count())
     parser.add_argument("--report-every","-r",type=int,default=100000)
     parser.add_argument("--batch",type=int,default=64)
-    parser.add_argument("--debug-interval",type=int,default=5)
+    parser.add_argument("--debug",action="store_true",help="Enable debug throughput output")
     parser.add_argument("--max","-m",type=int,default=0)
     args=parser.parse_args()
+
+    debug_mode = args.debug
+    debug_interval = 5  # seconds
 
     targets_p2pkh,targets_p2sh,targets_bech=load_targets(args.file)
     total_targets=len(targets_p2pkh)+len(targets_p2sh)+len(targets_bech)
@@ -230,30 +234,30 @@ def main():
         return
 
     print(f"Loaded {total_targets:,} targets: P2PKH={len(targets_p2pkh):,} P2SH={len(targets_p2sh):,} Bech32={len(targets_bech):,}")
-    print(f"Network: {args.network}, Workers: {args.workers}, Batch: {args.batch}, Debug interval: {args.debug_interval}s")
+    print(f"Network: {args.network}, Workers: {args.workers}, Batch: {args.batch}, Debug: {debug_mode}")
 
     ctx=mp.get_context("fork" if sys.platform!="win32" else "spawn")
     stop_event=ctx.Event()
     result_queue=ctx.Queue()
-    debug_counters=DebugCounters(args.workers)
+    debug_counters=DebugCounters(args.workers) if debug_mode else None
 
     # Start debug monitor
-    def debug_monitor(counters, stop_event, interval):
-        last_total=0
-        last_time=time.time()
-        while not stop_event.is_set():
-            time.sleep(interval)
-            with counters.total_keys.get_lock():
-                total=counters.total_keys.value
-            now=time.time()
-            rate=(total-last_total)/(now-last_time) if now!=last_time else 0
-            last_total,last_time=total,now
-            per_worker=[c.value for c in counters.worker_keys]
-            print(f"[DEBUG] Total keys: {total:,} Rate: {rate:,.1f} keys/s | per-worker: {per_worker}")
-            sys.stdout.flush()
-
-    monitor_proc=ctx.Process(target=debug_monitor,args=(debug_counters,stop_event,args.debug_interval),daemon=True)
-    monitor_proc.start()
+    if debug_mode:
+        def debug_monitor(counters, stop_event, interval):
+            last_total=0
+            last_time=time.time()
+            while not stop_event.is_set():
+                time.sleep(interval)
+                with counters.total_keys.get_lock():
+                    total=counters.total_keys.value
+                now=time.time()
+                rate=(total-last_total)/(now-last_time) if now!=last_time else 0
+                last_total,last_time=total,now
+                per_worker=[c.value for c in counters.worker_keys]
+                print(f"[DEBUG] Total keys: {total:,} Rate: {rate:,.1f} keys/s | per-worker: {per_worker}")
+                sys.stdout.flush()
+        monitor_proc=ctx.Process(target=debug_monitor,args=(debug_counters,stop_event,debug_interval),daemon=True)
+        monitor_proc.start()
 
     # Start workers
     processes=[]
@@ -282,7 +286,8 @@ def main():
         stop_event.set()
     finally:
         for p in processes: p.join(timeout=1)
-        monitor_proc.join(timeout=1)
+        if debug_mode:
+            monitor_proc.join(timeout=1)
         print("Workers stopped. Exiting.")
 
 if __name__=="__main__":
