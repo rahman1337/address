@@ -1,145 +1,152 @@
 #!/usr/bin/env python3
-import os
-import sys
-import time
-import hashlib
-import binascii
-import argparse
-import multiprocessing as mp
-from coincurve import PrivateKey
+"""
+btc2-fast.py - Random-key -> addresses; multithreaded with coincurve (or fallback)
+Optimized for speed (3 threads), optional --debug prints
+Default input files: btc1.txt, btc2.txt, btc3.txt
+"""
 
+import os, time, sys, argparse, hashlib
+from threading import Thread, Lock
+
+try:
+    from coincurve import PublicKey
+    HAVE_COINCURVE = True
+except Exception:
+    HAVE_COINCURVE = False
+
+# --- Base58 / Bech32 ---
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+BECH32_GEN = [0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3]
 
-def hash160(data: bytes) -> bytes:
-    return hashlib.new('ripemd160', hashlib.sha256(data).digest()).digest()
+# --- Hash helpers ---
+def sha256(b: bytes) -> bytes: return hashlib.sha256(b).digest()
+def ripemd160(b: bytes) -> bytes:
+    h = hashlib.new("ripemd160"); h.update(b); return h.digest()
+def hash160(b: bytes) -> bytes: return ripemd160(sha256(b))
+def int_to_bytes(i: int, length: int) -> bytes: return i.to_bytes(length, "big")
+def bytes_to_int(b: bytes) -> int: return int.from_bytes(b, "big")
 
+# --- Base58 / WIF ---
 def base58check(data: bytes) -> str:
-    checksum = hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4]
-    full = data + checksum
-    num = int.from_bytes(full, 'big')
-    res = ""
-    while num:
+    checksum = sha256(sha256(data))[:4]
+    data_cs = data + checksum
+    num = int.from_bytes(data_cs, "big")
+    res_chars = []
+    while num > 0:
         num, mod = divmod(num, 58)
-        res = BASE58_ALPHABET[mod] + res
-    pad = len(full) - len(full.lstrip(b'\0'))
-    return '1' * pad + res
+        res_chars.append(BASE58_ALPHABET[mod])
+    res = ''.join(reversed(res_chars))
+    n_pad = len(data) - len(data.lstrip(b'\0'))
+    return '1' * n_pad + res if n_pad else res
 
-def encode_bech32(hrp, witver, witprog):
+def wif_from_priv(priv_bytes: bytes) -> str:
+    return base58check(b'\x80' + priv_bytes + b'\x01')
+
+# --- Address encoders ---
+def encode_bech32(hrp: str, witver: int, witprog: bytes) -> str:
     def convertbits(data, frombits, tobits, pad=True):
-        acc = bits = 0
-        ret = []
-        maxv = (1 << tobits) - 1
+        acc=0; bits=0; ret=[]; maxv=(1<<tobits)-1
         for b in data:
-            acc = (acc << frombits) | b
-            bits += frombits
-            while bits >= tobits:
-                bits -= tobits
-                ret.append((acc >> bits) & maxv)
-        if pad and bits:
-            ret.append((acc << (tobits - bits)) & maxv)
+            acc=(acc<<frombits)|b; bits+=frombits
+            while bits>=tobits: bits-=tobits; ret.append((acc>>bits)&maxv)
+        if pad and bits: ret.append((acc<<(tobits-bits))&maxv)
         return ret
     def polymod(values):
-        GEN = [0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3]
-        chk = 1
+        chk=1
         for v in values:
-            top = chk >> 25
-            chk = ((chk & 0x1ffffff) << 5) ^ v
+            top=chk>>25
+            chk=((chk&0x1ffffff)<<5)^v
             for i in range(5):
-                if (top >> i) & 1:
-                    chk ^= GEN[i]
+                if(top>>i)&1: chk^=BECH32_GEN[i]
         return chk
     def hrp_expand(hrp): return [ord(x)>>5 for x in hrp]+[0]+[ord(x)&31 for x in hrp]
-    def create_checksum(hrp, data):
-        values = hrp_expand(hrp)+data+[0]*6
-        mod = polymod(values)^1
-        return [(mod>>5*(5-i))&31 for i in range(6)]
-    data = [witver]+convertbits(witprog,8,5)
-    combined = data+create_checksum(hrp,data)
-    return hrp+"1"+''.join([BECH32_CHARSET[d] for d in combined])
+    def create_checksum(hrp,data): return [(polymod(hrp_expand(hrp)+data+[0]*6)^1>>(5*(5-i))&31 for i in range(6))]
+    data=[witver]+convertbits(witprog,8,5)
+    chk=create_checksum(hrp,data)
+    return hrp+'1'+''.join([BECH32_CHARSET[d] for d in data+chk])
 
-def generate_addresses(priv_bytes, hrp="bc"):
-    pk = PrivateKey(priv_bytes)
-    pub = pk.public_key.format(compressed=True)
-    h160 = hash160(pub)
-    p2pkh = base58check(b'\x00' + h160)
-    redeem = b'\x00\x14' + h160
-    p2sh = base58check(b'\x05' + hash160(redeem))
-    bech32 = encode_bech32(hrp, 0, h160)
-    return p2pkh, p2sh, bech32
+def p2pkh_from_pub(pubc: bytes) -> str: return base58check(b'\x00'+hash160(pubc))
+def p2wpkh_from_pub(pubc: bytes, hrp="bc") -> str: return encode_bech32(hrp,0,hash160(pubc))
+def p2wpkh_in_p2sh_from_pub(pubc: bytes) -> str: return base58check(b'\x05'+hash160(b'\x00\x14'+hash160(pubc)))
 
+# --- Compressed pubkey ---
+def pubkey_compressed_from_priv_bytes(priv_bytes: bytes) -> bytes:
+    if HAVE_COINCURVE:
+        return PublicKey.from_valid_secret(priv_bytes).format(compressed=True)
+    else:
+        from ecdsa import SigningKey, SECP256k1
+        sk = SigningKey.from_string(priv_bytes, curve=SECP256k1)
+        return sk.get_verifying_key().to_string("compressed")
+
+# --- Load targets ---
 def load_targets(paths):
-    targets = set()
-    counts = {"p2pkh": 0, "p2sh": 0, "bech32": 0}
+    targ = set()
     for path in paths:
-        if not os.path.exists(path): continue
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                addr = line.strip()
-                if not addr or addr.startswith("#"): continue
-                targets.add(addr)
-                if addr.startswith("1"): counts["p2pkh"] += 1
-                elif addr.startswith("3"): counts["p2sh"] += 1
-                elif addr.lower().startswith("bc1"): counts["bech32"] += 1
-    print(f"Loaded {len(targets)} targets: "
-          f"P2PKH={counts['p2pkh']} P2SH={counts['p2sh']} Bech32={counts['bech32']}")
-    return targets
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    s = line.strip()
+                    if s: targ.add(s.lower())
+        except Exception as e:
+            print("Warning:", e, file=sys.stderr)
+    return targ
 
-def worker(proc_id, targets, report_every, hrp, debug, start_time):
-    total = 0
-    last_report = time.time()
+# --- Worker ---
+def worker(targets, debug, lock, outfile):
+    total=0; start=time.time()
     while True:
-        priv = os.urandom(32)
-        p2pkh, p2sh, bech32 = generate_addresses(priv, hrp)
-        if p2pkh in targets or p2sh in targets or bech32 in targets:
-            wif = base58check(b'\x80' + priv + b'\x01')
-            print(f"\n=== MATCH FOUND ===\n"
-                  f"[P{proc_id}] PRIV: {binascii.hexlify(priv).decode()}\n"
-                  f"[P{proc_id}] WIF : {wif}\n"
-                  f"[P{proc_id}] ADDR: {p2pkh if p2pkh in targets else p2sh if p2sh in targets else bech32}\n"
-                  f"===================\n", flush=True)
-        total += 1
-        if total % report_every == 0:
-            now = time.time()
-            rate = report_every / (now - last_report)
-            total_time = now - start_time
-            avg_rate = total / total_time
-            last_report = now
-            if debug:
-                print(f"[P{proc_id}] {total:,} keys — {rate:,.1f} keys/s (avg {avg_rate:,.1f})")
-            else:
-                print(f"[P{proc_id}] {total:,} keys — {rate:,.1f} keys/s")
+        priv_bytes=os.urandom(32)
+        pubc = pubkey_compressed_from_priv_bytes(priv_bytes)
+        p2pkh = p2pkh_from_pub(pubc)
+        p2wpkh = p2wpkh_from_pub(pubc)
+        p2sh_nested = p2wpkh_in_p2sh_from_pub(pubc)
+        wif = wif_from_priv(priv_bytes)
 
+        found_addr = None
+        for addr in [p2pkh,p2sh_nested,p2wpkh]:
+            if addr.lower() in targets:
+                found_addr = addr; break
+
+        if found_addr:
+            ts=time.strftime("%Y-%m-%d %H:%M:%S")
+            with lock:
+                print(f"\n=== MATCH FOUND ===\n{ts}\nWIF:{wif}\nADDRESS:{found_addr}\n===================\n")
+                try:
+                    with open(outfile,"a") as fo:
+                        fo.write(f"{ts}\nWIF:{wif}\nADDRESS:{found_addr}\n\n")
+                except Exception as e: print("Append failed:", e, file=sys.stderr)
+
+        total+=1
+        if debug:
+            now=time.time()
+            if now-start>=1.0:
+                rate=total/(now-start)
+                print(f"[{rate:.1f} keys/s]", end='\r', flush=True)
+
+# --- Main ---
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--file", "-f", nargs="+", default=["btc1.txt"])
-    parser.add_argument("--threads", "-t", type=int, default=4)
-    parser.add_argument("--report-every", "-r", type=int, default=10000)
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--hrp", default="bc")
-    args = parser.parse_args()
+    p=argparse.ArgumentParser(description="Random-key -> addresses; fast 3-threaded")
+    p.add_argument("-f","--file", nargs="+", help="target address file(s)")
+    p.add_argument("--threads",type=int,default=3,help="number of threads")
+    p.add_argument("--debug",action="store_true",help="print key rate")
+    args=p.parse_args()
 
-    targets = load_targets(args.file)
-    if not targets:
-        print("No valid addresses loaded.")
-        return
+    # Default input files if none provided
+    files = args.file if args.file else ["btc1.txt","btc2.txt","btc3.txt"]
+    targets=load_targets(files)
+    if not targets: print("No valid addresses loaded."); return
+    print(f"Loaded {len(targets):,} targets from {', '.join(files)}. Using {'coincurve' if HAVE_COINCURVE else 'Python fallback'}")
 
-    print(f"Starting with {args.threads} processes...")
-    start_time = time.time()
-    processes = []
-    for i in range(args.threads):
-        p = mp.Process(target=worker, args=(i+1, targets, args.report_every, args.hrp, args.debug, start_time))
-        p.start()
-        processes.append(p)
+    lock = Lock()
+    OUTFILE="found.txt"
 
+    threads = [Thread(target=worker, args=(targets,args.debug,lock,OUTFILE), daemon=True) for _ in range(args.threads)]
+    for t in threads: t.start()
     try:
-        for p in processes:
-            p.join()
+        while True: time.sleep(1)
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
-        for p in processes:
-            p.terminate()
+        print("\nStopped by user.")
 
-if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
+if __name__=="__main__":
     main()
