@@ -36,7 +36,7 @@ DEBUG = "--debug" in sys.argv
 
 # --- RPC / API endpoints ---
 RPC_ENDPOINTS = {
-    "ETH": "https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID",
+    "ETH": "wss://stylish-neat-scion.quiknode.pro/4e897c028407135cf67fe7b589d8d6f25945c1a0/",
     "BNB": "https://bsc-dataseed.binance.org",
     "BSC": "https://bsc-dataseed1.binance.org",
     "POLYGON": "https://polygon-rpc.com",
