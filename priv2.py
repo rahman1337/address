@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-btc_scanner_found_sleep.py (merged)
+btc_scanner_found_sleep.py (with 429 backoff handling)
 
 - Default 4 threads: 3 scanner threads and 1 dedicated balance-checker thread.
 - Scanner threads: derive addresses, call getreceivedbyaddress, sleep 0.6s per address.
   If received != 0 they enqueue (address, wif, received) to balance_queue.
 - Balance thread: dequeues items, calls addressbalance with retries, sleeps balance_sleep +/- jitter between balance checks to avoid 429.
-- AddrChecker has retries (3) and debug printing.
+- AddrChecker: retries on network errors and on 429s uses a longer backoff before retrying.
 - Ctrl+C prints checkpoint (last private key hex tried).
 - Use -d for debug.
 """
@@ -160,14 +160,30 @@ class IndexProvider:
             return val
 
 
-# ----------------- network checker with retries & sleeps -----------------
+# ----------------- network checker with retries, 429 backoff & sleeps -----------------
 class AddrChecker:
-    def __init__(self, session: requests.Session, debug: bool = False, timeout: float = 10.0):
+    def __init__(
+        self,
+        session: requests.Session,
+        debug: bool = False,
+        timeout: float = 10.0,
+        backoff_base: float = 5.0,
+    ):
+        """
+        backoff_base: extra seconds to add_per_attempt when a 429 is seen.
+        Actual wait on 429 for attempt n is: sleep_between + backoff_base * n
+        """
         self.session = session
         self.debug = debug
         self.timeout = timeout
+        self.backoff_base = backoff_base
 
     def _get_with_retries(self, url: str, retries: int = 3, sleep_between: float = 0.6):
+        """
+        Retries network errors and HTTP non-200 responses up to `retries`.
+        When a 429 is received, waits longer before retrying (using backoff_base).
+        Raises last exception if all retries exhausted.
+        """
         last_exc = None
         for attempt in range(1, retries + 1):
             try:
@@ -181,10 +197,25 @@ class AddrChecker:
                     print(f"[DEBUG] GET {url} -> {resp.status_code} {resp.reason}", flush=True)
                 if resp.status_code == 200:
                     return resp
+                # Special handling for 429: back off longer then retry (if attempts remain)
+                if resp.status_code == 429:
+                    last_exc = RuntimeError("HTTP 429 Too Many Requests")
+                    if self.debug:
+                        print(f"[DEBUG] GET {url} received 429; will back off before retrying (attempt {attempt})", flush=True)
+                    if attempt < retries:
+                        wait = sleep_between + (self.backoff_base * attempt)
+                        if self.debug:
+                            print(f"[DEBUG] Backing off for {wait:.2f}s before next retry.", flush=True)
+                        time.sleep(wait)
+                        continue
+                    # else fall-through to raise after loop
                 else:
+                    # Other non-200 errors: treat as transient and sleep the regular amount before retry
                     last_exc = RuntimeError(f"HTTP {resp.status_code}")
+            # regular sleep between retries (for network errors or non-429 non-200)
             if attempt < retries:
                 time.sleep(sleep_between)
+        # all attempts failed
         raise last_exc
 
     def get_received(self, address: str) -> int:
@@ -284,6 +315,8 @@ def balance_worker(checker: AddrChecker, print_lock: threading.Lock, debug: bool
         try:
             bal = checker.get_balance(addr)
         except Exception as e:
+            # IMPORTANT: keep printing errors if retries exhausted or immediate failure,
+            # so you don't miss anything (you asked not to swallow failures).
             with print_lock:
                 print("\n" + "=" * 60, flush=True)
                 print("!!! FOUND (BALANCE CHECK FAILED) !!!", flush=True)
@@ -331,7 +364,7 @@ def parse_args():
         except ValueError:
             raise argparse.ArgumentTypeError(f"invalid integer or hex value: {x}")
 
-    p = argparse.ArgumentParser(description="Deterministic BTC scanner (multi-threaded) with dedicated balance thread and jitter")
+    p = argparse.ArgumentParser(description="Deterministic BTC scanner (multi-threaded) with dedicated balance thread, jitter and 429 backoff")
     p.add_argument("-t", "--threads", type=int, default=4,
                    help="total threads to run (default 4: 3 scanners + 1 balance checker). Minimum 2.")
     p.add_argument("-d", "--debug", action="store_true", help="debug mode: prints each GET status")
@@ -340,6 +373,8 @@ def parse_args():
                    help="mean sleep (seconds) between balance checks in the dedicated balance thread (default 1.0)")
     p.add_argument("--jitter", type=float, default=0.2,
                    help="max +/- jitter (seconds) applied to balance-sleep (default 0.2, so default range is 0.8-1.2)")
+    p.add_argument("--backoff-base", type=float, default=5.0,
+                   help="base extra seconds to add per attempt when a 429 is seen (default 5.0). Wait on 429 = sleep_between + backoff_base * attempt")
     return p.parse_args()
 
 
@@ -355,7 +390,7 @@ def main():
     idx_provider = IndexProvider(start=args.start)
 
     session = requests.Session()
-    checker = AddrChecker(session=session, debug=args.debug)
+    checker = AddrChecker(session=session, debug=args.debug, backoff_base=args.backoff_base)
 
     print_lock = threading.Lock()
 
