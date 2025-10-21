@@ -283,25 +283,25 @@ def worker_thread(name: str, idx_provider: IndexProvider, checker: AddrChecker, 
                     except Exception as e:
                         with print_lock:
                             # Print a clearly delimited "found but balance check failed" block
-                            print("\n" + "=" * 60, flush=True)
+                            print("\n" + "=" * 53, flush=True)
                             print("!!! FOUND (BALANCE CHECK FAILED) !!!", flush=True)
                             print("", flush=True)
                             print("WIF:", wif_c, flush=True)
                             print("ADDRESS:", addr, flush=True)
                             print("RECEIVED (sats):", str(recvd), flush=True)
                             print("BALANCE CHECK ERROR:", str(e), flush=True)
-                            print("=" * 60 + "\n", flush=True)
+                            print("=" * 53 + "\n", flush=True)
                     else:
                         # Print a clear bordered block for found addresses
                         with print_lock:
-                            print("\n" + "=" * 60, flush=True)
+                            print("\n" + "=" * 53, flush=True)
                             print("!!!!! FOUND ADDRESS WITH RECEIVED FUNDS !!!!!", flush=True)
                             print("", flush=True)
                             print("WIF:", wif_c, flush=True)
                             print("ADDRESS:", addr, flush=True)
                             print("RECEIVED (sats):", str(recvd), flush=True)
                             print("BALANCE (sats):", str(bal), flush=True)
-                            print("=" * 60 + "\n", flush=True)
+                            print("=" * 53 + "\n", flush=True)
 
                 # 3) mandatory sleep 0.6s after each address check (per thread)
                 time.sleep(0.6)
