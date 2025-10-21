@@ -16,7 +16,7 @@ import bech32
 # =============================
 WORDLIST_FILE = "seed.txt"
 THREAD_COUNT = 3
-DERIVE_COUNT = 20
+DERIVE_COUNT = 10   # now 10 indices per path
 SLEEP_BETWEEN_CHECKS = 0.5
 RECEIVED_API = "https://blockchain.info/q/getreceivedbyaddress/"
 BALANCE_API = "https://blockchain.info/q/addressbalance/"
@@ -46,7 +46,6 @@ if len(wl) != 2048:
 mnemo = Mnemonic("english")
 mnemo.wordlist = wl
 
-# Lock for found.txt
 write_lock = threading.Lock()
 
 # =============================
@@ -55,13 +54,21 @@ write_lock = threading.Lock()
 def hash160(b: bytes) -> bytes:
     return hashlib.new("ripemd160", hashlib.sha256(b).digest()).digest()
 
+def wif_from_priv(priv_bytes: bytes, compressed=True) -> str:
+    payload = b'\x80' + priv_bytes + (b'\x01' if compressed else b'')
+    return base58.b58encode_check(payload).decode()
+
 def derive_addresses(seed_bytes, index):
-    """Return legacy (1...), nested (3...), bech32 (bc1q...) addresses."""
+    """Return list of (WIF, address) tuples for legacy, nested segwit, bech32"""
     root = bip32utils.BIP32Key.fromEntropy(seed_bytes)
+
+    results = []
 
     # m/44'/0'/0'/0/i
     k44 = root.ChildKey(44 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0).ChildKey(index)
     addr44 = k44.Address()
+    wif44 = wif_from_priv(k44.PrivateKey())
+    results.append((wif44, addr44))
 
     # m/49'/0'/0'/0/i
     k49 = root.ChildKey(49 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0).ChildKey(index)
@@ -70,6 +77,8 @@ def derive_addresses(seed_bytes, index):
     redeem = b'\x00\x14' + h160_49
     redeem_h160 = hash160(redeem)
     addr49 = base58.b58encode_check(b'\x05' + redeem_h160).decode()
+    wif49 = wif_from_priv(k49.PrivateKey())
+    results.append((wif49, addr49))
 
     # m/84'/0'/0'/0/i
     k84 = root.ChildKey(84 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0 + HARDEN).ChildKey(0).ChildKey(index)
@@ -77,12 +86,12 @@ def derive_addresses(seed_bytes, index):
     h160_84 = hash160(pub84)
     conv = bech32.convertbits(h160_84, 8, 5)
     addr84 = bech32.bech32_encode("bc", [0] + conv)
+    wif84 = wif_from_priv(k84.PrivateKey())
+    results.append((wif84, addr84))
 
-    return [addr44, addr49, addr84]
+    return results
 
-# --- API checkers with retries ---
 def http_get_with_retry(session, url):
-    """GET with retry on network/timeout errors."""
     for attempt in range(1, RETRY_LIMIT + 1):
         try:
             r = session.get(url, timeout=12)
@@ -103,19 +112,15 @@ def check_received(session, addr: str):
     r = http_get_with_retry(session, url)
     if r is None:
         return None
-
     if DEBUG:
-        body = (r.text or "").strip()[:150]
-        print(f"[DEBUG] GET {url} -> {r.status_code} | {body}", flush=True)
-
+        print(f"[DEBUG] GET {url} -> {r.status_code} | {r.text[:150]}", flush=True)
     if r.status_code == 404:
-        return None  # treat as not used
+        return None
     if r.status_code != 200:
         return None
-
     try:
         return int(r.text.strip())
-    except Exception:
+    except:
         return None
 
 def check_balance(session, addr: str):
@@ -123,24 +128,23 @@ def check_balance(session, addr: str):
     r = http_get_with_retry(session, url)
     if r is None:
         return None
-
     if DEBUG:
-        body = (r.text or "").strip()[:150]
-        print(f"[DEBUG] GET {url} -> {r.status_code} | {body}", flush=True)
-
+        print(f"[DEBUG] GET {url} -> {r.status_code} | {r.text[:150]}", flush=True)
     if r.status_code != 200:
         return None
     try:
         return int(r.text.strip())
-    except Exception:
+    except:
         return None
 
-def save_found(mnemonic, addr, received, balance):
+def save_found(mnemonic, wif, addr, received, balance):
     """Thread-safe append to found.txt"""
     with write_lock:
         with open(FOUND_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{mnemonic}\n{addr}\n{received}\n{balance}\n\n")
+            f.write(f"{mnemonic}\n{wif}\n{addr}\n{received}\n{balance}\n\n")
+    # print line by line
     print(mnemonic, flush=True)
+    print(wif, flush=True)
     print(addr, flush=True)
     print(received, flush=True)
     print(balance, flush=True)
@@ -161,15 +165,14 @@ def worker(tid: int, stop_event: threading.Event):
             seed_bytes = mnemo.to_seed(mnemonic)
 
             for i in range(DERIVE_COUNT):
-                addrs = derive_addresses(seed_bytes, i)
-                for addr in addrs:
+                for wif, addr in derive_addresses(seed_bytes, i):
                     received = check_received(session, addr)
                     time.sleep(SLEEP_BETWEEN_CHECKS)
                     if received is None or received <= 0:
                         continue
                     balance = check_balance(session, addr)
                     time.sleep(SLEEP_BETWEEN_CHECKS)
-                    save_found(mnemonic, addr, received, balance if balance is not None else 0)
+                    save_found(mnemonic, wif, addr, received, balance if balance is not None else 0)
 
         except KeyboardInterrupt:
             stop_event.set()
