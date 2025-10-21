@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-btc_scanner_found_sleep.py (refactored with jitter)
+btc_scanner_found_sleep.py (merged)
 
 - Default 4 threads: 3 scanner threads and 1 dedicated balance-checker thread.
 - Scanner threads: derive addresses, call getreceivedbyaddress, sleep 0.6s per address.
   If received != 0 they enqueue (address, wif, received) to balance_queue.
 - Balance thread: dequeues items, calls addressbalance with retries, sleeps balance_sleep +/- jitter between balance checks to avoid 429.
-- AddrChecker already has retries (3) and debug printing.
+- AddrChecker has retries (3) and debug printing.
 - Ctrl+C prints checkpoint (last private key hex tried).
 - Use -d for debug.
 """
@@ -318,11 +318,24 @@ def balance_worker(checker: AddrChecker, print_lock: threading.Lock, debug: bool
 
 # ----------------- CLI / main -----------------
 def parse_args():
+    def auto_int(x):
+        """
+        Accept decimal (1234) or hex (0x4d2 or 4d2).
+        """
+        try:
+            if x.lower().startswith("0x"):
+                return int(x, 16)
+            if any(c in "abcdefABCDEF" for c in x):
+                return int(x, 16)
+            return int(x, 10)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"invalid integer or hex value: {x}")
+
     p = argparse.ArgumentParser(description="Deterministic BTC scanner (multi-threaded) with dedicated balance thread and jitter")
     p.add_argument("-t", "--threads", type=int, default=4,
                    help="total threads to run (default 4: 3 scanners + 1 balance checker). Minimum 2.")
     p.add_argument("-d", "--debug", action="store_true", help="debug mode: prints each GET status")
-    p.add_argument("--start", type=int, default=1, help="start index (default 1)")
+    p.add_argument("--start", type=auto_int, default=1, help="start index (int or hex, e.g. 1234 or 0x4d2 or 4d2)")
     p.add_argument("--balance-sleep", type=float, default=1.0,
                    help="mean sleep (seconds) between balance checks in the dedicated balance thread (default 1.0)")
     p.add_argument("--jitter", type=float, default=0.2,
