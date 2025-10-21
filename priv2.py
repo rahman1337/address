@@ -1,464 +1,239 @@
 #!/usr/bin/env python3
 """
-btc_scanner_found_sleep.py (with 429 backoff handling)
+btc_scanner_async.py
 
-- Default 4 threads: 3 scanner threads and 1 dedicated balance-checker thread.
-- Scanner threads: derive addresses, call getreceivedbyaddress, sleep 0.6s per address.
-  If received != 0 they enqueue (address, wif, received) to balance_queue.
-- Balance thread: dequeues items, calls addressbalance with retries, sleeps balance_sleep +/- jitter between balance checks to avoid 429.
-- AddrChecker: retries on network errors and on 429s uses a longer backoff before retrying.
-- Ctrl+C prints checkpoint (last private key hex tried).
-- Use -d for debug.
+Deterministic async BTC address scanner:
+- Sequential deterministic private keys (1,2,3,...).
+- For each key derives compressed pubkey and addresses:
+  P2PKH (1...), P2SH-P2WPKH (3...), P2WPKH (bc1q...).
+- Uses aiohttp + asyncio for concurrency.
+- Sleeps ~0.6 s (with jitter) after each address check.
+- Limits concurrent network calls to avoid 429.
+- Retries network calls up to 3 times with backoff.
+- Ctrl+C prints a checkpoint (last private key hex tried).
+- Use -d for debug logging.
 """
+
 import argparse
-import threading
-import time
+import asyncio
+import aiohttp
 import signal
-import requests
-import queue
 import random
+import sys
 from coincurve import PrivateKey
 from Crypto.Hash import SHA256, RIPEMD160
 
-SECP256K1_ORDER = int(
-    "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16
-)
-BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+# --- constants ---
+SECP256K1_ORDER = int("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"  # correct Base58 alphabet
 
-# ----------------- hashing / base58 / WIF -----------------
+# --- hashing/base58 helpers ---
 def sha256(b: bytes) -> bytes:
-    h = SHA256.new()
-    h.update(b)
-    return h.digest()
-
+    h = SHA256.new(); h.update(b); return h.digest()
 
 def ripemd160(b: bytes) -> bytes:
-    h = RIPEMD160.new()
-    h.update(b)
-    return h.digest()
-
+    h = RIPEMD160.new(); h.update(b); return h.digest()
 
 def hash160(b: bytes) -> bytes:
     return ripemd160(sha256(b))
 
-
 def base58_encode(b: bytes) -> str:
-    zeros = 0
-    for c in b:
-        if c == 0:
-            zeros += 1
-        else:
-            break
+    n_pad = len(b) - len(b.lstrip(b"\0"))
     num = int.from_bytes(b, "big")
     chars = []
-    while num > 0:
+    while num:
         num, rem = divmod(num, 58)
         chars.append(BASE58_ALPHABET[rem])
-    return "1" * zeros + "".join(reversed(chars)) if chars else "1" * zeros
-
+    return "1" * n_pad + "".join(reversed(chars))
 
 def base58check_encode(payload: bytes) -> str:
     chk = sha256(sha256(payload))[:4]
     return base58_encode(payload + chk)
 
-
-def privkey_to_wif(priv_bytes: bytes, compressed: bool = False) -> str:
+def privkey_to_wif(priv_bytes: bytes, compressed=True) -> str:
     prefix = b"\x80"
-    payload = prefix + priv_bytes
-    if compressed:
-        payload += b"\x01"
+    payload = prefix + priv_bytes + (b"\x01" if compressed else b"")
     return base58check_encode(payload)
 
-
-# ----------------- bech32 (BIP-173) -----------------
+# --- Bech32 (BIP173) helpers ---
 BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
-
 def bech32_polymod(values):
-    GENERATORS = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    g = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
     chk = 1
     for v in values:
-        b = (chk >> 25) & 0xFF
+        b = chk >> 25
         chk = ((chk & 0x1FFFFFF) << 5) ^ v
         for i in range(5):
             if (b >> i) & 1:
-                chk ^= GENERATORS[i]
+                chk ^= g[i]
     return chk
 
+def bech32_hrp_expand(hrp): return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
 
-def bech32_hrp_expand(hrp: str):
-    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
-
-
-def bech32_create_checksum(hrp: str, data: bytes):
-    values = bech32_hrp_expand(hrp) + list(data) + [0, 0, 0, 0, 0, 0]
+def bech32_create_checksum(hrp, data):
+    values = bech32_hrp_expand(hrp) + list(data) + [0]*6
     polymod = bech32_polymod(values) ^ 1
-    return bytes((polymod >> (5 * (5 - i)) & 31) for i in range(6))
+    return bytes((polymod >> 5*(5-i)) & 31 for i in range(6))
 
-
-def bech32_encode(hrp: str, data: bytes) -> str:
+def bech32_encode(hrp, data):
     combined = bytes(list(data) + list(bech32_create_checksum(hrp, data)))
     return hrp + "1" + "".join(BECH32_CHARSET[b] for b in combined)
 
-
-def convertbits(data: bytes, frombits: int, tobits: int, pad: bool = True) -> bytes:
-    acc = 0
-    bits = 0
+def convertbits(data, frombits, tobits, pad=True):
+    acc = bits = 0
     ret = []
     maxv = (1 << tobits) - 1
     for b in data:
-        if b >> frombits:
-            raise ValueError("Invalid data for convertbits")
+        if b >> frombits: raise ValueError("invalid data")
         acc = (acc << frombits) | b
         bits += frombits
         while bits >= tobits:
             bits -= tobits
             ret.append((acc >> bits) & maxv)
-    if pad:
-        if bits:
-            ret.append((acc << (tobits - bits)) & maxv)
-    else:
-        if bits >= frombits or ((acc << (tobits - bits)) & maxv):
-            raise ValueError("Invalid padding in convertbits")
+    if pad and bits:
+        ret.append((acc << (tobits - bits)) & maxv)
     return bytes(ret)
 
-
 def bech32_p2wpkh_from_h160(h160: bytes) -> str:
-    version = 0
-    data = bytes([version]) + convertbits(h160, 8, 5)
-    return bech32_encode("bc", data)
+    return bech32_encode("bc", bytes([0]) + convertbits(h160, 8, 5))
 
+# --- address builders ---
+def p2pkh(pub): return base58check_encode(b"\x00" + hash160(pub))
+def p2sh_p2wpkh(pub): return base58check_encode(b"\x05" + hash160(b"\x00\x14" + hash160(pub)))
+def p2wpkh_bech32(pub): return bech32_p2wpkh_from_h160(hash160(pub))
 
-# ----------------- address builders -----------------
-def p2pkh(pub: bytes) -> str:
-    return base58check_encode(b"\x00" + hash160(pub))
-
-
-def p2sh_p2wpkh(pub: bytes) -> str:
-    redeem_script = b"\x00\x14" + hash160(pub)
-    return base58check_encode(b"\x05" + hash160(redeem_script))
-
-
-def p2wpkh_bech32(pub: bytes) -> str:
-    return bech32_p2wpkh_from_h160(hash160(pub))
-
-
-# ----------------- deterministic index provider -----------------
+# --- deterministic index provider ---
 class IndexProvider:
-    def __init__(self, start: int = 1):
+    def __init__(self, start=1):
         if not (1 <= start < SECP256K1_ORDER):
-            raise ValueError("start must be in [1, SECP256K1_ORDER-1]")
-        self._lock = threading.Lock()
+            raise ValueError("start out of range")
         self._i = start
-
-    def next_index(self) -> int:
-        with self._lock:
+        self._lock = asyncio.Lock()
+    async def next_index(self):
+        async with self._lock:
             val = self._i
-            self._i += 1
-            if self._i >= SECP256K1_ORDER:
-                self._i = 1
+            self._i = 1 if self._i + 1 >= SECP256K1_ORDER else self._i + 1
             return val
 
-
-# ----------------- network checker with retries, 429 backoff & sleeps -----------------
-class AddrChecker:
-    def __init__(
-        self,
-        session: requests.Session,
-        debug: bool = False,
-        timeout: float = 10.0,
-        backoff_base: float = 5.0,
-    ):
-        """
-        backoff_base: extra seconds to add_per_attempt when a 429 is seen.
-        Actual wait on 429 for attempt n is: sleep_between + backoff_base * n
-        """
-        self.session = session
-        self.debug = debug
-        self.timeout = timeout
-        self.backoff_base = backoff_base
-
-    def _get_with_retries(self, url: str, retries: int = 3, sleep_between: float = 0.6):
-        """
-        Retries network errors and HTTP non-200 responses up to `retries`.
-        When a 429 is received, waits longer before retrying (using backoff_base).
-        Raises last exception if all retries exhausted.
-        """
-        last_exc = None
-        for attempt in range(1, retries + 1):
-            try:
-                resp = self.session.get(url, timeout=self.timeout)
-            except Exception as e:
-                last_exc = e
-                if self.debug:
-                    print(f"[DEBUG] GET {url} attempt {attempt} error: {e}", flush=True)
-            else:
-                if self.debug:
-                    print(f"[DEBUG] GET {url} -> {resp.status_code} {resp.reason}", flush=True)
-                if resp.status_code == 200:
-                    return resp
-                # Special handling for 429: back off longer then retry (if attempts remain)
-                if resp.status_code == 429:
-                    last_exc = RuntimeError("HTTP 429 Too Many Requests")
-                    if self.debug:
-                        print(f"[DEBUG] GET {url} received 429; will back off before retrying (attempt {attempt})", flush=True)
-                    if attempt < retries:
-                        wait = sleep_between + (self.backoff_base * attempt)
-                        if self.debug:
-                            print(f"[DEBUG] Backing off for {wait:.2f}s before next retry.", flush=True)
-                        time.sleep(wait)
-                        continue
-                    # else fall-through to raise after loop
-                else:
-                    # Other non-200 errors: treat as transient and sleep the regular amount before retry
-                    last_exc = RuntimeError(f"HTTP {resp.status_code}")
-            # regular sleep between retries (for network errors or non-429 non-200)
-            if attempt < retries:
-                time.sleep(sleep_between)
-        # all attempts failed
-        raise last_exc
-
-    def get_received(self, address: str) -> int:
-        url = f"https://blockchain.info/q/getreceivedbyaddress/{address}"
-        resp = self._get_with_retries(url)
-        return int(resp.text.strip())
-
-    def get_balance(self, address: str) -> int:
-        url = f"https://blockchain.info/q/addressbalance/{address}"
-        resp = self._get_with_retries(url)
-        return int(resp.text.strip())
-
-
-# ----------------- globals / checkpoint -----------------
-stop_event = threading.Event()
+# --- graceful shutdown globals ---
+stop_event = asyncio.Event()
 last_priv_hex = None
-last_priv_lock = threading.Lock()
+last_priv_lock = asyncio.Lock()
 
-# Queue for balance checks: items are tuples (address, wif, received)
-balance_queue = queue.Queue()
+# --- network checker with rate limiting & retries ---
+class AddrChecker:
+    def __init__(self, session, sem, debug=False):
+        self.s = session
+        self.sem = sem
+        self.debug = debug
 
-# ----------------- worker thread (scanners) -----------------
-def worker_thread(name: str, idx_provider: IndexProvider, checker: AddrChecker, print_lock: threading.Lock, debug: bool):
+    async def _get(self, url, retries=3):
+        for attempt in range(1, retries+1):
+            if stop_event.is_set(): return None
+            try:
+                async with self.sem:
+                    async with self.s.get(url, timeout=15) as resp:
+                        if self.debug:
+                            print(f"[DEBUG] GET {url} -> {resp.status}")
+                        if resp.status == 429:
+                            await asyncio.sleep(5)
+                            continue
+                        if resp.status == 200:
+                            text = await resp.text()
+                            return int(text.strip())
+            except Exception as e:
+                if self.debug:
+                    print(f"[DEBUG] Error {url}: {e}")
+            await asyncio.sleep(0.6)
+        return None
+
+    async def get_received(self, address): 
+        return await self._get(f"https://blockchain.info/q/getreceivedbyaddress/{address}")
+    async def get_balance(self, address): 
+        return await self._get(f"https://blockchain.info/q/addressbalance/{address}")
+
+# --- worker task ---
+async def worker_task(name, idx_provider, checker, debug=False):
     global last_priv_hex
     while not stop_event.is_set():
-        idx = idx_provider.next_index()
+        idx = await idx_provider.next_index()
         priv_bytes = idx.to_bytes(32, "big")
-        priv_hex = priv_bytes.hex()
-        with last_priv_lock:
-            last_priv_hex = priv_hex
+        async with last_priv_lock:
+            last_priv_hex = priv_bytes.hex()
 
         try:
             pk = PrivateKey(priv_bytes)
-            pub_compressed = pk.public_key.format(compressed=True)
-            wif_c = privkey_to_wif(priv_bytes, compressed=True)
-
-            addresses = [
-                p2pkh(pub_compressed),  # 1...
-                p2sh_p2wpkh(pub_compressed),  # 3...
-                p2wpkh_bech32(pub_compressed),  # bc1q...
-            ]
+            pub = pk.public_key.format(compressed=True)
+            wif = privkey_to_wif(priv_bytes, True)
+            addresses = [p2pkh(pub), p2sh_p2wpkh(pub), p2wpkh_bech32(pub)]
 
             if debug:
-                with print_lock:
-                    print(f"[{name}] scanning idx={idx} priv={priv_hex}", flush=True)
+                print(f"[{name}] scanning idx={idx} priv={priv_bytes.hex()}")
 
             for addr in addresses:
-                if stop_event.is_set():
-                    break
+                if stop_event.is_set(): break
+                recvd = await checker.get_received(addr)
+                await asyncio.sleep(0.55 + random.random() * 0.1)
 
-                # 1) Check "received" with retries; if fails print error and move on
-                try:
-                    recvd = checker.get_received(addr)
-                except Exception as e:
-                    with print_lock:
-                        print(f"[ERROR] [{name}] addr={addr} getreceived FAILED: {e}", flush=True)
-                    # mandatory sleep 0.6s per address check (applies per thread)
-                    time.sleep(0.6)
-                    continue
-
-                # 2) If received != 0, enqueue for dedicated balance checker (do NOT check here)
-                if recvd != 0:
-                    try:
-                        balance_queue.put_nowait((addr, wif_c, recvd))
-                    except queue.Full:
-                        # If queue is full (unlikely unless you explicitly set maxsize), print a warning and skip
-                        with print_lock:
-                            print(f"[WARN] [{name}] balance_queue full; skipping enqueue for {addr}", flush=True)
-
-                # 3) mandatory sleep 0.6s after each address check (per thread)
-                time.sleep(0.6)
-
+                if recvd and recvd > 0:
+                    await asyncio.sleep(1.0)
+                    bal = await checker.get_balance(addr)
+                    print("\n" + "="*60)
+                    print("!!!!! FOUND ADDRESS WITH RECEIVED FUNDS !!!!!\n")
+                    print("WIF:", wif)
+                    print("ADDRESS:", addr)
+                    print("RECEIVED (sats):", recvd)
+                    print("BALANCE (sats):", bal if bal is not None else "N/A")
+                    print("="*60 + "\n")
         except Exception as e:
-            with print_lock:
-                print(f"[ERROR] [{name}] idx={idx} private derivation failed: {e}", flush=True)
-            time.sleep(0.6)
-
+            print(f"[ERROR] [{name}] failed: {e}")
+            await asyncio.sleep(0.6)
     if debug:
-        with print_lock:
-            print(f"[{name}] exiting", flush=True)
+        print(f"[{name}] exiting")
 
-
-# ----------------- dedicated balance-checker thread -----------------
-def balance_worker(checker: AddrChecker, print_lock: threading.Lock, debug: bool, balance_sleep: float, jitter: float):
-    """
-    Consumes balance_queue. For each queued item, calls get_balance and prints results.
-    Sleeps balance_sleep +/- jitter between balance checks to avoid 429.
-    Exits when stop_event is set and queue is empty.
-    """
-    while True:
-        if stop_event.is_set() and balance_queue.empty():
-            break
-        try:
-            addr, wif_c, recvd = balance_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue  # loop to check stop_event
-        try:
-            bal = checker.get_balance(addr)
-        except Exception as e:
-            # IMPORTANT: keep printing errors if retries exhausted or immediate failure,
-            # so you don't miss anything (you asked not to swallow failures).
-            with print_lock:
-                print("\n" + "=" * 60, flush=True)
-                print("!!! FOUND (BALANCE CHECK FAILED) !!!", flush=True)
-                print("", flush=True)
-                print("WIF:", wif_c, flush=True)
-                print("ADDRESS:", addr, flush=True)
-                print("RECEIVED (sats):", str(recvd), flush=True)
-                print("BALANCE CHECK ERROR:", str(e), flush=True)
-                print("=" * 60 + "\n", flush=True)
-        else:
-            with print_lock:
-                print("\n" + "=" * 60, flush=True)
-                print("!!!!! FOUND ADDRESS WITH RECEIVED FUNDS !!!!!", flush=True)
-                print("", flush=True)
-                print("WIF:", wif_c, flush=True)
-                print("ADDRESS:", addr, flush=True)
-                print("RECEIVED (sats):", str(recvd), flush=True)
-                print("BALANCE (sats):", str(bal), flush=True)
-                print("=" * 60 + "\n", flush=True)
-        finally:
-            balance_queue.task_done()
-            # Sleep balance_sleep +/- jitter (clamped to >= 0.0)
-            sleep_time = balance_sleep + random.uniform(-jitter, jitter)
-            if sleep_time < 0.0:
-                sleep_time = 0.0
-            time.sleep(sleep_time)
-
-    if debug:
-        with print_lock:
-            print("[balance-worker] exiting", flush=True)
-
-
-# ----------------- CLI / main -----------------
+# --- main ---
 def parse_args():
-    def auto_int(x):
-        """
-        Accept decimal (1234) or hex (0x4d2 or 4d2).
-        """
-        try:
-            if x.lower().startswith("0x"):
-                return int(x, 16)
-            if any(c in "abcdefABCDEF" for c in x):
-                return int(x, 16)
-            return int(x, 10)
-        except ValueError:
-            raise argparse.ArgumentTypeError(f"invalid integer or hex value: {x}")
-
-    p = argparse.ArgumentParser(description="Deterministic BTC scanner (multi-threaded) with dedicated balance thread, jitter and 429 backoff")
-    p.add_argument("-t", "--threads", type=int, default=4,
-                   help="total threads to run (default 4: 3 scanners + 1 balance checker). Minimum 2.")
-    p.add_argument("-d", "--debug", action="store_true", help="debug mode: prints each GET status")
-    p.add_argument("--start", type=auto_int, default=1, help="start index (int or hex, e.g. 1234 or 0x4d2 or 4d2)")
-    p.add_argument("--balance-sleep", type=float, default=1.0,
-                   help="mean sleep (seconds) between balance checks in the dedicated balance thread (default 1.0)")
-    p.add_argument("--jitter", type=float, default=0.2,
-                   help="max +/- jitter (seconds) applied to balance-sleep (default 0.2, so default range is 0.8-1.2)")
-    p.add_argument("--backoff-base", type=float, default=5.0,
-                   help="base extra seconds to add per attempt when a 429 is seen (default 5.0). Wait on 429 = sleep_between + backoff_base * attempt")
+    p = argparse.ArgumentParser(description="Deterministic async BTC scanner")
+    p.add_argument("-t","--threads",type=int,default=3,help="number of async workers (default 3)")
+    p.add_argument("--start",type=int,default=1,help="start index")
+    p.add_argument("-d","--debug",action="store_true")
     return p.parse_args()
 
-
-def main():
+async def main():
     global last_priv_hex
     args = parse_args()
-    if args.threads < 2:
-        raise SystemExit("threads must be >= 2 (at least one scanner and one balance thread)")
+    idx_provider = IndexProvider(args.start)
+    sem = asyncio.Semaphore(2)  # limit concurrent requests
+    async with aiohttp.ClientSession() as session:
+        checker = AddrChecker(session, sem, args.debug)
 
-    # We'll use (threads - 1) scanner threads and 1 dedicated balance thread.
-    scanner_count = max(1, args.threads - 1)
+        def handle_signal(*_):
+            stop_event.set()
+            asyncio.create_task(print_checkpoint())
 
-    idx_provider = IndexProvider(start=args.start)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, handle_signal)
 
-    session = requests.Session()
-    checker = AddrChecker(session=session, debug=args.debug, backoff_base=args.backoff_base)
+        tasks = [asyncio.create_task(worker_task(f"worker-{i+1}", idx_provider, checker, args.debug))
+                 for i in range(max(1, args.threads))]
 
-    print_lock = threading.Lock()
+        await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+        print("[INFO] All workers stopped. Exiting.")
 
-    # signal handler: set stop and print checkpoint
-    def _signal_handler(sig, frame):
-        stop_event.set()
-        with last_priv_lock:
-            hex_checkpoint = last_priv_hex
-        if hex_checkpoint:
-            print("\n[INFO] Interrupted by user.", flush=True)
-            print("[INFO] Last private key hex tried (checkpoint):", flush=True)
-            print(hex_checkpoint, flush=True)
+async def print_checkpoint():
+    await asyncio.sleep(0.1)
+    async with last_priv_lock:
+        if last_priv_hex:
+            print("\n[INFO] Interrupted by user.")
+            print("[INFO] Last private key hex tried (checkpoint):")
+            print(last_priv_hex)
         else:
-            print("\n[INFO] Interrupted by user. No key processed yet.", flush=True)
-
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
-
-    # start scanner threads
-    threads = []
-    for i in range(scanner_count):
-        t = threading.Thread(
-            target=worker_thread,
-            args=(f"scanner-{i+1}", idx_provider, checker, print_lock, args.debug),
-            daemon=True,
-        )
-        threads.append(t)
-        t.start()
-
-    # start single balance thread with jitter parameters
-    bal_thread = threading.Thread(
-        target=balance_worker,
-        args=(checker, print_lock, args.debug, args.balance_sleep, args.jitter),
-        daemon=True,
-    )
-    threads.append(bal_thread)
-    bal_thread.start()
-
-    try:
-        while any(t.is_alive() for t in threads):
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        stop_event.set()
-        with last_priv_lock:
-            hex_checkpoint = last_priv_hex
-        if hex_checkpoint:
-            print("\n[INFO] Interrupted by user.", flush=True)
-            print("[INFO] Last private key hex tried (checkpoint):", flush=True)
-            print(hex_checkpoint, flush=True)
-        else:
-            print("\n[INFO] Interrupted by user. No key processed yet.", flush=True)
-
-    # Wait briefly for threads to finish
-    for t in threads:
-        t.join(timeout=1.0)
-
-    # Ensure any remaining queued balance checks are attempted before full exit
-    # (balance_worker will exit when stop_event is set and queue empty)
-    if not balance_queue.empty():
-        try:
-            # give some time for balance worker to finish remaining items
-            balance_queue.join(timeout=5.0)
-        except TypeError:
-            # older Python's queue.join has no timeout param; ignore
-            pass
-
-    print("[INFO] All workers stopped. Exiting.", flush=True)
-
+            print("\n[INFO] Interrupted by user. No key processed yet.")
+    sys.exit(0)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
