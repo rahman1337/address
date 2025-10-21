@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-btc_scanner_threadpool_blockcypher_semaphore_wif.py
+btc_scanner_threadpool_blockcypher_semaphore_wif_base58_suffix.py
 
 Modified deterministic multi-threaded BTC address scanner that:
-- Iterates WIF strings formed as: <WIF_PREFIX><9-digit decimal suffix>
-  e.g. KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU100000001, ...
+- Iterates WIF strings formed as: <WIF_PREFIX><9-char base58 suffix>
+  e.g. KwDiBf89...M7rFU<9base58chars>, KwDiBf89...M7rFU<next 9base58chars>, ...
 - Decodes each WIF to a 32-byte private key (supports compressed WIFs).
 - Derives compressed pubkey and addresses:
   P2PKH (1...), P2SH-P2WPKH (3...), P2WPKH (bc1q...).
@@ -17,7 +17,7 @@ Modified deterministic multi-threaded BTC address scanner that:
 - Retries up to 3 times on network errors (0.6s between retries).
 - 0.6s sleeps apply per address per thread.
 - Uses a global threading.Semaphore to limit concurrent HTTP requests (--concurrency).
-- Ctrl+C prints a checkpoint (last private key hex tried).
+- Ctrl+C prints a checkpoint (last private key hex & last WIF tried).
 - Use -d for debug (prints GET status lines).
 """
 import argparse
@@ -187,29 +187,69 @@ def p2wpkh_bech32(pub: bytes) -> str:
     return bech32_p2wpkh_from_h160(hash160(pub))
 
 
-# ----------------- deterministic WIF index provider -----------------
+# ----------------- base58 <-> integer helpers for fixed-length suffixes -----------------
+def base58_to_int_fixed(s: str) -> int:
+    """Convert a base58 string to int (no padding rules)."""
+    num = 0
+    for ch in s:
+        idx = BASE58_ALPHABET.find(ch)
+        if idx == -1:
+            raise ValueError(f"Invalid base58 char: {ch}")
+        num = num * 58 + idx
+    return num
+
+
+def int_to_base58_fixed(num: int, length: int) -> str:
+    """Convert int to base58 string, padded (left) with '1' to reach requested length."""
+    if num < 0:
+        raise ValueError("num must be non-negative")
+    if num == 0:
+        s = "1"
+    else:
+        chars = []
+        while num > 0:
+            num, rem = divmod(num, 58)
+            chars.append(BASE58_ALPHABET[rem])
+        s = "".join(reversed(chars))
+    # left-pad with '1' to the requested length
+    if len(s) > length:
+        raise ValueError("Integer too large to encode in requested length")
+    return "1" * (length - len(s)) + s
+
+
+# ----------------- deterministic WIF index provider (base58 9-char suffix) -----------------
 class WIFIndexProvider:
     """
-    Produces sequential decimal 9-digit suffixes for WIF strings.
-    WIF strings are constructed as: prefix + "{suffix:09d}"
-    E.g. prefix="KwDiBf89...M7rFU", suffix 100000001 -> "KwDiBf89...M7rFU100000001"
+    Produces sequential base58 9-character suffixes for WIF strings.
+    WIF strings are constructed as: prefix + <9-char base58 suffix>
+    The start parameter is a 9-char base58 string (default '111111111').
     """
-    def __init__(self, prefix: str, start: int = 100000001):
-        if start < 0:
-            raise ValueError("start must be non-negative")
+    SUFFIX_LEN = 9
+
+    def __init__(self, prefix: str, start_base58: str = "111111111"):
+        if not isinstance(prefix, str) or len(prefix) == 0:
+            raise ValueError("prefix must be a non-empty string")
+        if not isinstance(start_base58, str) or len(start_base58) != self.SUFFIX_LEN:
+            raise ValueError(f"start must be a {self.SUFFIX_LEN}-character base58 string")
+        for ch in start_base58:
+            if ch not in BASE58_ALPHABET:
+                raise ValueError(f"start contains invalid base58 char: {ch}")
         self._prefix = prefix
         self._lock = threading.Lock()
-        self._i = start
+        self._i = base58_to_int_fixed(start_base58)
 
-    def next_suffix(self) -> int:
+    def next_suffix(self) -> str:
         with self._lock:
             val = self._i
+            # increment for next call
             self._i += 1
-            return val
+            # convert val to base58 fixed-length string
+            return int_to_base58_fixed(val, self.SUFFIX_LEN)
 
-    def construct_wif(self, suffix: int) -> str:
-        # 9-digit decimal suffix, zero-padded to 9 digits
-        return f"{self._prefix}{suffix:09d}"
+    def construct_wif(self, suffix_base58: str) -> str:
+        if len(suffix_base58) != self.SUFFIX_LEN:
+            raise ValueError("suffix must be length " + str(self.SUFFIX_LEN))
+        return f"{self._prefix}{suffix_base58}"
 
 
 # ----------------- network checker with retries, sleeps & semaphore -----------------
@@ -329,13 +369,10 @@ def worker_thread(name: str, wif_provider: WIFIndexProvider, checker: AddrChecke
             except Exception as e:
                 with print_lock:
                     print(f"[ERROR] [{name}] WIF decode failed for '{wif}': {e}", flush=True)
-                # still set last_priv_hex for checkpoint if possible
+                # set checkpoint placeholder
                 with last_priv_lock:
-                    try:
-                        last_priv_hex = "UNKNOWN"
-                    except Exception:
-                        last_priv_hex = None
-                # mandatory per-address sleep behavior (we treat this as a single failed 'address check' to avoid hot-loop)
+                    last_priv_hex = None
+                # per-address sleep to avoid hot-loop
                 time.sleep(0.6)
                 continue
 
@@ -344,11 +381,8 @@ def worker_thread(name: str, wif_provider: WIFIndexProvider, checker: AddrChecke
                 last_priv_hex = priv_hex
 
             pk = PrivateKey(priv_bytes)
-            # always use compressed public key format (makes sense when WIF indicates compression; if uncompressed WIF,
-            # we still will derive compressed pubkey here -- this mirrors original script's use of compressed=True)
             pub_compressed = pk.public_key.format(compressed=True)
-            # reflect WIF compression flag in produced WIF_C for printing
-            wif_c = wif  # since we're iterating WIFs already, keep original WIF
+            wif_c = wif  # original WIF string
 
             addresses = [
                 p2pkh(pub_compressed),  # 1...
@@ -417,19 +451,29 @@ def worker_thread(name: str, wif_provider: WIFIndexProvider, checker: AddrChecke
 
 # ----------------- CLI / main -----------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Deterministic BTC scanner using WIF prefix + 9-digit suffix (ThreadPoolExecutor) + BlockCypher balance (with semaphore)")
+    p = argparse.ArgumentParser(description="Deterministic BTC scanner using WIF prefix + 9-char base58 suffix (ThreadPoolExecutor) + BlockCypher balance (with semaphore)")
     p.add_argument("-t", "--threads", type=int, default=3, help="number of worker threads (default 3)")
     p.add_argument("-c", "--concurrency", type=int, default=2, help="max concurrent HTTP requests across threads (default 2)")
     p.add_argument("-d", "--debug", action="store_true", help="debug mode: prints each GET status")
     p.add_argument("--wif-prefix", type=str, default="KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU", help="WIF prefix to use (default long prefix you provided)")
-    p.add_argument("--start", type=int, default=100000001, help="start 9-digit decimal suffix (default 100000001)")
+    p.add_argument("--start", type=str, default="111111111", help="start 9-char base58 suffix (default '111111111')")
     return p.parse_args()
 
 
 def main():
     global last_priv_hex, last_wif_tried
     args = parse_args()
-    wif_provider = WIFIndexProvider(prefix=args.wif_prefix, start=args.start)
+    # validate start
+    start = args.start
+    if len(start) != WIFIndexProvider.SUFFIX_LEN:
+        print(f"[FATAL] --start must be exactly {WIFIndexProvider.SUFFIX_LEN} base58 characters", file=sys.stderr)
+        sys.exit(2)
+    for ch in start:
+        if ch not in BASE58_ALPHABET:
+            print(f"[FATAL] --start contains invalid base58 char: {ch}", file=sys.stderr)
+            sys.exit(2)
+
+    wif_provider = WIFIndexProvider(prefix=args.wif_prefix, start_base58=start)
 
     session = requests.Session()
     # semaphore controlling concurrent HTTP requests across all threads
