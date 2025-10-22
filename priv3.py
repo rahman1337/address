@@ -6,6 +6,7 @@ import sys
 import requests
 import threading
 import os
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from coincurve import PrivateKey
 from Crypto.Hash import SHA256, RIPEMD160
@@ -119,78 +120,51 @@ def p2sh_p2wpkh(pub: bytes) -> str:
 def p2wpkh_bech32(pub: bytes) -> str:
     return bech32_p2wpkh_from_h160(hash160(pub))
 
-# --------------------- PrefixCounterProvider ---------------------
-class PrefixCounterProvider:
+# --------------------- RandomSuffixProvider ---------------------
+class RandomSuffixProvider:
     """
-    Private key = <prefix_hex (arbitrary)> + <suffix_hex> to make 64 hex chars
+    Private key = <static prefix> + <random non-repeating hex suffix>
     """
-    def __init__(self, prefix_hex: str, mode: str = "hex", start_counter: int = 0, persist_file: str = None):
+    def __init__(self, prefix_hex: str, suffix_len: int = 18, persist_file: str = None):
         prefix_hex = prefix_hex.upper()
-        if len(prefix_hex) >= 64:
-            raise ValueError("prefix_hex must be less than 64 hex chars")
+        if len(prefix_hex) + suffix_len != 64:
+            raise ValueError("prefix + suffix length must be 64 hex chars")
         int(prefix_hex, 16)
         self.prefix_hex = prefix_hex
-        self.suffix_len = 64 - len(prefix_hex)
-        self.mode = mode.lower()
-        if self.mode not in ("hex", "digits", "letters"):
-            raise ValueError("mode must be one of: hex, digits, letters")
-
+        self.suffix_len = suffix_len
         self._lock = threading.Lock()
         self.persist_file = persist_file
-        self.counter = int(start_counter)
+        self.used_suffixes = set()
+
         if persist_file and os.path.exists(persist_file):
             try:
-                with open(persist_file, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                if content:
-                    self.counter = max(self.counter, int(content))
+                with open(persist_file, "r") as f:
+                    for line in f:
+                        s = line.strip()
+                        if s:
+                            self.used_suffixes.add(s.upper())
             except Exception:
                 pass
 
-    def _persist_counter(self, value: int):
+    def _persist_suffix(self, suffix: str):
         if not self.persist_file:
             return
-        tmp = self.persist_file + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(str(value))
-        os.replace(tmp, self.persist_file)
-
-    def _counter_to_suffix_hex(self, counter: int) -> str:
-        if self.mode == "hex":
-            s = format(counter, "0{}X".format(self.suffix_len))
-            if len(s) > self.suffix_len:
-                raise RuntimeError("counter overflow for suffix length")
-            return s.zfill(self.suffix_len)
-        elif self.mode == "digits":
-            s = str(counter).zfill(self.suffix_len)
-            if len(s) > self.suffix_len:
-                raise RuntimeError("counter overflow for digits-mode suffix length")
-            return s.upper()
-        else:  # letters mode A-F only
-            digits = []
-            n = counter
-            if n == 0:
-                digits = ["A"]
-            else:
-                while n > 0:
-                    digits.append("ABCDEF"[n % 6])
-                    n //= 6
-            s = "".join(reversed(digits)).rjust(self.suffix_len, "A")
-            if len(s) > self.suffix_len:
-                raise RuntimeError("counter overflow for letters-mode suffix length")
-            return s.upper()
+        with open(self.persist_file, "a") as f:
+            f.write(suffix + "\n")
 
     def next_priv_bytes(self):
         with self._lock:
-            c = self.counter
-            suffix = self._counter_to_suffix_hex(c)
-            self.counter += 1
-            self._persist_counter(c)
+            while True:
+                suffix = "".join(random.choices("0123456789ABCDEF", k=self.suffix_len))
+                if suffix not in self.used_suffixes:
+                    self.used_suffixes.add(suffix)
+                    self._persist_suffix(suffix)
+                    break
 
-        full_hex = (self.prefix_hex + suffix).upper()
+        full_hex = self.prefix_hex + suffix
         priv_int = int(full_hex, 16)
         if not (1 <= priv_int < SECP256K1_ORDER):
-            raise RuntimeError("Generated private key out of range")
+            return self.next_priv_bytes()
         return priv_int.to_bytes(32, "big"), suffix, full_hex
 
 # --------------------- AddrChecker ---------------------
@@ -248,7 +222,7 @@ stop_event = threading.Event()
 last_priv_hex = None
 last_priv_lock = threading.Lock()
 
-def worker_thread(name: str, provider: PrefixCounterProvider, checker: AddrChecker, print_lock: threading.Lock, debug: bool):
+def worker_thread(name: str, provider: RandomSuffixProvider, checker: AddrChecker, print_lock: threading.Lock, debug: bool):
     global last_priv_hex
     while not stop_event.is_set():
         try:
@@ -325,26 +299,23 @@ def worker_thread(name: str, provider: PrefixCounterProvider, checker: AddrCheck
 
 # --------------------- Arg parse ---------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="BTC scanner: 30-char prefix + deterministic non-repeating suffix private-keys")
+    p = argparse.ArgumentParser(description="BTC scanner: static 46-char prefix + random non-repeating 18-char suffix")
     p.add_argument("-t", "--threads", type=int, default=3, help="number of worker threads (default 3)")
     p.add_argument("-c", "--concurrency", type=int, default=2, help="max concurrent HTTP requests across threads (default 2)")
     p.add_argument("-d", "--debug", action="store_true", help="debug mode: prints each GET status and suffix")
-    p.add_argument("--prefix", type=str, default="FFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-                   help="fixed 30-hex-char prefix")
-    p.add_argument("--mode", type=str, default="hex", choices=["hex", "digits", "letters"],
-                   help="suffix generation mode: hex, digits, letters")
-    p.add_argument("--start-counter", type=int, default=0, help="start counter (default 0)")
-    p.add_argument("--persist-counter", type=str, default=None,
-                   help="optional file to persist last used counter")
+    p.add_argument("--prefix", type=str, default="FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BB",
+                   help="fixed 46-hex-char prefix")
+    p.add_argument("--persist", type=str, default=None,
+                   help="optional file to persist used suffixes")
     return p.parse_args()
 
 # --------------------- Main ---------------------
 def main():
     global last_priv_hex
     args = parse_args()
+
     try:
-        provider = PrefixCounterProvider(prefix_hex=args.prefix, mode=args.mode,
-                                         start_counter=args.start_counter, persist_file=args.persist_counter)
+        provider = RandomSuffixProvider(prefix_hex=args.prefix, suffix_len=18, persist_file=args.persist)
     except Exception as e:
         print(f"[FATAL] failed to initialize provider: {e}", flush=True)
         sys.exit(1)
@@ -352,7 +323,6 @@ def main():
     session = requests.Session()
     sem = threading.Semaphore(max(1, args.concurrency))
     checker = AddrChecker(session=session, sem=sem, debug=args.debug)
-
     print_lock = threading.Lock()
 
     def _signal_handler(sig, frame):
