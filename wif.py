@@ -3,9 +3,9 @@
 btc_scanner_threadpool_blockcypher_semaphore_wif_base58_suffix.py
 
 Modified deterministic multi-threaded BTC address scanner that:
-- Iterates WIF strings formed as: <WIF_PREFIX>71<8-char base58 random suffix>
-  e.g. KwDiBf89...M7rFU71<8-random-base58-chars>, KwDiBf89...M7rFU71<next-random-8chars>, ...
-  (the two characters '7' and '1' are fixed; the trailing 8 chars are random and guaranteed
+- Iterates WIF strings formed as: <WIF_PREFIX>7<9-char base58 random suffix>
+  e.g. KwDiBf89...M7rFU7<9-random-base58-chars>, KwDiBf89...M7rFU7<next-random-9chars>, ...
+  (the single character '7' is fixed; the trailing 9 chars are random and guaranteed
    not to repeat within the same run)
 - Decodes each WIF to a 32-byte private key (supports compressed WIFs).
 - Derives compressed pubkey and addresses:
@@ -193,11 +193,11 @@ def p2wpkh_bech32(pub: bytes) -> str:
 # ----------------- deterministic WIF index provider (random non-repeating suffix) -----------------
 class WIFIndexProvider:
     """
-    Produces random, non-repeating base58 8-character suffixes for WIF strings.
-    WIF strings are constructed as: prefix + '71' + <8-char base58 random suffix>
+    Produces random, non-repeating base58 9-character suffixes for WIF strings.
+    WIF strings are constructed as: prefix + '7' + <9-char base58 random suffix>
     The provider guarantees no repeats within a single program run by tracking seen suffixes.
     """
-    SUFFIX_LEN = 8  # variable random part length (the '71' is fixed)
+    SUFFIX_LEN = 9  # variable random part length (the single '7' is fixed)
 
     def __init__(self, prefix: str):
         if not isinstance(prefix, str) or len(prefix) == 0:
@@ -219,7 +219,7 @@ class WIFIndexProvider:
         """
         with self._lock:
             # try until an unseen suffix is generated
-            # (given 58^8 possibilities, collision probability is tiny for reasonable runs)
+            # (given 58^9 possibilities, collision probability is tiny for reasonable runs)
             while True:
                 s = self._gen_random_suffix()
                 if s not in self._seen:
@@ -229,8 +229,8 @@ class WIFIndexProvider:
     def construct_wif(self, suffix_base58: str) -> str:
         if len(suffix_base58) != self.SUFFIX_LEN:
             raise ValueError("suffix must be length " + str(self.SUFFIX_LEN))
-        # fixed '71' inserted between prefix and variable suffix
-        return f"{self._prefix}71{suffix_base58}"
+        # fixed single '7' inserted between prefix and variable suffix
+        return f"{self._prefix}7{suffix_base58}"
 
 
 # ----------------- network checker with retries, sleeps & semaphore -----------------
@@ -432,7 +432,7 @@ def worker_thread(name: str, wif_provider: WIFIndexProvider, checker: AddrChecke
 
 # ----------------- CLI / main -----------------
 def parse_args():
-    p = argparse.ArgumentParser(description="BTC scanner using WIF prefix + fixed '71' + random non-repeating 8-char base58 suffix (ThreadPoolExecutor) + BlockCypher balance (with semaphore)")
+    p = argparse.ArgumentParser(description="BTC scanner using WIF prefix + fixed '7' + random non-repeating 9-char base58 suffix (ThreadPoolExecutor) + BlockCypher balance (with semaphore)")
     p.add_argument("-t", "--threads", type=int, default=3, help="number of worker threads (default 3)")
     p.add_argument("-c", "--concurrency", type=int, default=2, help="max concurrent HTTP requests across threads (default 2)")
     p.add_argument("-d", "--debug", action="store_true", help="debug mode: prints each GET status")
