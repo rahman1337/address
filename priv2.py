@@ -1,23 +1,4 @@
 #!/usr/bin/env python3
-"""
-btc_scanner_threadpool_blockcypher_semaphore.py
-
-Deterministic multi-threaded BTC address scanner using ThreadPoolExecutor:
-- Sequential deterministic private keys (1,2,3,...).
-- For each key derives compressed pubkey and addresses:
-  P2PKH (1...), P2SH-P2WPKH (3...), P2WPKH (bc1q...).
-- For every address:
-    - GET https://blockchain.info/q/getreceivedbyaddress/{address}
-    - (sleep 0.6s after each address check)
-    - If received != 0: sleep 1.0s, then GET BlockCypher:
-      https://api.blockcypher.com/v1/btc/main/addrs/{address}/balance
-    - Print nicely formatted "FOUND" block for hits.
-- Retries up to 3 times on network errors (0.6s between retries).
-- 0.6s sleeps apply per address per thread.
-- Uses a global threading.Semaphore to limit concurrent HTTP requests (--concurrency).
-- Ctrl+C prints a checkpoint (last private key hex tried).
-- Use -d for debug (prints GET status lines).
-"""
 import argparse
 import time
 import signal
@@ -33,22 +14,23 @@ SECP256K1_ORDER = int(
 )
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
-# ----------------- hashing / base58 / WIF -----------------
+# ANSI colors
+YELLOW = "\033[33m"
+LIGHT_GREEN = "\033[92m"
+RESET = "\033[0m"
+
 def sha256(b: bytes) -> bytes:
     h = SHA256.new()
     h.update(b)
     return h.digest()
-
 
 def ripemd160(b: bytes) -> bytes:
     h = RIPEMD160.new()
     h.update(b)
     return h.digest()
 
-
 def hash160(b: bytes) -> bytes:
     return ripemd160(sha256(b))
-
 
 def base58_encode(b: bytes) -> str:
     zeros = 0
@@ -64,11 +46,9 @@ def base58_encode(b: bytes) -> str:
         chars.append(BASE58_ALPHABET[rem])
     return "1" * zeros + "".join(reversed(chars)) if chars else "1" * zeros
 
-
 def base58check_encode(payload: bytes) -> str:
     chk = sha256(sha256(payload))[:4]
     return base58_encode(payload + chk)
-
 
 def privkey_to_wif(priv_bytes: bytes, compressed: bool = False) -> str:
     prefix = b"\x80"
@@ -77,10 +57,7 @@ def privkey_to_wif(priv_bytes: bytes, compressed: bool = False) -> str:
         payload += b"\x01"
     return base58check_encode(payload)
 
-
-# ----------------- bech32 (BIP-173) -----------------
 BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-
 
 def bech32_polymod(values):
     GENERATORS = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
@@ -93,21 +70,17 @@ def bech32_polymod(values):
                 chk ^= GENERATORS[i]
     return chk
 
-
 def bech32_hrp_expand(hrp: str):
     return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
-
 
 def bech32_create_checksum(hrp: str, data: bytes):
     values = bech32_hrp_expand(hrp) + list(data) + [0, 0, 0, 0, 0, 0]
     polymod = bech32_polymod(values) ^ 1
     return bytes((polymod >> (5 * (5 - i)) & 31) for i in range(6))
 
-
 def bech32_encode(hrp: str, data: bytes) -> str:
     combined = bytes(list(data) + list(bech32_create_checksum(hrp, data)))
     return hrp + "1" + "".join(BECH32_CHARSET[b] for b in combined)
-
 
 def convertbits(data: bytes, frombits: int, tobits: int, pad: bool = True) -> bytes:
     acc = 0
@@ -130,28 +103,21 @@ def convertbits(data: bytes, frombits: int, tobits: int, pad: bool = True) -> by
             raise ValueError("Invalid padding in convertbits")
     return bytes(ret)
 
-
 def bech32_p2wpkh_from_h160(h160: bytes) -> str:
     version = 0
     data = bytes([version]) + convertbits(h160, 8, 5)
     return bech32_encode("bc", data)
 
-
-# ----------------- address builders -----------------
 def p2pkh(pub: bytes) -> str:
     return base58check_encode(b"\x00" + hash160(pub))
-
 
 def p2sh_p2wpkh(pub: bytes) -> str:
     redeem_script = b"\x00\x14" + hash160(pub)
     return base58check_encode(b"\x05" + hash160(redeem_script))
 
-
 def p2wpkh_bech32(pub: bytes) -> str:
     return bech32_p2wpkh_from_h160(hash160(pub))
 
-
-# ----------------- deterministic index provider -----------------
 class IndexProvider:
     def __init__(self, start: int = 1):
         if not (1 <= start < SECP256K1_ORDER):
@@ -167,8 +133,6 @@ class IndexProvider:
                 self._i = 1
             return val
 
-
-# ----------------- network checker with retries, sleeps & semaphore -----------------
 class AddrChecker:
     def __init__(self, session: requests.Session, sem: threading.Semaphore, debug: bool = False, timeout: float = 10.0):
         self.session = session
@@ -205,20 +169,16 @@ class AddrChecker:
                 time.sleep(sleep_between)
         raise last_exc
 
+    # Uses blockchain.info quick API to get total received (satoshis).
+    # Returns int (total received in satoshis) or raises on failure.
     def get_received(self, address: str) -> int:
-        """
-        Uses blockchain.info quick API to get total received (satoshis).
-        Returns int (total received in satoshis) or raises on failure.
-        """
         url = f"https://blockchain.info/q/getreceivedbyaddress/{address}"
         resp = self._get_with_retries(url)
         return int(resp.text.strip())
 
+    # Uses BlockCypher address balance endpoint.
+    # Returns int(final_balance in satoshis) or raises on failure.
     def get_balance(self, address: str) -> int:
-        """
-        Uses BlockCypher address balance endpoint.
-        Returns int(final_balance in satoshis) or raises on failure.
-        """
         url = f"https://api.blockcypher.com/v1/btc/main/addrs/{address}/balance"
         resp = self._get_with_retries(url)
         data = resp.json()
@@ -229,14 +189,10 @@ class AddrChecker:
         else:
             return int(data.get("total_received", 0))
 
-
-# ----------------- globals / checkpoint -----------------
 stop_event = threading.Event()
 last_priv_hex = None
 last_priv_lock = threading.Lock()
 
-
-# ----------------- worker thread -----------------
 def worker_thread(name: str, idx_provider: IndexProvider, checker: AddrChecker, print_lock: threading.Lock, debug: bool):
     global last_priv_hex
     while not stop_event.is_set():
@@ -288,7 +244,8 @@ def worker_thread(name: str, idx_provider: IndexProvider, checker: AddrChecker, 
                             print("", flush=True)
                             print("WIF:", wif_c, flush=True)
                             print("ADDRESS:", addr, flush=True)
-                            print("RECEIVED (sats):", str(recvd), flush=True)
+                            # colored received
+                            print("RECEIVED (sats):", f"{YELLOW}{recvd}{RESET}", flush=True)
                             print("BALANCE CHECK ERROR:", str(e), flush=True)
                             print("=" * 53 + "\n", flush=True)
                     else:
@@ -299,8 +256,9 @@ def worker_thread(name: str, idx_provider: IndexProvider, checker: AddrChecker, 
                             print("", flush=True)
                             print("WIF:", wif_c, flush=True)
                             print("ADDRESS:", addr, flush=True)
-                            print("RECEIVED (sats):", str(recvd), flush=True)
-                            print("BALANCE (sats):", str(bal), flush=True)
+                            # colored received and balance
+                            print("RECEIVED (sats):", f"{YELLOW}{recvd}{RESET}", flush=True)
+                            print("BALANCE (sats):", f"{LIGHT_GREEN}{bal}{RESET}", flush=True)
                             print("=" * 53 + "\n", flush=True)
 
                 # 3) mandatory sleep 0.6s after each address check (per thread)
@@ -315,8 +273,6 @@ def worker_thread(name: str, idx_provider: IndexProvider, checker: AddrChecker, 
         with print_lock:
             print(f"[{name}] exiting", flush=True)
 
-
-# ----------------- CLI / main -----------------
 def parse_args():
     p = argparse.ArgumentParser(description="Deterministic BTC scanner (ThreadPoolExecutor) + BlockCypher balance (with semaphore)")
     p.add_argument("-t", "--threads", type=int, default=3, help="number of worker threads (default 3)")
@@ -324,7 +280,6 @@ def parse_args():
     p.add_argument("-d", "--debug", action="store_true", help="debug mode: prints each GET status")
     p.add_argument("--start", type=int, default=1, help="start index (default 1)")
     return p.parse_args()
-
 
 def main():
     global last_priv_hex
@@ -388,7 +343,6 @@ def main():
         executor.shutdown(wait=True)
 
     print("[INFO] All workers stopped. Exiting.", flush=True)
-
 
 if __name__ == "__main__":
     main()
