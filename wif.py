@@ -3,8 +3,10 @@
 btc_scanner_threadpool_blockcypher_semaphore_wif_base58_suffix.py
 
 Modified deterministic multi-threaded BTC address scanner that:
-- Iterates WIF strings formed as: <WIF_PREFIX><9-char base58 suffix>
-  e.g. KwDiBf89...M7rFU<9base58chars>, KwDiBf89...M7rFU<next 9base58chars>, ...
+- Iterates WIF strings formed as: <WIF_PREFIX>71<8-char base58 random suffix>
+  e.g. KwDiBf89...M7rFU71<8-random-base58-chars>, KwDiBf89...M7rFU71<next-random-8chars>, ...
+  (the two characters '7' and '1' are fixed; the trailing 8 chars are random and guaranteed
+   not to repeat within the same run)
 - Decodes each WIF to a 32-byte private key (supports compressed WIFs).
 - Derives compressed pubkey and addresses:
   P2PKH (1...), P2SH-P2WPKH (3...), P2WPKH (bc1q...).
@@ -26,6 +28,7 @@ import signal
 import sys
 import requests
 import threading
+import secrets
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from coincurve import PrivateKey
 from Crypto.Hash import SHA256, RIPEMD160
@@ -187,69 +190,47 @@ def p2wpkh_bech32(pub: bytes) -> str:
     return bech32_p2wpkh_from_h160(hash160(pub))
 
 
-# ----------------- base58 <-> integer helpers for fixed-length suffixes -----------------
-def base58_to_int_fixed(s: str) -> int:
-    """Convert a base58 string to int (no padding rules)."""
-    num = 0
-    for ch in s:
-        idx = BASE58_ALPHABET.find(ch)
-        if idx == -1:
-            raise ValueError(f"Invalid base58 char: {ch}")
-        num = num * 58 + idx
-    return num
-
-
-def int_to_base58_fixed(num: int, length: int) -> str:
-    """Convert int to base58 string, padded (left) with '1' to reach requested length."""
-    if num < 0:
-        raise ValueError("num must be non-negative")
-    if num == 0:
-        s = "1"
-    else:
-        chars = []
-        while num > 0:
-            num, rem = divmod(num, 58)
-            chars.append(BASE58_ALPHABET[rem])
-        s = "".join(reversed(chars))
-    # left-pad with '1' to the requested length
-    if len(s) > length:
-        raise ValueError("Integer too large to encode in requested length")
-    return "1" * (length - len(s)) + s
-
-
-# ----------------- deterministic WIF index provider (base58 9-char suffix) -----------------
+# ----------------- deterministic WIF index provider (random non-repeating suffix) -----------------
 class WIFIndexProvider:
     """
-    Produces sequential base58 9-character suffixes for WIF strings.
-    WIF strings are constructed as: prefix + <9-char base58 suffix>
-    The start parameter is a 9-char base58 string (default '111111111').
+    Produces random, non-repeating base58 8-character suffixes for WIF strings.
+    WIF strings are constructed as: prefix + '71' + <8-char base58 random suffix>
+    The provider guarantees no repeats within a single program run by tracking seen suffixes.
     """
-    SUFFIX_LEN = 9
+    SUFFIX_LEN = 8  # variable random part length (the '71' is fixed)
 
-    def __init__(self, prefix: str, start_base58: str = "111111111"):
+    def __init__(self, prefix: str):
         if not isinstance(prefix, str) or len(prefix) == 0:
             raise ValueError("prefix must be a non-empty string")
-        if not isinstance(start_base58, str) or len(start_base58) != self.SUFFIX_LEN:
-            raise ValueError(f"start must be a {self.SUFFIX_LEN}-character base58 string")
-        for ch in start_base58:
-            if ch not in BASE58_ALPHABET:
-                raise ValueError(f"start contains invalid base58 char: {ch}")
         self._prefix = prefix
         self._lock = threading.Lock()
-        self._i = base58_to_int_fixed(start_base58)
+        # set of suffix strings already returned (keeps uniqueness within run)
+        self._seen = set()
+
+    def _gen_random_suffix(self) -> str:
+        # cryptographically secure random picks
+        return "".join(secrets.choice(BASE58_ALPHABET) for _ in range(self.SUFFIX_LEN))
 
     def next_suffix(self) -> str:
+        """
+        Return a new random SUFFIX_LEN-length base58 suffix that hasn't been produced before.
+        This will loop until it finds an unused suffix (practical unless the search space
+        is exhausted or extremely large runs are performed).
+        """
         with self._lock:
-            val = self._i
-            # increment for next call
-            self._i += 1
-            # convert val to base58 fixed-length string
-            return int_to_base58_fixed(val, self.SUFFIX_LEN)
+            # try until an unseen suffix is generated
+            # (given 58^8 possibilities, collision probability is tiny for reasonable runs)
+            while True:
+                s = self._gen_random_suffix()
+                if s not in self._seen:
+                    self._seen.add(s)
+                    return s
 
     def construct_wif(self, suffix_base58: str) -> str:
         if len(suffix_base58) != self.SUFFIX_LEN:
             raise ValueError("suffix must be length " + str(self.SUFFIX_LEN))
-        return f"{self._prefix}{suffix_base58}"
+        # fixed '71' inserted between prefix and variable suffix
+        return f"{self._prefix}71{suffix_base58}"
 
 
 # ----------------- network checker with retries, sleeps & semaphore -----------------
@@ -451,29 +432,19 @@ def worker_thread(name: str, wif_provider: WIFIndexProvider, checker: AddrChecke
 
 # ----------------- CLI / main -----------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Deterministic BTC scanner using WIF prefix + 9-char base58 suffix (ThreadPoolExecutor) + BlockCypher balance (with semaphore)")
+    p = argparse.ArgumentParser(description="BTC scanner using WIF prefix + fixed '71' + random non-repeating 8-char base58 suffix (ThreadPoolExecutor) + BlockCypher balance (with semaphore)")
     p.add_argument("-t", "--threads", type=int, default=3, help="number of worker threads (default 3)")
     p.add_argument("-c", "--concurrency", type=int, default=2, help="max concurrent HTTP requests across threads (default 2)")
     p.add_argument("-d", "--debug", action="store_true", help="debug mode: prints each GET status")
     p.add_argument("--wif-prefix", type=str, default="KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU", help="WIF prefix to use (default long prefix you provided)")
-    p.add_argument("--start", type=str, default="111111111", help="start 9-char base58 suffix (default '111111111')")
     return p.parse_args()
 
 
 def main():
     global last_priv_hex, last_wif_tried
     args = parse_args()
-    # validate start
-    start = args.start
-    if len(start) != WIFIndexProvider.SUFFIX_LEN:
-        print(f"[FATAL] --start must be exactly {WIFIndexProvider.SUFFIX_LEN} base58 characters", file=sys.stderr)
-        sys.exit(2)
-    for ch in start:
-        if ch not in BASE58_ALPHABET:
-            print(f"[FATAL] --start contains invalid base58 char: {ch}", file=sys.stderr)
-            sys.exit(2)
 
-    wif_provider = WIFIndexProvider(prefix=args.wif_prefix, start_base58=start)
+    wif_provider = WIFIndexProvider(prefix=args.wif_prefix)
 
     session = requests.Session()
     # semaphore controlling concurrent HTTP requests across all threads
