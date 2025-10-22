@@ -7,53 +7,109 @@ import requests
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from coincurve import PrivateKey
-from Crypto.Hash import keccak
-from decimal import Decimal, getcontext
+from Crypto.Hash import SHA256, RIPEMD160
+from web3 import Web3
 
-# for precise wei -> native conversion
-getcontext().prec = 40
-
+# -----------------------
+# CONFIG
+# -----------------------
 SECP256K1_ORDER = int(
     "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16
 )
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
+# ANSI colors
 YELLOW = "\033[33m"
 LIGHT_GREEN = "\033[92m"
+RED = "\033[91m"
 RESET = "\033[0m"
 
-# default RPC endpoints (change/override with --rpc_<chain> or --rpc)
-DEFAULT_RPCS = {
-    "eth": "https://ethereum.publicnode.com",
-    "bsc": "https://bsc-dataseed.binance.org/",
-    "polygon": "https://polygon-rpc.com/",
+# EVM chains config: rpc endpoints and ERC-20 tokens
+EVM_CHAINS = {
+    "eth": {
+        "rpc": "https://rpc.ankr.com/eth",
+        "native": "ETH",
+        "erc20": {
+            "USDT": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+            "USDC": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606EB48",
+            "DAI": "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+            "WBTC": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+        },
+    },
+    "bsc": {
+        "rpc": "https://bsc-dataseed.binance.org/",
+        "native": "BNB",
+        "erc20": {
+            "BUSD": "0xe9e7cea3dedca5984780bafc599bd69add087d56",
+            "USDT": "0x55d398326f99059fF775485246999027B3197955",
+        },
+    },
+    "polygon": {
+        "rpc": "https://polygon-rpc.com",
+        "native": "MATIC",
+        "erc20": {
+            "USDT": "0x3813e82e6f7098b9583FC0F33a962D02018B6803",
+            "USDC": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+        },
+    },
 }
 
-# mapping chain -> native symbol
-CHAIN_SYMBOL = {
-    "eth": "ETH",
-    "bsc": "BNB",
-    "polygon": "MATIC",
-}
+# -----------------------
+# HASH & ENCODE HELPERS
+# -----------------------
+def sha256(b: bytes) -> bytes:
+    from Crypto.Hash import SHA256
+    h = SHA256.new()
+    h.update(b)
+    return h.digest()
 
-# ---------- Utilities ----------
-def eth_address_from_priv(priv_bytes: bytes) -> str:
-    pk = PrivateKey(priv_bytes)
-    pub_uncompressed = pk.public_key.format(compressed=False)
-    pub_xy = pub_uncompressed[1:]
-    k = keccak.new(digest_bits=256)
-    k.update(pub_xy)
-    addr = "0x" + k.digest()[-20:].hex()
-    return addr
+def ripemd160(b: bytes) -> bytes:
+    from Crypto.Hash import RIPEMD160
+    h = RIPEMD160.new()
+    h.update(b)
+    return h.digest()
 
-def wei_to_native_str(wei: int) -> str:
-    native = Decimal(wei) / Decimal(10 ** 18)
-    # pretty print with up to 18 decimals
-    s = format(native.normalize(), 'f')
-    return s
+def hash160(b: bytes) -> bytes:
+    return ripemd160(sha256(b))
 
-# ---------- Index provider ----------
+def base58_encode(b: bytes) -> str:
+    zeros = 0
+    for c in b:
+        if c == 0:
+            zeros += 1
+        else:
+            break
+    num = int.from_bytes(b, "big")
+    chars = []
+    while num > 0:
+        num, rem = divmod(num, 58)
+        chars.append(BASE58_ALPHABET[rem])
+    return "1" * zeros + "".join(reversed(chars)) if chars else "1" * zeros
+
+def base58check_encode(payload: bytes) -> str:
+    chk = sha256(sha256(payload))[:4]
+    return base58_encode(payload + chk)
+
+def privkey_to_wif(priv_bytes: bytes, compressed: bool = False) -> str:
+    prefix = b"\x80"
+    payload = prefix + priv_bytes
+    if compressed:
+        payload += b"\x01"
+    return base58check_encode(payload)
+
+def p2pkh(pub: bytes) -> str:
+    return base58check_encode(b"\x00" + hash160(pub))
+
+def p2sh_p2wpkh(pub: bytes) -> str:
+    redeem_script = b"\x00\x14" + hash160(pub)
+    return base58check_encode(b"\x05" + hash160(redeem_script))
+
+# -----------------------
+# INDEX PROVIDER
+# -----------------------
 class IndexProvider:
     def __init__(self, start: int = 1):
+        import threading
         if not (1 <= start < SECP256K1_ORDER):
             raise ValueError("start must be in [1, SECP256K1_ORDER-1]")
         self._lock = threading.Lock()
@@ -67,218 +123,182 @@ class IndexProvider:
                 self._i = 1
             return val
 
-# ---------- RPC checker ----------
-class RpcChecker:
-    def __init__(self, session: requests.Session, sem: threading.Semaphore, rpc_url: str, debug: bool = False, timeout: float = 10.0):
+# -----------------------
+# BTC CHECKER
+# -----------------------
+class BTCChecker:
+    def __init__(self, session, sem: threading.Semaphore):
         self.session = session
         self.sem = sem
-        self.rpc_url = rpc_url.rstrip("/")
-        self.debug = debug
-        self.timeout = timeout
 
-    def _post_with_retries(self, payload: dict, retries: int = 3, sleep_between: float = 0.6):
-        last_exc = None
-        for attempt in range(1, retries + 1):
-            try:
-                self.sem.acquire()
-                try:
-                    resp = self.session.post(self.rpc_url, json=payload, timeout=self.timeout)
-                finally:
-                    self.sem.release()
-            except Exception as e:
-                last_exc = e
-                if self.debug:
-                    print(f"[DEBUG] POST {self.rpc_url} attempt {attempt} error: {e}", flush=True)
-            else:
-                if self.debug:
-                    print(f"[DEBUG] POST {self.rpc_url} -> {resp.status_code} {resp.reason}", flush=True)
-                try:
-                    data = resp.json()
-                except Exception as e:
-                    last_exc = e
-                else:
-                    if "error" in data:
-                        last_exc = RuntimeError(f"RPC error: {data['error']}")
-                    else:
-                        return data
-            if attempt < retries:
-                time.sleep(sleep_between)
-        raise last_exc
-
-    def get_balance_wei(self, address: str) -> int:
-        payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [address, "latest"], "id": 1}
-        data = self._post_with_retries(payload)
-        if not data or "result" not in data:
-            raise RuntimeError("No result in RPC response")
-        res = data["result"]
+    def get_balance(self, addr: str) -> int:
+        url = f"https://api.blockcypher.com/v1/btc/main/addrs/{addr}/balance"
+        self.sem.acquire()
         try:
-            return int(res, 16)
-        except Exception as e:
-            raise RuntimeError(f"Invalid balance value: {res}") from e
+            resp = self.session.get(url, timeout=10)
+        finally:
+            self.sem.release()
+        if resp.status_code != 200:
+            raise RuntimeError(f"BTC balance API error: {resp.status_code}")
+        data = resp.json()
+        return int(data.get("final_balance", 0))
 
-# ---------- Worker ----------
+# -----------------------
+# EVM CHECKER
+# -----------------------
+class EVMChecker:
+    def __init__(self, web3: Web3, sem: threading.Semaphore):
+        self.web3 = web3
+        self.sem = sem
+
+    def get_native_balance(self, addr: str) -> int:
+        self.sem.acquire()
+        try:
+            return self.web3.eth.get_balance(addr)
+        finally:
+            self.sem.release()
+
+    def get_erc20_balance(self, addr: str, token_addr: str) -> int:
+        contract = self.web3.eth.contract(address=self.web3.to_checksum_address(token_addr),
+                                          abi=[{"constant":True,"inputs":[{"name":"_owner","type":"address"}],
+                                                "name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],
+                                                "type":"function"}])
+        self.sem.acquire()
+        try:
+            return contract.functions.balanceOf(self.web3.to_checksum_address(addr)).call()
+        finally:
+            self.sem.release()
+
+# -----------------------
+# WORKER THREAD
+# -----------------------
 stop_event = threading.Event()
 last_priv_hex = None
 last_priv_lock = threading.Lock()
 
-def worker_thread(name: str, idx_provider: IndexProvider, rpc_checkers: dict, chains: list, print_lock: threading.Lock, debug: bool):
-    """
-    For each index:
-      - build priv_bytes
-      - derive address per chain
-      - query balance for each chain
-      - if any balance > 0: print private key and all chains with balances
-    """
+def worker_thread(name, idx_provider: IndexProvider, print_lock: threading.Lock, debug: bool, chains: list, sem: threading.Semaphore):
     global last_priv_hex
+    session = requests.Session()
+    btc_checker = BTCChecker(session, sem)
+
+    evm_checkers = {}
+    for chain in chains:
+        if chain != "btc":
+            w3 = Web3(Web3.HTTPProvider(EVM_CHAINS[chain]["rpc"]))
+            evm_checkers[chain] = EVMChecker(w3, sem)
+
     while not stop_event.is_set():
         idx = idx_provider.next_index()
         priv_bytes = idx.to_bytes(32, "big")
         priv_hex = priv_bytes.hex()
-        priv_hex_prefixed = "0x" + priv_hex
         with last_priv_lock:
             last_priv_hex = priv_hex
 
         try:
-            # collect non-zero balances per chain
-            found = []
-            for ch in chains:
-                checker = rpc_checkers[ch]
-                try:
-                    addr = eth_address_from_priv(priv_bytes)
-                except Exception as e:
-                    # impossible normally, but skip if error deriving
-                    if debug:
-                        with print_lock:
-                            print(f"[{name}] error deriving address for chain {ch}: {e}", flush=True)
-                    continue
+            pk = PrivateKey(priv_bytes)
+            pub = pk.public_key.format(compressed=True)
+            wif = privkey_to_wif(priv_bytes, compressed=True)
+            addr_btc = [p2pkh(pub), p2sh_p2wpkh(pub)]  # simplified for demo
 
-                # Query balance
+            for chain in chains:
+                if stop_event.is_set():
+                    break
                 try:
-                    bal = checker.get_balance_wei(addr)
+                    if chain == "btc":
+                        for a in addr_btc:
+                            try:
+                                bal = btc_checker.get_balance(a)
+                            except Exception as e:
+                                with print_lock:
+                                    print(f"[ERROR] BTC address {a} balance failed: {e}", flush=True)
+                                continue
+                            if bal > 0:
+                                with print_lock:
+                                    print("\n" + "="*50)
+                                    print("BTC FOUND!")
+                                    print("WIF:", wif)
+                                    print("ADDRESS:", a)
+                                    print(f"BALANCE: {LIGHT_GREEN}{bal}{RESET} satoshis")
+                                    print("="*50 + "\n")
+                    else:
+                        evm_checker = evm_checkers[chain]
+                        addr_hex = pk.to_hex()
+                        try:
+                            native_bal = evm_checker.get_native_balance(addr_hex)
+                        except Exception as e:
+                            with print_lock:
+                                print(f"[ERROR] {chain.upper()} native balance error for {addr_hex}: {e}", flush=True)
+                            native_bal = 0
+
+                        erc_balances = {}
+                        for token, t_addr in EVM_CHAINS[chain]["erc20"].items():
+                            try:
+                                b = evm_checker.get_erc20_balance(addr_hex, t_addr)
+                                if b > 0:
+                                    erc_balances[token] = b
+                            except Exception as e:
+                                with print_lock:
+                                    print(f"[ERROR] {chain.upper()} ERC20 {token} balance error for {addr_hex}: {e}", flush=True)
+                        if native_bal > 0 or erc_balances:
+                            with print_lock:
+                                print("\n" + "="*50)
+                                print(f"{chain.upper()} FOUND!")
+                                print("Private key:", addr_hex)
+                                print(f"{EVM_CHAINS[chain]['native']}")
+                                print(f"balance: {LIGHT_GREEN}{native_bal}{RESET}")
+                                for t, b in erc_balances.items():
+                                    print(f"{t} balance: {LIGHT_GREEN}{b}{RESET}")
+                                print("="*50 + "\n")
                 except Exception as e:
                     with print_lock:
-                        print(f"[ERROR] [{name}] chain={ch} addr={addr} balance check FAILED: {e}", flush=True)
-                    # be polite and don't hammer if RPC failing
-                    time.sleep(0.6)
-                    continue
-
-                if bal != 0:
-                    found.append((ch, addr, bal))
-
-                # small per-chain delay to reduce hitting rate limits
-                time.sleep(0.1)
-
-            if found:
-                # Pretty multi-chain report
-                with print_lock:
-                    print("\n" + "=" * 80, flush=True)
-                    print("!!!!! FOUND PRIVATE KEY WITH BALANCES !!!!!", flush=True)
-                    print("", flush=True)
-                    print("PRIVATE KEY:", priv_hex_prefixed, flush=True)
-                    print("", flush=True)
-                    print("Chains with native balances:")
-                    for ch, addr, bal in found:
-                        sym = CHAIN_SYMBOL.get(ch, ch.upper())
-                        print("", flush=True)
-                        print(f"  Chain: {ch} ({sym})", flush=True)
-                        print(f"  Address: {addr}", flush=True)
-                        print(f"  Balance (wei): {YELLOW}{bal}{RESET}", flush=True)
-                        print(f"  Balance ({sym}): {LIGHT_GREEN}{wei_to_native_str(bal)}{RESET}", flush=True)
-                    print("=" * 80 + "\n", flush=True)
-
-            # mandatory sleep per private key loop to be polite overall
-            time.sleep(0.6)
-
+                        print(f"[ERROR] {chain.upper()} processing failed: {e}", flush=True)
         except Exception as e:
             with print_lock:
-                print(f"[ERROR] [{name}] idx={idx} worker error: {e}", flush=True)
-            time.sleep(0.6)
+                print(f"[ERROR] {name} idx {idx} derivation failed: {e}", flush=True)
 
-    if debug:
-        with print_lock:
-            print(f"[{name}] exiting", flush=True)
-
-# ---------- CLI & Main ----------
+# -----------------------
+# MAIN
+# -----------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Deterministic multi-chain EVM scanner (index -> priv -> multi-chain addresses)")
-    p.add_argument("-t", "--threads", type=int, default=3, help="worker threads")
-    p.add_argument("-c", "--concurrency", type=int, default=2, help="max concurrent RPC requests across threads")
-    p.add_argument("-d", "--debug", action="store_true", help="debug mode")
-    p.add_argument("--start", type=int, default=1, help="start index")
-    p.add_argument("--chains", type=str, default="eth,bsc,polygon", help="comma-separated chains to check (eth,bsc,polygon)")
-    p.add_argument("--rpc_eth", type=str, default=None, help="override ETH RPC URL")
-    p.add_argument("--rpc_bsc", type=str, default=None, help="override BSC RPC URL")
-    p.add_argument("--rpc_polygon", type=str, default=None, help="override Polygon RPC URL")
+    p = argparse.ArgumentParser(description="Multi-chain scanner (BTC/EVM + ERC20)")
+    p.add_argument("--chains", type=str, default="btc,eth,bsc,polygon")
+    p.add_argument("-t", "--threads", type=int, default=3)
+    p.add_argument("-c", "--concurrency", type=int, default=2)
+    p.add_argument("--start", type=int, default=1)
+    p.add_argument("--debug", action="store_true")
     return p.parse_args()
 
 def main():
     global last_priv_hex
     args = parse_args()
-
-    chains = [c.strip().lower() for c in args.chains.split(",") if c.strip()]
-    # validate chains
-    for ch in chains:
-        if ch not in DEFAULT_RPCS:
-            print(f"[FATAL] unknown chain '{ch}'", flush=True)
-            sys.exit(1)
-
-    # build rpc urls (override if provided)
-    rpc_urls = {}
-    rpc_urls["eth"] = args.rpc_eth if args.rpc_eth else DEFAULT_RPCS["eth"]
-    rpc_urls["bsc"] = args.rpc_bsc if args.rpc_bsc else DEFAULT_RPCS["bsc"]
-    rpc_urls["polygon"] = args.rpc_polygon if args.rpc_polygon else DEFAULT_RPCS["polygon"]
-
+    chains = args.chains.split(",")
     idx_provider = IndexProvider(start=args.start)
-    session = requests.Session()
+    print_lock = threading.Lock()
     sem = threading.Semaphore(max(1, args.concurrency))
 
-    # prepare an RpcChecker for each selected chain (they can share the same semaphore/session)
-    rpc_checkers = {}
-    for ch in set(chains):
-        rpc_checkers[ch] = RpcChecker(session=session, sem=sem, rpc_url=rpc_urls[ch], debug=args.debug)
-
-    print_lock = threading.Lock()
-
-    def _signal_handler(sig, frame):
+    def signal_handler(sig, frame):
         stop_event.set()
         with last_priv_lock:
             hex_checkpoint = last_priv_hex
-        if hex_checkpoint:
-            print("\n[INFO] Interrupted by user. Last private key hex tried (checkpoint):", flush=True)
-            print(hex_checkpoint, flush=True)
-        else:
-            print("\n[INFO] Interrupted by user. No key processed yet.", flush=True)
+        print("\n[INFO] Interrupted. Last key:", hex_checkpoint)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
-
-    num_threads = max(1, args.threads)
-    with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        futures = [
-            executor.submit(worker_thread, f"worker-{i+1}", idx_provider, rpc_checkers, chains, print_lock, args.debug)
-            for i in range(num_threads)
-        ]
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        futures = [executor.submit(worker_thread, f"worker-{i+1}", idx_provider, print_lock, args.debug, chains, sem)
+                   for i in range(args.threads)]
         try:
-            for future in as_completed(futures):
+            for f in as_completed(futures):
                 if stop_event.is_set():
                     break
                 try:
-                    future.result(timeout=0)
+                    f.result(timeout=0)
                 except Exception:
                     pass
         except KeyboardInterrupt:
             stop_event.set()
-            with last_priv_lock:
-                hex_checkpoint = last_priv_hex
-            if hex_checkpoint:
-                print("\n[INFO] Interrupted by user. Last private key hex tried (checkpoint):", flush=True)
-                print(hex_checkpoint, flush=True)
-            else:
-                print("\n[INFO] Interrupted by user. No key processed yet.", flush=True)
-
         executor.shutdown(wait=True)
-
-    print("[INFO] All workers stopped. Exiting.", flush=True)
+    print("[INFO] All workers stopped.")
 
 if __name__ == "__main__":
     main()
