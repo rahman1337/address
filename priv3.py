@@ -119,41 +119,24 @@ def p2sh_p2wpkh(pub: bytes) -> str:
 def p2wpkh_bech32(pub: bytes) -> str:
     return bech32_p2wpkh_from_h160(hash160(pub))
 
-# --------------------- New provider: Prefix + Deterministic Non-repeating Suffix ---------------------
+# --------------------- PrefixCounterProvider ---------------------
 class PrefixCounterProvider:
     """
-    Build private key hex as:
-      PRIV = <prefix_hex (42 chars)> + <suffix_hex (22 chars)>
-
-    Suffix generation modes:
-      - hex:    suffix = counter in hex (0..), zero-padded to 22 hex chars (0-9A-F)
-      - digits: suffix = counter in decimal, zero-padded to 22 chars (digits only 0-9)
-      - letters: suffix = counter in base-6 mapped to A..F, zero-padded to 22 chars (letters A-F only)
-
-    Ensures full key < SECP256K1_ORDER. Optionally persist the last counter to a file to avoid repeats across runs.
+    Private key = <prefix_hex (arbitrary)> + <suffix_hex> to make 64 hex chars
     """
     def __init__(self, prefix_hex: str, mode: str = "hex", start_counter: int = 0, persist_file: str = None):
         prefix_hex = prefix_hex.upper()
-        if len(prefix_hex) != 42:
-            raise ValueError("prefix_hex must be exactly 42 hex characters (21 bytes)")
-        # validate hex
+        if len(prefix_hex) >= 64:
+            raise ValueError("prefix_hex must be less than 64 hex chars")
         int(prefix_hex, 16)
         self.prefix_hex = prefix_hex
-
-        # order suffix (remaining 22 hex chars) and numeric bound
-        order_hex = format(SECP256K1_ORDER, "064x").upper()
-        self.order_suffix_hex = order_hex[42:]  # 22 hex chars
-        self.order_suffix_int = int(self.order_suffix_hex, 16)
-
-        self.suffix_len = 22
+        self.suffix_len = 64 - len(prefix_hex)
         self.mode = mode.lower()
         if self.mode not in ("hex", "digits", "letters"):
             raise ValueError("mode must be one of: hex, digits, letters")
 
         self._lock = threading.Lock()
         self.persist_file = persist_file
-
-        # load persisted counter if available; otherwise use provided start_counter
         self.counter = int(start_counter)
         if persist_file and os.path.exists(persist_file):
             try:
@@ -162,87 +145,55 @@ class PrefixCounterProvider:
                 if content:
                     self.counter = max(self.counter, int(content))
             except Exception:
-                # ignore and use start_counter
                 pass
-
-        # final validation: ensure starting counter does not already exceed order bound
-        if not self._counter_valid(self.counter):
-            raise RuntimeError("start_counter is out of range for suffix generation (would exceed order)")
 
     def _persist_counter(self, value: int):
         if not self.persist_file:
             return
-        # write the last used counter (as decimal) atomically
         tmp = self.persist_file + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(str(value))
         os.replace(tmp, self.persist_file)
 
-    def _counter_valid(self, counter: int) -> bool:
-        """
-        Returns True if the suffix produced by this counter would produce a suffix numeric value
-        (when interpreted as hex) < order_suffix_int.
-        """
-        s = self._counter_to_suffix_hex(counter)
-        return int(s, 16) < self.order_suffix_int
-
     def _counter_to_suffix_hex(self, counter: int) -> str:
         if self.mode == "hex":
-            s = format(counter, "0{}x".format(self.suffix_len)).upper()
+            s = format(counter, "0{}X".format(self.suffix_len))
             if len(s) > self.suffix_len:
-                # overflow: counter cannot fit into suffix_len hex digits
                 raise RuntimeError("counter overflow for suffix length")
             return s.zfill(self.suffix_len)
         elif self.mode == "digits":
             s = str(counter).zfill(self.suffix_len)
             if len(s) > self.suffix_len:
                 raise RuntimeError("counter overflow for digits-mode suffix length")
-            # digits-only string is valid hex because 0-9 are hex digits
             return s.upper()
-        else:  # letters mode: map base-6 digits -> A..F
-            # convert counter to base-6, then map 0->A,1->B,...5->F, pad to suffix_len
-            if counter < 0:
-                raise RuntimeError("counter must be non-negative")
+        else:  # letters mode A-F only
             digits = []
             n = counter
             if n == 0:
                 digits = ["A"]
             else:
                 while n > 0:
-                    digits.append("ABCDEF"[n % 6])  # map 0..5 -> A..F
+                    digits.append("ABCDEF"[n % 6])
                     n //= 6
-            s = "".join(reversed(digits)).rjust(self.suffix_len, "A")  # pad with 'A' (represents 0)
+            s = "".join(reversed(digits)).rjust(self.suffix_len, "A")
             if len(s) > self.suffix_len:
                 raise RuntimeError("counter overflow for letters-mode suffix length")
             return s.upper()
 
     def next_priv_bytes(self):
-        """
-        Increment counter and return (priv_bytes(32), suffix_hex(22), full_priv_hex(64))
-        """
         with self._lock:
-            # find next counter that yields suffix < order_suffix_int
-            while True:
-                # advance counter
-                c = self.counter
-                # We'll use the current counter as the produced suffix, then increment
-                if not self._counter_valid(c):
-                    # if invalid, we cannot proceed further; stop
-                    raise RuntimeError("counter reached the maximum valid suffix bound (would exceed curve order)")
-                suffix = self._counter_to_suffix_hex(c)
-                # commit counter for next call
-                self.counter = c + 1
-                # persist last used (we persist the last used counter value, i.e. c)
-                self._persist_counter(c)
-                break
+            c = self.counter
+            suffix = self._counter_to_suffix_hex(c)
+            self.counter += 1
+            self._persist_counter(c)
 
         full_hex = (self.prefix_hex + suffix).upper()
         priv_int = int(full_hex, 16)
         if not (1 <= priv_int < SECP256K1_ORDER):
-            raise RuntimeError("Generated private key out of range (defensive check)")
+            raise RuntimeError("Generated private key out of range")
         return priv_int.to_bytes(32, "big"), suffix, full_hex
 
-# --------------------- AddrChecker (unchanged) ---------------------
+# --------------------- AddrChecker ---------------------
 class AddrChecker:
     def __init__(self, session: requests.Session, sem: threading.Semaphore, debug: bool = False, timeout: float = 10.0):
         self.session = session
@@ -292,7 +243,7 @@ class AddrChecker:
         else:
             return int(data.get("total_received", 0))
 
-# --------------------- Worker and main (mostly unchanged) ---------------------
+# --------------------- Worker ---------------------
 stop_event = threading.Event()
 last_priv_hex = None
 last_priv_lock = threading.Lock()
@@ -372,20 +323,22 @@ def worker_thread(name: str, provider: PrefixCounterProvider, checker: AddrCheck
         with print_lock:
             print(f"[{name}] exiting", flush=True)
 
+# --------------------- Arg parse ---------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="BTC scanner: fixed prefix + deterministic non-repeating suffix private-keys")
+    p = argparse.ArgumentParser(description="BTC scanner: 30-char prefix + deterministic non-repeating suffix private-keys")
     p.add_argument("-t", "--threads", type=int, default=3, help="number of worker threads (default 3)")
     p.add_argument("-c", "--concurrency", type=int, default=2, help="max concurrent HTTP requests across threads (default 2)")
     p.add_argument("-d", "--debug", action="store_true", help="debug mode: prints each GET status and suffix")
-    p.add_argument("--prefix", type=str, default="FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF",
-                   help="fixed 42-hex-char prefix (default shown)")
+    p.add_argument("--prefix", type=str, default="FFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+                   help="fixed 30-hex-char prefix")
     p.add_argument("--mode", type=str, default="hex", choices=["hex", "digits", "letters"],
-                   help="suffix generation mode: hex (counter in hex), digits (decimal digits only), letters (A-F only)")
+                   help="suffix generation mode: hex, digits, letters")
     p.add_argument("--start-counter", type=int, default=0, help="start counter (default 0)")
     p.add_argument("--persist-counter", type=str, default=None,
-                   help="optional file to persist last used counter (prevents repeats across runs)")
+                   help="optional file to persist last used counter")
     return p.parse_args()
 
+# --------------------- Main ---------------------
 def main():
     global last_priv_hex
     args = parse_args()
