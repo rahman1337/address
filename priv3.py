@@ -16,7 +16,6 @@ SECP256K1_ORDER = int(
 )
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
-# ANSI colors
 YELLOW = "\033[33m"
 LIGHT_GREEN = "\033[92m"
 RESET = "\033[0m"
@@ -76,9 +75,9 @@ def bech32_hrp_expand(hrp: str):
     return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
 
 def bech32_create_checksum(hrp: str, data: bytes):
-    values = bech32_hrp_expand(hrp) + list(data) + [0, 0, 0, 0, 0, 0]
+    values = bech32_hrp_expand(hrp) + list(data) + [0]*6
     polymod = bech32_polymod(values) ^ 1
-    return bytes((polymod >> (5 * (5 - i)) & 31) for i in range(6))
+    return bytes((polymod >> (5*(5-i)) & 31) for i in range(6))
 
 def bech32_encode(hrp: str, data: bytes) -> str:
     combined = bytes(list(data) + list(bech32_create_checksum(hrp, data)))
@@ -97,12 +96,8 @@ def convertbits(data: bytes, frombits: int, tobits: int, pad: bool = True) -> by
         while bits >= tobits:
             bits -= tobits
             ret.append((acc >> bits) & maxv)
-    if pad:
-        if bits:
-            ret.append((acc << (tobits - bits)) & maxv)
-    else:
-        if bits >= frombits or ((acc << (tobits - bits)) & maxv):
-            raise ValueError("Invalid padding in convertbits")
+    if pad and bits:
+        ret.append((acc << (tobits - bits)) & maxv)
     return bytes(ret)
 
 def bech32_p2wpkh_from_h160(h160: bytes) -> str:
@@ -124,14 +119,17 @@ def p2wpkh_bech32(pub: bytes) -> str:
 class RandomSuffixProvider:
     """
     Private key = <static prefix> + <random non-repeating hex suffix>
+    Automatically calculates suffix length to make total 64 hex chars (32 bytes)
     """
-    def __init__(self, prefix_hex: str, suffix_len: int = 18, persist_file: str = None):
-        prefix_hex = prefix_hex.upper()
-        if len(prefix_hex) + suffix_len != 64:
-            raise ValueError("prefix + suffix length must be 64 hex chars")
-        int(prefix_hex, 16)
+    def __init__(self, prefix_hex: str, persist_file: str = None):
+        prefix_hex = prefix_hex.upper().strip()
+        if any(c not in "0123456789ABCDEF" for c in prefix_hex):
+            raise ValueError("Prefix contains invalid hex characters")
         self.prefix_hex = prefix_hex
-        self.suffix_len = suffix_len
+        self.suffix_len = 64 - len(prefix_hex)
+        if self.suffix_len <= 0:
+            raise ValueError(f"Prefix too long, must be <64 hex chars, got {len(prefix_hex)}")
+
         self._lock = threading.Lock()
         self.persist_file = persist_file
         self.used_suffixes = set()
@@ -265,7 +263,6 @@ def worker_thread(name: str, provider: RandomSuffixProvider, checker: AddrChecke
                         with print_lock:
                             print("\n" + "=" * 53, flush=True)
                             print("!!! FOUND (BALANCE CHECK FAILED) !!!", flush=True)
-                            print("", flush=True)
                             print("WIF:", wif_c, flush=True)
                             print("ADDRESS:", addr, flush=True)
                             print("FULL_PRIV_HEX:", priv_hex, flush=True)
@@ -277,7 +274,6 @@ def worker_thread(name: str, provider: RandomSuffixProvider, checker: AddrChecke
                         with print_lock:
                             print("\n" + "=" * 53, flush=True)
                             print("!!!!! FOUND ADDRESS WITH RECEIVED FUNDS !!!!!", flush=True)
-                            print("", flush=True)
                             print("WIF:", wif_c, flush=True)
                             print("ADDRESS:", addr, flush=True)
                             print("FULL_PRIV_HEX:", priv_hex, flush=True)
@@ -299,30 +295,25 @@ def worker_thread(name: str, provider: RandomSuffixProvider, checker: AddrChecke
 
 # --------------------- Arg parse ---------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="BTC scanner: static 46-char prefix + random non-repeating 18-char suffix")
+    p = argparse.ArgumentParser(description="BTC scanner: static prefix + random non-repeating suffix")
     p.add_argument("-t", "--threads", type=int, default=3, help="number of worker threads (default 3)")
     p.add_argument("-c", "--concurrency", type=int, default=2, help="max concurrent HTTP requests across threads (default 2)")
     p.add_argument("-d", "--debug", action="store_true", help="debug mode: prints each GET status and suffix")
     p.add_argument("--prefix", type=str, default="FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BB",
-                   help="fixed 46-hex-char prefix")
-    p.add_argument("--persist", type=str, default=None,
-                   help="optional file to persist used suffixes")
+                   help="fixed hex prefix")
+    p.add_argument("--persist", type=str, default=None, help="file to store used suffixes to avoid repeats")
     return p.parse_args()
 
 # --------------------- Main ---------------------
 def main():
     global last_priv_hex
     args = parse_args()
-
-    try:
-        provider = RandomSuffixProvider(prefix_hex=args.prefix, suffix_len=18, persist_file=args.persist)
-    except Exception as e:
-        print(f"[FATAL] failed to initialize provider: {e}", flush=True)
-        sys.exit(1)
+    provider = RandomSuffixProvider(prefix_hex=args.prefix, persist_file=args.persist)
 
     session = requests.Session()
     sem = threading.Semaphore(max(1, args.concurrency))
     checker = AddrChecker(session=session, sem=sem, debug=args.debug)
+
     print_lock = threading.Lock()
 
     def _signal_handler(sig, frame):
@@ -330,8 +321,7 @@ def main():
         with last_priv_lock:
             hex_checkpoint = last_priv_hex
         if hex_checkpoint:
-            print("\n[INFO] Interrupted by user.", flush=True)
-            print("[INFO] Last private key hex tried (checkpoint):", flush=True)
+            print("\n[INFO] Interrupted by user. Last private key hex tried (checkpoint):", flush=True)
             print(hex_checkpoint, flush=True)
         else:
             print("\n[INFO] Interrupted by user. No key processed yet.", flush=True)
@@ -359,8 +349,7 @@ def main():
             with last_priv_lock:
                 hex_checkpoint = last_priv_hex
             if hex_checkpoint:
-                print("\n[INFO] Interrupted by user.", flush=True)
-                print("[INFO] Last private key hex tried (checkpoint):", flush=True)
+                print("\n[INFO] Interrupted by user. Last private key hex tried (checkpoint):", flush=True)
                 print(hex_checkpoint, flush=True)
             else:
                 print("\n[INFO] Interrupted by user. No key processed yet.", flush=True)
