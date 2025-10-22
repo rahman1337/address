@@ -5,6 +5,7 @@ import signal
 import sys
 import requests
 import threading
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from coincurve import PrivateKey
 from Crypto.Hash import SHA256, RIPEMD160
@@ -118,31 +119,130 @@ def p2sh_p2wpkh(pub: bytes) -> str:
 def p2wpkh_bech32(pub: bytes) -> str:
     return bech32_p2wpkh_from_h160(hash160(pub))
 
-class IntIndexProvider:
+# --------------------- New provider: Prefix + Deterministic Non-repeating Suffix ---------------------
+class PrefixCounterProvider:
     """
-    Provides sequential integer indices (1,2,3,...) and converts each index to a 32-byte big-endian private key.
-    - start is 1-based index (default 1).
-    - wraps to 1 when exceeding SECP256K1_ORDER-1 (same behavior as original script).
-    """
-    def __init__(self, start: int = 1):
-        if not (1 <= start < SECP256K1_ORDER):
-            raise ValueError("start must be in [1, SECP256K1_ORDER-1]")
-        self._lock = threading.Lock()
-        self._i = start
+    Build private key hex as:
+      PRIV = <prefix_hex (42 chars)> + <suffix_hex (22 chars)>
 
-    def next_priv_bytes(self) -> (bytes, int):
+    Suffix generation modes:
+      - hex:    suffix = counter in hex (0..), zero-padded to 22 hex chars (0-9A-F)
+      - digits: suffix = counter in decimal, zero-padded to 22 chars (digits only 0-9)
+      - letters: suffix = counter in base-6 mapped to A..F, zero-padded to 22 chars (letters A-F only)
+
+    Ensures full key < SECP256K1_ORDER. Optionally persist the last counter to a file to avoid repeats across runs.
+    """
+    def __init__(self, prefix_hex: str, mode: str = "hex", start_counter: int = 0, persist_file: str = None):
+        prefix_hex = prefix_hex.upper()
+        if len(prefix_hex) != 42:
+            raise ValueError("prefix_hex must be exactly 42 hex characters (21 bytes)")
+        # validate hex
+        int(prefix_hex, 16)
+        self.prefix_hex = prefix_hex
+
+        # order suffix (remaining 22 hex chars) and numeric bound
+        order_hex = format(SECP256K1_ORDER, "064x").upper()
+        self.order_suffix_hex = order_hex[42:]  # 22 hex chars
+        self.order_suffix_int = int(self.order_suffix_hex, 16)
+
+        self.suffix_len = 22
+        self.mode = mode.lower()
+        if self.mode not in ("hex", "digits", "letters"):
+            raise ValueError("mode must be one of: hex, digits, letters")
+
+        self._lock = threading.Lock()
+        self.persist_file = persist_file
+
+        # load persisted counter if available; otherwise use provided start_counter
+        self.counter = int(start_counter)
+        if persist_file and os.path.exists(persist_file):
+            try:
+                with open(persist_file, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    self.counter = max(self.counter, int(content))
+            except Exception:
+                # ignore and use start_counter
+                pass
+
+        # final validation: ensure starting counter does not already exceed order bound
+        if not self._counter_valid(self.counter):
+            raise RuntimeError("start_counter is out of range for suffix generation (would exceed order)")
+
+    def _persist_counter(self, value: int):
+        if not self.persist_file:
+            return
+        # write the last used counter (as decimal) atomically
+        tmp = self.persist_file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(str(value))
+        os.replace(tmp, self.persist_file)
+
+    def _counter_valid(self, counter: int) -> bool:
         """
-        Returns tuple (priv_bytes_32, index_int)
+        Returns True if the suffix produced by this counter would produce a suffix numeric value
+        (when interpreted as hex) < order_suffix_int.
+        """
+        s = self._counter_to_suffix_hex(counter)
+        return int(s, 16) < self.order_suffix_int
+
+    def _counter_to_suffix_hex(self, counter: int) -> str:
+        if self.mode == "hex":
+            s = format(counter, "0{}x".format(self.suffix_len)).upper()
+            if len(s) > self.suffix_len:
+                # overflow: counter cannot fit into suffix_len hex digits
+                raise RuntimeError("counter overflow for suffix length")
+            return s.zfill(self.suffix_len)
+        elif self.mode == "digits":
+            s = str(counter).zfill(self.suffix_len)
+            if len(s) > self.suffix_len:
+                raise RuntimeError("counter overflow for digits-mode suffix length")
+            # digits-only string is valid hex because 0-9 are hex digits
+            return s.upper()
+        else:  # letters mode: map base-6 digits -> A..F
+            # convert counter to base-6, then map 0->A,1->B,...5->F, pad to suffix_len
+            if counter < 0:
+                raise RuntimeError("counter must be non-negative")
+            digits = []
+            n = counter
+            if n == 0:
+                digits = ["A"]
+            else:
+                while n > 0:
+                    digits.append("ABCDEF"[n % 6])  # map 0..5 -> A..F
+                    n //= 6
+            s = "".join(reversed(digits)).rjust(self.suffix_len, "A")  # pad with 'A' (represents 0)
+            if len(s) > self.suffix_len:
+                raise RuntimeError("counter overflow for letters-mode suffix length")
+            return s.upper()
+
+    def next_priv_bytes(self):
+        """
+        Increment counter and return (priv_bytes(32), suffix_hex(22), full_priv_hex(64))
         """
         with self._lock:
-            val = self._i
-            # increment and wrap if necessary
-            self._i += 1
-            if self._i >= SECP256K1_ORDER:
-                self._i = 1
-        priv_bytes = val.to_bytes(32, "big")
-        return priv_bytes, val
+            # find next counter that yields suffix < order_suffix_int
+            while True:
+                # advance counter
+                c = self.counter
+                # We'll use the current counter as the produced suffix, then increment
+                if not self._counter_valid(c):
+                    # if invalid, we cannot proceed further; stop
+                    raise RuntimeError("counter reached the maximum valid suffix bound (would exceed curve order)")
+                suffix = self._counter_to_suffix_hex(c)
+                # commit counter for next call
+                self.counter = c + 1
+                # persist last used (we persist the last used counter value, i.e. c)
+                self._persist_counter(c)
+                break
 
+        full_hex = (self.prefix_hex + suffix).upper()
+        priv_int = int(full_hex, 16)
+        if not (1 <= priv_int < SECP256K1_ORDER):
+            raise RuntimeError("Generated private key out of range (defensive check)")
+        return priv_int.to_bytes(32, "big"), suffix, full_hex
+
+# --------------------- AddrChecker (unchanged) ---------------------
 class AddrChecker:
     def __init__(self, session: requests.Session, sem: threading.Semaphore, debug: bool = False, timeout: float = 10.0):
         self.session = session
@@ -154,12 +254,10 @@ class AddrChecker:
         last_exc = None
         for attempt in range(1, retries + 1):
             try:
-                # acquire semaphore slot for outbound request
                 self.sem.acquire()
                 try:
                     resp = self.session.get(url, timeout=self.timeout)
                 finally:
-                    # always release semaphore even on request exceptions
                     self.sem.release()
             except Exception as e:
                 last_exc = e
@@ -171,7 +269,6 @@ class AddrChecker:
                 if resp.status_code == 200:
                     return resp
                 elif resp.status_code == 429:
-                    # Server rate limit — treat as retryable but wait longer before retry
                     last_exc = RuntimeError("HTTP 429 Too Many Requests")
                 else:
                     last_exc = RuntimeError(f"HTTP {resp.status_code}")
@@ -179,15 +276,11 @@ class AddrChecker:
                 time.sleep(sleep_between)
         raise last_exc
 
-    # Uses blockchain.info quick API to get total received (satoshis).
-    # Returns int (total received in satoshis) or raises on failure.
     def get_received(self, address: str) -> int:
         url = f"https://blockchain.info/q/getreceivedbyaddress/{address}"
         resp = self._get_with_retries(url)
         return int(resp.text.strip())
 
-    # Uses BlockCypher address balance endpoint.
-    # Returns int(final_balance in satoshis) or raises on failure.
     def get_balance(self, address: str) -> int:
         url = f"https://api.blockcypher.com/v1/btc/main/addrs/{address}/balance"
         resp = self._get_with_retries(url)
@@ -199,16 +292,17 @@ class AddrChecker:
         else:
             return int(data.get("total_received", 0))
 
+# --------------------- Worker and main (mostly unchanged) ---------------------
 stop_event = threading.Event()
 last_priv_hex = None
 last_priv_lock = threading.Lock()
 
-def worker_thread(name: str, idx_provider: IntIndexProvider, checker: AddrChecker, print_lock: threading.Lock, debug: bool):
+def worker_thread(name: str, provider: PrefixCounterProvider, checker: AddrChecker, print_lock: threading.Lock, debug: bool):
     global last_priv_hex
     while not stop_event.is_set():
         try:
-            priv_bytes, idx_val = idx_provider.next_priv_bytes()
-            priv_hex = priv_bytes.hex()
+            priv_bytes, suffix_hex, full_hex = provider.next_priv_bytes()
+            priv_hex = full_hex
             with last_priv_lock:
                 last_priv_hex = priv_hex
 
@@ -217,62 +311,56 @@ def worker_thread(name: str, idx_provider: IntIndexProvider, checker: AddrChecke
             wif_c = privkey_to_wif(priv_bytes, compressed=True)
 
             addresses = [
-                p2pkh(pub_compressed),  # 1...
-                p2sh_p2wpkh(pub_compressed),  # 3...
-                p2wpkh_bech32(pub_compressed),  # bc1q...
+                p2pkh(pub_compressed),
+                p2sh_p2wpkh(pub_compressed),
+                p2wpkh_bech32(pub_compressed),
             ]
 
             if debug:
                 with print_lock:
-                    print(f"[{name}] scanning idx={idx_val} priv={priv_hex}", flush=True)
+                    print(f"[{name}] suffix={suffix_hex} priv={priv_hex}", flush=True)
 
             for addr in addresses:
                 if stop_event.is_set():
                     break
 
-                # 1) Check "received" with retries; if fails print error and move on
                 try:
                     recvd = checker.get_received(addr)
                 except Exception as e:
                     with print_lock:
                         print(f"[ERROR] [{name}] addr={addr} getreceived FAILED: {e}", flush=True)
-                    # sleep 0.6s per address check (applies per thread)
                     time.sleep(0.6)
                     continue
 
-                # 2) If received != 0, wait 1.0s before checking balance to reduce 429
                 if recvd != 0:
                     time.sleep(1.0)
                     try:
                         bal = checker.get_balance(addr)
                     except Exception as e:
                         with print_lock:
-                            # Print a clearly delimited "found but balance check failed" block
                             print("\n" + "=" * 53, flush=True)
                             print("!!! FOUND (BALANCE CHECK FAILED) !!!", flush=True)
                             print("", flush=True)
                             print("WIF:", wif_c, flush=True)
                             print("ADDRESS:", addr, flush=True)
-                            print("INDEX:", idx_val, flush=True)
-                            # colored received
+                            print("FULL_PRIV_HEX:", priv_hex, flush=True)
+                            print("SUFFIX_HEX:", suffix_hex, flush=True)
                             print("RECEIVED (sats):", f"{YELLOW}{recvd}{RESET}", flush=True)
                             print("BALANCE CHECK ERROR:", str(e), flush=True)
                             print("=" * 53 + "\n", flush=True)
                     else:
-                        # Print a clear bordered block for found addresses
                         with print_lock:
                             print("\n" + "=" * 53, flush=True)
                             print("!!!!! FOUND ADDRESS WITH RECEIVED FUNDS !!!!!", flush=True)
                             print("", flush=True)
                             print("WIF:", wif_c, flush=True)
                             print("ADDRESS:", addr, flush=True)
-                            print("INDEX:", idx_val, flush=True)
-                            # colored received and balance
+                            print("FULL_PRIV_HEX:", priv_hex, flush=True)
+                            print("SUFFIX_HEX:", suffix_hex, flush=True)
                             print("RECEIVED (sats):", f"{YELLOW}{recvd}{RESET}", flush=True)
                             print("BALANCE (sats):", f"{LIGHT_GREEN}{bal}{RESET}", flush=True)
                             print("=" * 53 + "\n", flush=True)
 
-                # 3) mandatory sleep 0.6s after each address check (per thread)
                 time.sleep(0.6)
 
         except Exception as e:
@@ -285,30 +373,35 @@ def worker_thread(name: str, idx_provider: IntIndexProvider, checker: AddrChecke
             print(f"[{name}] exiting", flush=True)
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Deterministic BTC scanner (integer index -> 32-byte big-endian private key)")
+    p = argparse.ArgumentParser(description="BTC scanner: fixed prefix + deterministic non-repeating suffix private-keys")
     p.add_argument("-t", "--threads", type=int, default=3, help="number of worker threads (default 3)")
     p.add_argument("-c", "--concurrency", type=int, default=2, help="max concurrent HTTP requests across threads (default 2)")
-    p.add_argument("-d", "--debug", action="store_true", help="debug mode: prints each GET status")
-    p.add_argument("--start", type=int, default=1, help="start index (default 1)")
+    p.add_argument("-d", "--debug", action="store_true", help="debug mode: prints each GET status and suffix")
+    p.add_argument("--prefix", type=str, default="FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF",
+                   help="fixed 42-hex-char prefix (default shown)")
+    p.add_argument("--mode", type=str, default="hex", choices=["hex", "digits", "letters"],
+                   help="suffix generation mode: hex (counter in hex), digits (decimal digits only), letters (A-F only)")
+    p.add_argument("--start-counter", type=int, default=0, help="start counter (default 0)")
+    p.add_argument("--persist-counter", type=str, default=None,
+                   help="optional file to persist last used counter (prevents repeats across runs)")
     return p.parse_args()
 
 def main():
     global last_priv_hex
     args = parse_args()
     try:
-        idx_provider = IntIndexProvider(start=args.start)
+        provider = PrefixCounterProvider(prefix_hex=args.prefix, mode=args.mode,
+                                         start_counter=args.start_counter, persist_file=args.persist_counter)
     except Exception as e:
-        print(f"[FATAL] failed to initialize index provider: {e}", flush=True)
+        print(f"[FATAL] failed to initialize provider: {e}", flush=True)
         sys.exit(1)
 
     session = requests.Session()
-    # semaphore controlling concurrent HTTP requests across all threads
     sem = threading.Semaphore(max(1, args.concurrency))
     checker = AddrChecker(session=session, sem=sem, debug=args.debug)
 
     print_lock = threading.Lock()
 
-    # signal handler: set stop and print checkpoint
     def _signal_handler(sig, frame):
         stop_event.set()
         with last_priv_lock:
@@ -323,25 +416,20 @@ def main():
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    # start worker threads via ThreadPoolExecutor
     num_threads = max(1, args.threads)
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
         futures = [
-            executor.submit(worker_thread, f"worker-{i+1}", idx_provider, checker, print_lock, args.debug)
+            executor.submit(worker_thread, f"worker-{i+1}", provider, checker, print_lock, args.debug)
             for i in range(num_threads)
         ]
 
         try:
-            # Wait until all futures complete or stop_event is set
             for future in as_completed(futures):
-                # if stop_event set, break out -- workers will exit on their own
                 if stop_event.is_set():
                     break
-                # propagate exceptions from worker threads if any
                 try:
                     future.result(timeout=0)
                 except Exception:
-                    # ignore here — worker threads print their own errors
                     pass
         except KeyboardInterrupt:
             stop_event.set()
@@ -354,7 +442,6 @@ def main():
             else:
                 print("\n[INFO] Interrupted by user. No key processed yet.", flush=True)
 
-        # allow threads a moment to see stop_event and exit
         executor.shutdown(wait=True)
 
     print("[INFO] All workers stopped. Exiting.", flush=True)
