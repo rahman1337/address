@@ -1,79 +1,44 @@
 #!/usr/bin/env python3
-"""
-scan_final_bech32_fixed.py
-- Chains: btc (1,3,bc1q,bc1p), eth, bsc, polygon
-- 4 threads (one per chain)
-- BTC: blockchain.info getreceivedbyaddress -> if >0 sleep 1.1s -> blockchain.info addressbalance
-- Sleep per address: 0.6s + jitter up to 0.4s
-- FOUND prints always (bold green) for any raw > 0
-- Debug (-d): per-address progress + colored HTTP/Web3 status (green OK, red error)
-Requirements: pip install coincurve pysha3 web3 requests pycryptodome bech32
-"""
-
 import argparse
-import signal
-import sys
-import threading
 import time
-import random
-from concurrent.futures import ThreadPoolExecutor
-from decimal import Decimal, getcontext
-from functools import lru_cache
+import signal
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
-
 from coincurve import PrivateKey
-from Crypto.Hash import SHA256, RIPEMD160
-import sha3
-from web3 import Web3
-import bech32  # pip package providing bech32_encode & convertbits
-
-# show tiny decimal values exactly
-getcontext().prec = 80
-
-# -------------------------
-# Config
-# -------------------------
-THREADS = 4
-CHAINS = ["btc", "eth", "bsc", "polygon"]
-RPCS = {
-    "eth": "https://ethereum.publicnode.com",
-    "bsc": "https://bsc-dataseed.binance.org/",
-    "polygon": "https://polygon-rpc.com/",
-}
-CHAIN_SYMBOL = {"eth": "ETH", "bsc": "BNB", "polygon": "MATIC", "btc": "BTC"}
-
-SLEEP_BASE = 0.6
-JITTER_MAX = 0.4
-BTC_PRE_BALANCE_SLEEP = 1.1
-RETRY_MAX = 3
-RETRY_BACKOFF = 1.0
+from Crypto.Hash import SHA256, RIPEMD160, keccak
 
 SECP256K1_ORDER = int(
     "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16
 )
-
-# ANSI colors
-BOLD_GREEN = "\033[1;32m"
-CLR_GREEN = "\033[92m"
-CLR_RED = "\033[91m"
-CLR_RESET = "\033[0m"
-
-# -------------------------
-# Utilities
-# -------------------------
-def sha256_bytes(b: bytes) -> bytes:
-    h = SHA256.new(); h.update(b); return h.digest()
-
-def ripemd160_bytes(b: bytes) -> bytes:
-    h = RIPEMD160.new(); h.update(b); return h.digest()
-
-def hash160(b: bytes) -> bytes:
-    return ripemd160_bytes(sha256_bytes(b))
-
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
+# ANSI colors
+YELLOW = "\033[33m"
+LIGHT_GREEN = "\033[92m"
+RESET = "\033[0m"
+
+# ----------------- BTC helpers -----------------
+def sha256(b: bytes) -> bytes:
+    h = SHA256.new()
+    h.update(b)
+    return h.digest()
+
+def ripemd160(b: bytes) -> bytes:
+    h = RIPEMD160.new()
+    h.update(b)
+    return h.digest()
+
+def hash160(b: bytes) -> bytes:
+    return ripemd160(sha256(b))
+
 def base58_encode(b: bytes) -> str:
-    zeros = len(b) - len(b.lstrip(b"\x00"))
+    zeros = 0
+    for c in b:
+        if c == 0:
+            zeros += 1
+        else:
+            break
     num = int.from_bytes(b, "big")
     chars = []
     while num > 0:
@@ -82,391 +47,325 @@ def base58_encode(b: bytes) -> str:
     return "1" * zeros + "".join(reversed(chars)) if chars else "1" * zeros
 
 def base58check_encode(payload: bytes) -> str:
-    chk = sha256_bytes(sha256_bytes(payload))[:4]
+    chk = sha256(sha256(payload))[:4]
     return base58_encode(payload + chk)
 
-def wif_from_priv(priv_bytes: bytes) -> str:
-    return base58check_encode(b"\x80" + priv_bytes + b"\x01")
+def privkey_to_wif(priv_bytes: bytes, compressed: bool = False) -> str:
+    prefix = b"\x80"
+    payload = prefix + priv_bytes
+    if compressed:
+        payload += b"\x01"
+    return base58check_encode(payload)
 
-def evm_address_from_priv(priv_bytes: bytes) -> str:
+def p2pkh(pub: bytes) -> str:
+    return base58check_encode(b"\x00" + hash160(pub))
+
+def p2sh_p2wpkh(pub: bytes) -> str:
+    redeem_script = b"\x00\x14" + hash160(pub)
+    return base58check_encode(b"\x05" + hash160(redeem_script))
+
+# ----------------- bech32 helpers -----------------
+BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+def bech32_polymod(values):
+    GENERATORS = [0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3]
+    chk = 1
+    for v in values:
+        b = (chk >> 25) & 0xFF
+        chk = ((chk & 0x1FFFFFF) << 5) ^ v
+        for i in range(5):
+            if (b >> i) & 1:
+                chk ^= GENERATORS[i]
+    return chk
+
+def bech32_hrp_expand(hrp: str):
+    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+
+def bech32_create_checksum(hrp: str, data: bytes, bech32m: bool = False):
+    values = bech32_hrp_expand(hrp) + list(data) + [0]*6
+    polymod = bech32_polymod(values)
+    const = 0x2bc830a3 if bech32m else 1
+    polymod ^= const
+    return bytes((polymod >> (5*(5-i)) & 31) for i in range(6))
+
+def convertbits(data: bytes, frombits: int, tobits: int, pad: bool = True) -> bytes:
+    acc = 0
+    bits = 0
+    ret = []
+    maxv = (1 << tobits) - 1
+    for b in data:
+        if b >> frombits:
+            raise ValueError("Invalid data for convertbits")
+        acc = (acc << frombits) | b
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            ret.append((acc >> bits) & maxv)
+    if pad and bits:
+        ret.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
+        raise ValueError("Invalid padding in convertbits")
+    return bytes(ret)
+
+def bech32_encode(hrp: str, data: bytes, bech32m: bool = False) -> str:
+    combined = bytes(list(data) + list(bech32_create_checksum(hrp, data, bech32m=bech32m)))
+    return hrp + "1" + "".join(BECH32_CHARSET[b] for b in combined)
+
+def p2wpkh_bech32(pub: bytes) -> str:
+    h160 = hash160(pub)
+    data = bytes([0]) + convertbits(h160, 8, 5)
+    return bech32_encode("bc", data, bech32m=False)
+
+# ----------------- Taproot (P2TR) -----------------
+def tagged_hash(tag: str, msg: bytes) -> bytes:
+    tag_hash = sha256(tag.encode())
+    return sha256(tag_hash + tag_hash + msg)
+
+def p2tr_from_privkey(priv_bytes: bytes) -> str:
+    priv_int = int.from_bytes(priv_bytes, "big")
+    if priv_int == 0 or priv_int >= SECP256K1_ORDER:
+        raise ValueError("Invalid private key for taproot")
+    internal_pk = PrivateKey(priv_bytes)
+    internal_uncomp = internal_pk.public_key.format(compressed=False)
+    internal_xonly = internal_uncomp[1:33]
+    tweak_bytes = tagged_hash("TapTweak", internal_xonly)
+    tweak_int = int.from_bytes(tweak_bytes, "big") % SECP256K1_ORDER
+    tweaked_priv_int = (priv_int + tweak_int) % SECP256K1_ORDER
+    if tweaked_priv_int == 0:
+        raise ValueError("Taproot tweak resulted in invalid key (0).")
+    tweaked_pk = PrivateKey(tweaked_priv_int.to_bytes(32, "big"))
+    tweaked_uncomp = tweaked_pk.public_key.format(compressed=False)
+    tweaked_xonly = tweaked_uncomp[1:33]
+    data = bytes([1]) + convertbits(tweaked_xonly, 8, 5)
+    return bech32_encode("bc", data, bech32m=True)
+
+# ----------------- EVM helpers -----------------
+def eth_address_from_priv(priv_bytes: bytes) -> str:
     pk = PrivateKey(priv_bytes)
-    pub_uncompressed = pk.public_key.format(compressed=False)[1:]
-    k = sha3.keccak_256(); k.update(pub_uncompressed)
-    return "0x" + k.digest()[-20:].hex()
+    uncompressed = pk.public_key.format(compressed=False)
+    keccak_hash = keccak.new(digest_bits=256)
+    keccak_hash.update(uncompressed[1:])
+    addr_bytes = keccak_hash.digest()[-20:]
+    return "0x" + addr_bytes.hex()
 
-def human_amount_from_raw(raw_int: int, decimals: int) -> str:
-    d = Decimal(raw_int) / (Decimal(10) ** decimals)
-    s = format(d, "f")
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    if s == "":
-        s = "0"
-    return s
-
-def sleep_with_jitter():
-    time.sleep(SLEEP_BASE + random.uniform(0, JITTER_MAX))
-
-# -------------------------
-# Bech32 helpers (using bech32 package correctly)
-# -------------------------
-def bech32_encode_segwit(hrp: str, witver: int, witprog: bytes) -> str:
-    # convertbytes/convertbits: bech32.convertbits(data, frombits, tobits, pad=True)
-    converted = bech32.convertbits(witprog, 8, 5)
-    if converted is None:
-        raise ValueError("convertbits failed")
-    data = [witver] + converted
-    return bech32.bech32_encode(hrp, data)
-
-# -------------------------
-# BTC address derivation (all types)
-# -------------------------
-def make_btc_addresses(priv_bytes: bytes):
-    pk = PrivateKey(priv_bytes)
-    pub_comp = pk.public_key.format(compressed=True)
-    p2pkh = base58check_encode(b"\x00" + hash160(pub_comp))
-    redeem = b"\x00\x14" + hash160(pub_comp)
-    p2sh = base58check_encode(b"\x05" + hash160(redeem))
-    # p2wpkh bech32 (bc1q...)
-    p2wpkh = bech32_encode_segwit("bc", 0, hash160(pub_comp))
-    # p2tr bech32m (bc1p...)
-    # use x-only pubkey (uncompressed pubkey's X coordinate)
-    pub_uncomp = pk.public_key.format(compressed=False)
-    x_only = pub_uncomp[1:33]
-    p2tr = bech32_encode_segwit("bc", 1, x_only)
-    return p2pkh, p2sh, p2wpkh, p2tr
-
-# -------------------------
-# HTTP helpers with debug coloring
-# -------------------------
-def colored_debug_http(url: str, status: int, debug: bool, prefix: str = "HTTP GET"):
-    if not debug:
-        return
-    color = CLR_GREEN if status == 200 else CLR_RED
-    print(f"[DEBUG] {prefix} {url} -> {color}{status}{CLR_RESET}", flush=True)
-
-def http_get_text(url: str, debug=False, retries=RETRY_MAX):
-    last_exc = None
-    for attempt in range(1, retries + 1):
-        try:
-            r = requests.get(url, timeout=10)
-            colored_debug_http(url, r.status_code, debug)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:
-            last_exc = e
-            if debug:
-                print(f"[DEBUG] HTTP GET attempt {attempt} failed for {url}: {e}", flush=True)
-            if attempt < retries:
-                time.sleep(RETRY_BACKOFF)
-    raise last_exc
-
-# -------------------------
-# BTC checker using blockchain.info only
-# -------------------------
-class BTCChecker:
-    def __init__(self, session: requests.Session, debug: bool = False):
-        self.session = session
-        self.debug = debug
-
-    def get_received_sats(self, addr: str) -> int:
-        url = f"https://blockchain.info/q/getreceivedbyaddress/{addr}"
-        try:
-            txt = http_get_text(url, debug=self.debug)
-            txt = txt.strip()
-            if txt == "":
-                return 0
-            # text may be integer (sats) or decimal BTC
-            if "." in txt:
-                return int(Decimal(txt) * Decimal(1e8))
-            return int(txt)
-        except Exception as e:
-            if self.debug:
-                print(f"[DEBUG] getreceived error for {addr}: {e}", flush=True)
-            return 0
-
-    def get_balance_sats(self, addr: str) -> int:
-        # user-requested delay before balance check
-        time.sleep(BTC_PRE_BALANCE_SLEEP)
-        url = f"https://blockchain.info/q/addressbalance/{addr}"
-        try:
-            txt = http_get_text(url, debug=self.debug)
-            txt = txt.strip()
-            if txt == "":
-                return 0
-            return int(txt)
-        except Exception as e:
-            if self.debug:
-                print(f"[DEBUG] addressbalance error for {addr}: {e}", flush=True)
-            return 0
-
-# -------------------------
-# EVM helpers
-# -------------------------
-@lru_cache(maxsize=512)
-def get_token_decimals_cached(w3: Web3, token_addr: str) -> int:
-    try:
-        abi = [{"constant": True, "inputs": [], "name": "decimals", "outputs": [{"type":"uint8"}], "type":"function"}]
-        return int(w3.eth.contract(address=w3.toChecksumAddress(token_addr), abi=abi).functions.decimals().call())
-    except Exception:
-        return 18
-
-def evm_get_balance_with_retries(w3: Web3, addr: str, debug=False, retries=RETRY_MAX):
-    last_exc = None
-    rpc_url = getattr(w3.provider, "endpoint_uri", None)
-    for attempt in range(1, retries + 1):
-        try:
-            bal = w3.eth.get_balance(addr)
-            if debug:
-                print(f"[DEBUG] RPC {rpc_url or w3} get_balance -> {CLR_GREEN}OK{CLR_RESET}", flush=True)
-            return int(bal)
-        except Exception as e:
-            last_exc = e
-            if debug:
-                print(f"[DEBUG] RPC {rpc_url or w3} get_balance attempt {attempt} failed: {e}", flush=True)
-            if attempt < retries:
-                time.sleep(RETRY_BACKOFF)
-    raise last_exc
-
-def evm_get_erc20_with_retries(w3: Web3, addr: str, token_addr: str, debug=False, retries=RETRY_MAX):
-    abi = [{"constant": True, "inputs":[{"name":"_owner","type":"address"}],
-            "name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
-    token = w3.eth.contract(address=w3.toChecksumAddress(token_addr), abi=abi)
-    last_exc = None
-    rpc_url = getattr(w3.provider, "endpoint_uri", None)
-    for attempt in range(1, retries + 1):
-        try:
-            res = int(token.functions.balanceOf(w3.toChecksumAddress(addr)).call())
-            if debug:
-                print(f"[DEBUG] RPC {rpc_url or w3} erc20 {token_addr} -> {CLR_GREEN}OK{CLR_RESET}", flush=True)
-            return res
-        except Exception as e:
-            last_exc = e
-            if debug:
-                print(f"[DEBUG] RPC {rpc_url or w3} erc20 attempt {attempt} failed for {token_addr}: {e}", flush=True)
-            if attempt < retries:
-                time.sleep(RETRY_BACKOFF)
-    raise last_exc
-
-# -------------------------
-# Index provider
-# -------------------------
+# ----------------- Index Provider -----------------
 class IndexProvider:
     def __init__(self, start: int = 1):
         self._lock = threading.Lock()
-        if not (1 <= start < SECP256K1_ORDER):
-            raise ValueError("start out of range")
         self._i = start
     def next_index(self) -> int:
         with self._lock:
-            v = self._i
+            val = self._i
             self._i += 1
             if self._i >= SECP256K1_ORDER:
                 self._i = 1
-            return v
+            return val
 
-# -------------------------
-# Worker (one thread per chain)
-# -------------------------
+# ----------------- AddrChecker -----------------
+class AddrChecker:
+    def __init__(self, session: requests.Session, sem: threading.Semaphore, delay: float=0.6, debug: bool=False, timeout: float=10.0):
+        self.session = session
+        self.sem = sem
+        self.delay = delay
+        self.debug = debug
+        self.timeout = timeout
+
+    def _get_with_retries(self, url, retries=3):
+        last_exc = None
+        for attempt in range(1, retries+1):
+            try:
+                self.sem.acquire()
+                try:
+                    resp = self.session.get(url, timeout=self.timeout)
+                finally:
+                    self.sem.release()
+            except Exception as e:
+                last_exc = e
+            else:
+                if resp.status_code == 200:
+                    time.sleep(self.delay)
+                    return resp
+                elif resp.status_code == 429:
+                    last_exc = RuntimeError("HTTP 429 Too Many Requests")
+                else:
+                    last_exc = RuntimeError(f"HTTP {resp.status_code}")
+            if attempt < retries:
+                time.sleep(self.delay)
+        raise last_exc
+
+    # BTC received
+    def btc_received(self, addr: str) -> int:
+        url = f"https://blockchain.info/q/getreceivedbyaddress/{addr}"
+        resp = self._get_with_retries(url)
+        return int(resp.text.strip())
+
+    # BTC balance
+    def btc_balance(self, addr: str) -> int:
+        url = f"https://api.blockcypher.com/v1/btc/main/addrs/{addr}/balance"
+        resp = self._get_with_retries(url)
+        data = resp.json()
+        return int(data.get("final_balance", 0))
+
+    # ETH/BSC/Polygon balance
+    def evm_balance(self, chain: str, address: str) -> int:
+        endpoints = {
+            "eth":"https://rpc.ankr.com/eth",
+            "bsc":"https://bsc-dataseed.binance.org/",
+            "polygon":"https://rpc.ankr.com/polygon"
+        }
+        if chain not in endpoints:
+            raise RuntimeError("Unknown chain: "+chain)
+        url = endpoints[chain]
+        addr = address if address.startswith("0x") else "0x"+address
+        payload = {"jsonrpc":"2.0","method":"eth_getBalance","params":[addr,"latest"],"id":1}
+        self.sem.acquire()
+        try:
+            resp = self.session.post(url,json=payload,timeout=self.timeout)
+        finally:
+            self.sem.release()
+        resp.raise_for_status()
+        time.sleep(self.delay)
+        result = resp.json()
+        return int(result["result"],16)
+
+# ----------------- Worker Thread -----------------
 stop_event = threading.Event()
-_shutdown_printed = threading.Event()
-progress = {"last_idx": 0}
 last_priv_hex = None
 last_priv_lock = threading.Lock()
 
-def print_found(chain_label: str, lines: list):
-    print("\n" + BOLD_GREEN + "=" * 80 + CLR_RESET)
-    print("\n".join(lines))
-    print(BOLD_GREEN + "=" * 80 + CLR_RESET + "\n")
-
-def worker_chain(chain: str, idx_provider: IndexProvider, btc_checker: BTCChecker, web3s: dict, evm_checkers: dict, print_lock: threading.Lock, debug: bool):
+def worker_thread(name, idx_provider, checker, print_lock, chains):
     global last_priv_hex
     while not stop_event.is_set():
         idx = idx_provider.next_index()
-        progress["last_idx"] = idx
-        priv_bytes = idx.to_bytes(32, "big")
+        priv_bytes = idx.to_bytes(32,"big")
         priv_hex = priv_bytes.hex()
+        priv_hex_0x = "0x"+priv_hex
         with last_priv_lock:
-            last_priv_hex = priv_hex
-
-        if debug:
-            with print_lock:
-                print(f"[DEBUG] started chain={chain} idx={idx} priv=0x{priv_hex[:24]}...", flush=True)
-
+            last_priv_hex = priv_hex_0x
         try:
-            # BTC path
-            if chain == "btc":
-                try:
-                    p2pkh, p2sh, p2wpkh, p2tr = make_btc_addresses(priv_bytes)
-                except Exception as e:
-                    with print_lock:
-                        print(f"[ERROR] BTC address derivation failed idx={idx}: {e}", flush=True)
-                    sleep_with_jitter()
-                    continue
+            pk = PrivateKey(priv_bytes)
+            pub = pk.public_key.format(compressed=True)
+            wif = privkey_to_wif(priv_bytes, compressed=True)
 
-                for addr in (p2pkh, p2sh, p2wpkh, p2tr):
-                    if addr is None:
-                        continue
+            # ----------------- BTC -----------------
+            if "btc" in chains:
+                btc_addrs = [p2pkh(pub), p2sh_p2wpkh(pub), p2wpkh_bech32(pub)]
+                try:
+                    btc_addrs.append(p2tr_from_privkey(priv_bytes))
+                except Exception as e:
+                    if checker.debug:
+                        with print_lock:
+                            print(f"[DEBUG] Taproot derivation skipped for idx {idx}: {e}", flush=True)
+
+                for addr in btc_addrs:
+                    if stop_event.is_set(): break
                     try:
-                        rec = btc_checker.get_received_sats(addr)
+                        recvd = checker.btc_received(addr)
                     except Exception as e:
                         with print_lock:
-                            print(f"[ERROR] BTC get_received failed for {addr} idx={idx}: {e}", flush=True)
-                        rec = 0
-                    if rec and int(rec) > 0:
-                        # sleep before balance, then check balance (both via blockchain.info)
-                        try:
-                            bal = btc_checker.get_balance_sats(addr)
-                        except Exception as e:
-                            with print_lock:
-                                print(f"[ERROR] BTC get_balance failed for {addr} idx={idx}: {e}", flush=True)
-                            bal = 0
-                        if int(bal) > 0:
-                            human = human_amount_from_raw(int(bal), 8)
-                            lines = [
-                                f"!!!!! FOUND BTC ADDRESS WITH FUNDS !!!!!",
-                                f"PRIVATE KEY (hex): 0x{priv_hex}",
-                                f"WIF: {wif_from_priv(priv_bytes)}",
-                                f"ADDRESS: {addr}",
-                                f"BALANCE (sats): {int(bal)}",
-                                f"BALANCE (BTC): {human}",
-                            ]
-                            with print_lock:
-                                print_found("btc", lines)
-                    # single sleep per address
-                    sleep_with_jitter()
-
-            # EVM path
-            else:
-                w3 = web3s.get(chain)
-                checker = evm_checkers.get(chain)
-                if w3 is None or checker is None:
-                    with print_lock:
-                        print(f"[ERROR] No RPC configured for chain {chain}", flush=True)
-                    sleep_with_jitter()
-                    continue
-
-                try:
-                    addr_checksum = w3.toChecksumAddress(evm_address_from_priv(priv_bytes))
-                except Exception as e:
-                    with print_lock:
-                        print(f"[ERROR] invalid derived address for {chain} idx={idx}: {e}", flush=True)
-                    sleep_with_jitter()
-                    continue
-
-                # native balance (wei)
-                native_raw = 0
-                try:
-                    native_raw = evm_get_balance_with_retries(w3, addr_checksum, debug=debug)
-                except Exception as e:
-                    with print_lock:
-                        print(f"[ERROR] {chain} native balance failed for {addr_checksum} idx={idx}: {e}", flush=True)
-                    native_raw = 0
-
-                # ERC20s (if configured)
-                token_results = {}
-                for sym, taddr in {}.items():  # empty by default
+                            print(f"[ERROR] BTC {addr} {e}",flush=True)
+                        continue
+                    if recvd == 0:
+                        continue
                     try:
-                        raw = evm_get_erc20_with_retries(w3, addr_checksum, taddr, debug=debug)
-                        if raw and int(raw) > 0:
-                            decs = get_token_decimals_cached(w3, taddr)
-                            token_results[sym] = (int(raw), decs, human_amount_from_raw(int(raw), decs))
+                        bal = checker.btc_balance(addr)
                     except Exception as e:
-                        if debug:
-                            with print_lock:
-                                print(f"[DEBUG] {chain} token {sym} check failed for {addr_checksum} idx={idx}: {e}", flush=True)
-
-                token_positive = any(raw > 0 for (raw, _, _) in token_results.values()) if token_results else False
-                if (native_raw and int(native_raw) > 0) or token_positive:
-                    lines = [f"!!!!! FOUND {chain.upper()} PRIVATE KEY WITH FUNDS !!!!!",
-                             f"PRIVATE KEY (hex): 0x{priv_hex}",
-                             f"DERIVED ADDRESS: {addr_checksum}"]
-                    if native_raw and int(native_raw) > 0:
-                        native_human = human_amount_from_raw(int(native_raw), 18)
-                        lines.append(f"NATIVE (wei): {int(native_raw)}")
-                        lines.append(f"NATIVE ({CHAIN_SYMBOL.get(chain, chain.upper())}): {native_human}")
-                    if token_results:
-                        lines.append("Token balances:")
-                        for s, (raw, decs, human_tok) in token_results.items():
-                            lines.append(f"  {s}: raw={raw} decimals={decs} human={human_tok}")
+                        with print_lock:
+                            print("\n"+"="*53)
+                            print("!!! FOUND BTC ADDRESS BUT BALANCE CHECK FAILED !!!")
+                            print("")
+                            print("WIF:", wif)
+                            print("ADDRESS:", addr)
+                            print("RECEIVED (sats):",f"{YELLOW}{recvd}{RESET}")
+                            print("BALANCE CHECK ERROR:",str(e))
+                            print("="*53+"\n")
+                        continue
                     with print_lock:
-                        print_found(chain, lines)
+                        print("\n"+"="*53)
+                        print("!!!!! FOUND BITCOIN ADDRESS WITH FUNDS !!!!!")
+                        print("")
+                        print("WIF:", wif)
+                        print("ADDRESS:", addr)
+                        print("RECEIVED (sats):",f"{YELLOW}{recvd}{RESET}")
+                        print("BALANCE (sats):",f"{LIGHT_GREEN}{bal}{RESET}")
+                        print("="*53+"\n")
 
-                sleep_with_jitter()
+            # ----------------- ETH/BSC/Polygon -----------------
+            for chain in ["eth","bsc","polygon"]:
+                if chain not in chains: continue
+                addr = eth_address_from_priv(priv_bytes)
+                try:
+                    bal = checker.evm_balance(chain,addr)
+                except Exception as e:
+                    with print_lock:
+                        print(f"[ERROR] {chain.upper()} {addr} {e}",flush=True)
+                    continue
+                if bal == 0:
+                    continue
+                with print_lock:
+                    print("\n"+"="*53)
+                    print("!!!!! FOUND ADDRESS WITH FUNDS !!!!!")
+                    print("")
+                    print("PRIVATE KEY (hex):",priv_hex_0x)
+                    print("ADDRESS:",addr)
+                    print("COINS:",chain.upper())
+                    print("BALANCE (wei):",bal)
+                    print("BALANCE (native):",f"{bal/1e18:.6f} {chain.upper()}")
+                    print("="*53+"\n")
 
         except Exception as e:
-            # keep worker alive; report debug
             with print_lock:
-                if debug:
-                    print(f"[DEBUG] Worker error idx={idx}: {CLR_RED}{e}{CLR_RESET}", flush=True)
-                else:
-                    print(f"[ERROR] Worker error idx={idx}: {e}", flush=True)
-            sleep_with_jitter()
+                print(f"[ERROR] {name} idx={idx} derivation failed: {e}",flush=True)
 
-# -------------------------
-# Progress thread (debug)
-# -------------------------
-def progress_worker(print_lock: threading.Lock, debug: bool):
-    while not stop_event.is_set():
-        if debug:
-            with print_lock:
-                print(f"[DEBUG] last_idx: {progress.get('last_idx', 0)}", end="\r", flush=True)
-        time.sleep(2.5)
+# ----------------- Main -----------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Multi-chain EVM + BTC scanner")
+    p.add_argument("-t","--threads",type=int,default=3)
+    p.add_argument("-c","--concurrency",type=int,default=2)
+    p.add_argument("--chains",type=str,default="eth,bsc,polygon,btc")
+    p.add_argument("--start",type=int,default=1)
+    p.add_argument("--delay",type=float,default=0.6,help="Delay in seconds between each web request")
+    return p.parse_args()
 
-# -------------------------
-# Main
-# -------------------------
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("-d", "--debug", action="store_true", help="debug/progress mode")
-    p.add_argument("--start", type=int, default=1, help="start index")
-    args = p.parse_args()
-    debug = args.debug
-
-    # prepare web3 instances
-    web3s = {}
-    evm_checkers = {}
-    for ch, rpc in RPCS.items():
-        try:
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
-            web3s[ch] = w3
-            evm_checkers[ch] = EVMChecker(w3, debug=debug)
-        except Exception as e:
-            print(f"[ERROR] Failed to create Web3 for {ch}: {e}", flush=True)
+    global last_priv_hex
+    args = parse_args()
+    chains = [x.lower() for x in args.chains.split(",")]
 
     idx_provider = IndexProvider(start=args.start)
     session = requests.Session()
-    btc_checker = BTCChecker(session, debug=debug)
+    sem = threading.Semaphore(max(1,args.concurrency))
+    checker = AddrChecker(session,sem,delay=args.delay)
+
     print_lock = threading.Lock()
 
-    def _signal(sig, frame):
-        if not _shutdown_printed.is_set():
-            with print_lock:
-                print("\n[INFO] Interrupted. Stopping workers...", flush=True)
-            _shutdown_printed.set()
+    def _signal_handler(sig, frame):
         stop_event.set()
-        time.sleep(0.1)
+        with last_priv_lock:
+            checkpoint = last_priv_hex
+        if checkpoint:
+            print("\n[INFO] Interrupted by user. Last private key hex:",checkpoint,flush=True)
+        else:
+            print("\n[INFO] Interrupted by user. No key processed yet.",flush=True)
 
-    signal.signal(signal.SIGINT, _signal)
-    signal.signal(signal.SIGTERM, _signal)
+    signal.signal(signal.SIGINT,_signal_handler)
+    signal.signal(signal.SIGTERM,_signal_handler)
 
-    # start progress thread
-    prog = threading.Thread(target=progress_worker, args=(print_lock, debug), daemon=True)
-    prog.start()
-
-    # start 4 workers (one per chain)
-    with ThreadPoolExecutor(max_workers=THREADS) as ex:
-        for chain in CHAINS:
-            ex.submit(worker_chain, chain, idx_provider, btc_checker, web3s, evm_checkers, print_lock, debug)
+    with ThreadPoolExecutor(max_workers=max(1,args.threads)) as executor:
+        futures = [executor.submit(worker_thread,f"worker-{i+1}",idx_provider,checker,print_lock,chains)
+                   for i in range(max(1,args.threads))]
         try:
-            while not stop_event.is_set():
-                time.sleep(0.2)
+            for future in as_completed(futures):
+                if stop_event.is_set(): break
+                try:
+                    future.result(timeout=0)
+                except Exception:
+                    pass
         except KeyboardInterrupt:
             stop_event.set()
-        finally:
-            ex.shutdown(wait=True)
+        executor.shutdown(wait=True)
 
-    with print_lock:
-        print("\n[INFO] All workers stopped. Exiting.", flush=True)
+    print("[INFO] All workers stopped. Exiting.",flush=True)
 
 if __name__ == "__main__":
     main()
