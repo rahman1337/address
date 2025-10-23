@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+"""
+HD-only scanner (random valid 12-word mnemonics drawn from a 2048-word file).
+For each mnemonic the script derives wallet-accurate keys:
+  - BTC: m/44'/0'/0'/0/i  -> P2PKH (1...)
+         m/49'/0'/0'/0/i  -> P2SH-P2WPKH (3...)
+         m/84'/0'/0'/0/i  -> P2WPKH (bc1q...)
+         m/86'/0'/0'/0/i  -> P2TR (bc1p...)
+  - EVM: m/44'/60'/0'/0/i -> ETH/BSC/POLYGON (0x...)
+It generates valid random 12-word mnemonics from the provided 2048-word list (one word per line),
+ensures no mnemonic is scanned twice by persisting seen mnemonics to disk.
+"""
 import argparse
 import time
 import signal
@@ -13,9 +24,9 @@ import hmac
 import struct
 import sys
 import os
-import itertools
 import bip32utils
 
+# Constants
 SECP256K1_ORDER = int(
     "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16
 )
@@ -24,7 +35,7 @@ BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 LIGHT_GREEN = "\033[92m"
 RESET = "\033[0m"
 
-# ----------------- Helper Functions -----------------
+# ----------------- Helper crypto functions -----------------
 def sha256(b: bytes) -> bytes:
     h = SHA256.new()
     h.update(b)
@@ -70,7 +81,7 @@ def p2sh_p2wpkh(pub: bytes) -> str:
     redeem_script = b"\x00\x14" + hash160(pub)
     return base58check_encode(b"\x05" + hash160(redeem_script))
 
-# ----------------- Bech32 / Taproot helpers -----------------
+# Bech32 / Taproot helpers (kept from your original)
 BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 def bech32_polymod(values):
     GENERATORS = [0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3]
@@ -143,7 +154,7 @@ def p2tr_from_privkey(priv_bytes: bytes) -> str:
     data = bytes([1]) + convertbits(tweaked_xonly, 8, 5)
     return bech32_encode("bc", data, bech32m=True)
 
-# ----------------- EVM -----------------
+# EVM address
 def eth_address_from_priv(priv_bytes: bytes) -> str:
     pk = PrivateKey(priv_bytes)
     uncompressed = pk.public_key.format(compressed=False)
@@ -151,10 +162,10 @@ def eth_address_from_priv(priv_bytes: bytes) -> str:
     k.update(uncompressed[1:])
     return "0x" + k.digest()[-20:].hex()
 
-# ----------------- Stop Event (global) -----------------
+# ----------------- Globals & threading -----------------
 stop_event = threading.Event()
 
-# ----------------- AddrChecker with Retry -----------------
+# ----------------- HTTP checker with retries (keeps your original behavior) -----------------
 class AddrChecker:
     def __init__(self, session: requests.Session, sem: threading.Semaphore, delay=0.6, timeout=10, debug=False):
         self.session = session
@@ -162,7 +173,7 @@ class AddrChecker:
         self.delay = delay
         self.timeout = timeout
         self.debug = debug
-        self.backoffs = [1,3,5]  # retry backoff seconds
+        self.backoffs = [1,3,5]
 
     def _request_with_retries(self, method, url, **kwargs):
         last_exc = None
@@ -189,7 +200,8 @@ class AddrChecker:
                     last_exc = RuntimeError(f"HTTP {resp.status_code}")
             except Exception as e:
                 last_exc = e
-            print(f"[WARN] Attempt {attempt} failed for {url}: {last_exc}")
+            if self.debug:
+                print(f"[WARN] Attempt {attempt} failed for {url}: {last_exc}")
             if attempt < len(self.backoffs):
                 time.sleep(backoff)
         raise last_exc
@@ -230,58 +242,83 @@ def log(msg, print_lock=None, debug=False, always=False):
         else:
             print(msg, flush=True)
 
-# ----------------- Per-priv processing -----------------
-def process_index_priv(priv_bytes: bytes, checker: AddrChecker, chains, print_lock, debug=False):
+# ----------------- Debug print of all 7 addresses for given privs -----------------
+def debug_print_7_addresses(privs_for_btc: dict, evm_priv: bytes):
     """
-    Given priv_bytes (32), perform the BTC and EVM checks and printing.
-    This is used by both HD and random modes.
+    privs_for_btc: dict with keys p2pkh,p2sh,p2wpkh,p2tr -> priv_bytes
+    evm_priv: private bytes for EVM
     """
+    try:
+        p2pkh_addr = p2pkh(PrivateKey(privs_for_btc['p2pkh']).public_key.format(compressed=True))
+    except Exception:
+        p2pkh_addr = "<err>"
+    try:
+        p2sh_addr = p2sh_p2wpkh(PrivateKey(privs_for_btc['p2sh']).public_key.format(compressed=True))
+    except Exception:
+        p2sh_addr = "<err>"
+    try:
+        p2w_addr = p2wpkh_bech32(PrivateKey(privs_for_btc['p2wpkh']).public_key.format(compressed=True))
+    except Exception:
+        p2w_addr = "<err>"
+    try:
+        p2tr_addr = p2tr_from_privkey(privs_for_btc['p2tr'])
+    except Exception:
+        p2tr_addr = "<err>"
+    try:
+        eth_addr = eth_address_from_priv(evm_priv)
+    except Exception:
+        eth_addr = "<err>"
+    print("[DEBUG] Addresses to scan:")
+    print("  BTC P2PKH:", p2pkh_addr)
+    print("  BTC P2SH-P2WPKH:", p2sh_addr)
+    print("  BTC P2WPKH:", p2w_addr)
+    print("  BTC P2TR:", p2tr_addr)
+    print("  ETH / BSC / POLYGON:", eth_addr)
+
+# ----------------- Per-kind processing (scans specific address types) -----------------
+def scan_btc_address_from_priv(priv_bytes: bytes, checker: AddrChecker, print_lock, debug=False):
+    """Scan all BTC address types derived from this single private key (legacy fallback)."""
     if stop_event.is_set():
         return
-    priv_hex_0x = "0x" + priv_bytes.hex()
-    log(f"[DEBUG] priv {priv_hex_0x}", print_lock, debug)
-
-    pk = PrivateKey(priv_bytes)
-    pub = pk.public_key.format(compressed=True)
-    wif = privkey_to_wif(priv_bytes, compressed=True)
-
-    # BTC checks
-    if "btc" in chains:
-        btc_addrs = [p2pkh(pub), p2sh_p2wpkh(pub), p2wpkh_bech32(pub)]
-        try:
-            btc_addrs.append(p2tr_from_privkey(priv_bytes))
-        except Exception as e:
-            log(f"[DEBUG] Taproot skipped: {e}", print_lock, debug)
-        for addr in btc_addrs:
-            if stop_event.is_set():
-                return
-            try:
-                recvd = checker.btc_received(addr)
-                if recvd == 0:
-                    continue
-                bal = checker.btc_balance(addr)
-            except Exception as e:
-                log(f"[ERROR] BTC {addr} {e}", print_lock, always=True)
-                continue
-            btc_balance_btc = bal / 1e8
-            if btc_balance_btc > 0:
-                with print_lock:
-                    print("\n" + "="*53, flush=True)
-                    print("!!!!! FOUND BITCOIN ADDRESS WITH FUNDS !!!!!", flush=True)
-                    print("", flush=True)
-                    print("WIF:", wif, flush=True)
-                    print("ADDRESS:", addr, flush=True)
-                    print("RECEIVED (BTC):", f"{recvd/1e8:.14f}", flush=True)
-                    print("BALANCE (BTC):", f"{LIGHT_GREEN}{btc_balance_btc:.14f}{RESET}", flush=True)
-                    print("="*53 + "\n", flush=True)
-
-    # EVM checks (eth, bsc, polygon)
-    for chain in ["eth","bsc","polygon"]:
-        if chain not in chains:
-            continue
+    pub = PrivateKey(priv_bytes).public_key.format(compressed=True)
+    addrs = []
+    try:
+        addrs.append(p2pkh(pub))
+        addrs.append(p2sh_p2wpkh(pub))
+        addrs.append(p2wpkh_bech32(pub))
+        addrs.append(p2tr_from_privkey(priv_bytes))
+    except Exception:
+        pass
+    for addr in addrs:
         if stop_event.is_set():
             return
-        addr = eth_address_from_priv(priv_bytes)
+        try:
+            recvd = checker.btc_received(addr)
+            if recvd == 0:
+                continue
+            bal = checker.btc_balance(addr)
+        except Exception as e:
+            log(f"[ERROR] BTC {addr} {e}", print_lock, always=True)
+            continue
+        btc_balance_btc = bal / 1e8
+        if btc_balance_btc > 0:
+            with print_lock:
+                print("\n" + "="*53, flush=True)
+                print("!!!!! FOUND BITCOIN ADDRESS WITH FUNDS !!!!!", flush=True)
+                print("", flush=True)
+                print("ADDRESS:", addr, flush=True)
+                print("RECEIVED (BTC):", f"{recvd/1e8:.14f}", flush=True)
+                print("BALANCE (BTC):", f"{LIGHT_GREEN}{btc_balance_btc:.14f}{RESET}", flush=True)
+                print("="*53 + "\n", flush=True)
+
+def scan_evm_from_priv(priv_bytes: bytes, checker: AddrChecker, print_lock, debug=False):
+    """Scan ETH/BSC/POLYGON from a single private key."""
+    if stop_event.is_set():
+        return
+    addr = eth_address_from_priv(priv_bytes)
+    for chain in ["eth","bsc","polygon"]:
+        if stop_event.is_set():
+            return
         try:
             bal = checker.evm_balance(chain, addr)
             native_bal = bal / 1e18
@@ -293,136 +330,155 @@ def process_index_priv(priv_bytes: bytes, checker: AddrChecker, chains, print_lo
                 print("\n" + "="*53, flush=True)
                 print("!!!!! FOUND ADDRESS WITH FUNDS !!!!!", flush=True)
                 print("", flush=True)
-                print("PRIVATE KEY (hex):", priv_hex_0x, flush=True)
                 print("ADDRESS:", addr, flush=True)
                 print("COINS:", chain.upper(), flush=True)
                 print("BALANCE (wei):", bal, flush=True)
                 print("BALANCE (native):", f"{LIGHT_GREEN}{native_bal:.18f} {chain.upper()}{RESET}", flush=True)
                 print("="*53 + "\n", flush=True)
 
-# ----------------- HD generators using bip32utils -----------------
-_zero_seen = False
-_zero_lock = threading.Lock()
-
-def read_word_file_2048(file_path):
-    """
-    Reads file that contains exactly 2048 words, one per line.
-    Returns list of words.
-    """
+# ----------------- BIP39 mnemonic generator helpers -----------------
+def read_word_file_2048(file_path: str):
     with open(file_path, "r", encoding="utf-8") as f:
         words = [line.strip() for line in f if line.strip()]
     if len(words) != 2048:
-        raise RuntimeError(f"Seed file must contain exactly 2048 words (one per line). Found {len(words)}.")
+        raise RuntimeError(f"Wordlist file must contain exactly 2048 words, one per line (found {len(words)})")
     return words
 
-def hd_12word_blocks(words, start_block=0):
+def entropy_to_mnemonic_indices(entropy_bytes: bytes):
     """
-    Generator over 12-word blocks (non-overlapping) from words list.
-    cycles when reaching end.
-    yields (block_index, mnemonic_str)
+    For 12-word mnemonics: entropy 128 bits (16 bytes) + checksum 4 bits -> 132 bits -> 12 * 11 bits indices
+    Returns list of 12 indices (0..2047)
     """
-    blocks = len(words) // 12
-    if blocks == 0:
-        raise RuntimeError("Not enough words for any 12-word mnemonic.")
-    i = start_block % blocks
-    while not stop_event.is_set():
-        base = (i % blocks) * 12
-        mnemonic_words = words[base:base+12]
-        mnemonic = " ".join(mnemonic_words)
-        yield i, mnemonic
-        i += 1
+    if len(entropy_bytes) != 16:
+        raise ValueError("entropy must be 16 bytes")
+    digest = hashlib.sha256(entropy_bytes).digest()
+    ent_bits = int.from_bytes(entropy_bytes, "big")
+    checksum_bits = int.from_bytes(digest, "big") >> (256 - 4)
+    combined = (ent_bits << 4) | checksum_bits  # 132 bits
+    indices = []
+    for i in range(12):
+        shift = 11 * (12 - 1 - i)
+        idx = (combined >> shift) & 0x7FF
+        indices.append(idx)
+    return indices
 
-def bip39_seed_from_mnemonic(mnemonic_str, passphrase=""):
-    """
-    BIP-39 seed (PBKDF2 HMAC-SHA512).
-    """
+def random_valid_mnemonic_from_wordlist(words):
+    entropy_int = secrets.randbits(128)
+    entropy_bytes = entropy_int.to_bytes(16, "big")
+    indices = entropy_to_mnemonic_indices(entropy_bytes)
+    mnemonic_words = [words[i] for i in indices]
+    return " ".join(mnemonic_words), indices
+
+# ----------------- BIP32 derivation via bip32utils -----------------
+def bip39_seed_from_mnemonic(mnemonic_str: str, passphrase: str = ""):
     salt = ("mnemonic" + passphrase).encode("utf-8")
     return hashlib.pbkdf2_hmac("sha512", mnemonic_str.encode("utf-8"), salt, 2048, dklen=64)
 
-def derive_priv_for_path(seed_bytes, purpose, account=0, change=0, addr_index=0):
+def derive_priv_for_path_from_seed(seed_bytes: bytes, purpose: int, coin: int, account: int = 0, change: int = 0, addr_index: int = 0) -> bytes:
     """
-    Using bip32utils derive: purpose' / coin' / account' / change / addr_index
-    For Bitcoin mainnet coin is 0 (we use the standard flow).
-    Returns private key bytes (32).
+    Derive purpose' / coin' / account' / change / addr_index
+    Returns 32-byte private key bytes.
     """
-    # master from seed
     root = bip32utils.BIP32Key.fromEntropy(seed_bytes)
-    # purpose' (hardened)
     purpose_node = root.ChildKey(purpose + bip32utils.BIP32_HARDEN)
-    coin_node = purpose_node.ChildKey(0 + bip32utils.BIP32_HARDEN)  # coin type 0 for BTC mainnet
+    coin_node = purpose_node.ChildKey(coin + bip32utils.BIP32_HARDEN)
     account_node = coin_node.ChildKey(account + bip32utils.BIP32_HARDEN)
     change_node = account_node.ChildKey(change)
     addr_node = change_node.ChildKey(addr_index)
     return addr_node.PrivateKey()
 
-def hd_generator_from_file_12word_blocks(file_path, start_block=0, addr_index=0, passphrase=""):
+# ----------------- Seen mnemonics persistence -----------------
+def load_seen_mnemonics(path):
+    s = set()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    w = line.strip()
+                    if w:
+                        s.add(w)
+        except Exception:
+            pass
+    return s
+
+def persist_seen_mnemonic(path, mnemonic):
+    # append line
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(mnemonic.replace("\n"," ") + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+# ----------------- Generator: produce unique random valid mnemonics and derive keys -----------------
+_zero_lock = threading.Lock()
+_zero_seen = False
+
+def hd_unique_mnemonic_generator(wordlist_path: str, seen_path: str, addr_index: int = 0, passphrase: str = "", debug: bool = False):
     """
-    For each 12-word block (non-overlapping) yields a tuple:
-       (block_index, { 'p2pkh':priv_bytes, 'p2sh':priv_bytes, 'p2wpkh':priv_bytes, 'p2tr':priv_bytes }, evm_priv_bytes)
-    We derive for addr_index (default 0).
+    Infinite generator: yields (mnemonic, privs_dict, evm_priv_bytes)
+    privs_dict: {'p2pkh':bytes,'p2sh':bytes,'p2wpkh':bytes,'p2tr':bytes}
+    evm_priv_bytes: bytes for ETH/BSC/POLYGON (derived from coin=60 path)
+    Ensures mnemonic is never yielded twice; persists seen mnemonics to seen_path.
     """
-    words = read_word_file_2048(file_path)
-    for block_idx, mnemonic in hd_12word_blocks(words, start_block=start_block):
-        # generate seed
+    words = read_word_file_2048(wordlist_path)
+    seen = load_seen_mnemonics(seen_path)
+    while not stop_event.is_set():
+        mnemonic, indices = random_valid_mnemonic_from_wordlist(words)
+        if mnemonic in seen:
+            continue
+        # derive seed
         seed = bip39_seed_from_mnemonic(mnemonic, passphrase=passphrase)
         privs = {}
-        skip_block = False
-        # derive each purpose
+        skip = False
+        # derive BTC purposes (coin=0)
         for purpose, keyname in [(44, "p2pkh"), (49, "p2sh"), (84, "p2wpkh"), (86, "p2tr")]:
             try:
-                priv_bytes = derive_priv_for_path(seed, purpose, account=0, change=0, addr_index=addr_index)
-            except Exception as e:
-                # derivation failed for this purpose; skip block
-                skip_block = True
+                priv_bytes = derive_priv_for_path_from_seed(seed, purpose=purpose, coin=0, account=0, change=0, addr_index=addr_index)
+            except Exception:
+                skip = True
                 break
             priv_int = int.from_bytes(priv_bytes, "big")
             if priv_int == 0 or priv_int >= SECP256K1_ORDER:
-                skip_block = True
+                skip = True
                 break
             privs[keyname] = priv_bytes
-        if skip_block:
+        if skip:
             continue
-        # representative evm priv: use p2wpkh (if available)
-        evm_priv = privs.get("p2wpkh") or list(privs.values())[0]
-        # ensure we don't emit zero twice (edge-case)
-        if int.from_bytes(evm_priv, "big") == 0:
+        # derive EVM priv under coin 60
+        try:
+            evm_priv = derive_priv_for_path_from_seed(seed, purpose=44, coin=60, account=0, change=0, addr_index=addr_index)
+        except Exception:
+            # if derivation fails, skip
+            continue
+        evm_int = int.from_bytes(evm_priv, "big")
+        if evm_int == 0 or evm_int >= SECP256K1_ORDER:
+            continue
+        # zero-key guard (extremely unlikely)
+        if evm_int == 0:
             with _zero_lock:
                 global _zero_seen
                 if _zero_seen:
                     continue
                 _zero_seen = True
-        yield (block_idx, privs, evm_priv)
-
-# ----------------- Random keypool generator -----------------
-def random_keypool_generator():
-    while not stop_event.is_set():
-        priv_int = secrets.randbelow(SECP256K1_ORDER - 1) + 1
-        if priv_int == 0:
-            with _zero_lock:
-                global _zero_seen
-                if _zero_seen:
-                    continue
-                _zero_seen = True
-        priv_bytes = priv_int.to_bytes(32, "big")
-        # For random mode we use same priv for all BTC formats
-        yield (None, {"p2pkh": priv_bytes, "p2sh": priv_bytes, "p2wpkh": priv_bytes, "p2tr": priv_bytes}, priv_bytes)
+        # success -> mark seen (persist) and yield
+        seen.add(mnemonic)
+        persist_seen_mnemonic(seen_path, mnemonic)
+        if debug:
+            print("[DEBUG] Generated mnemonic indices:", indices)
+            print("[DEBUG] Mnemonic:", mnemonic)
+        yield (mnemonic, privs, evm_priv)
 
 # ----------------- CLI -----------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Multi-chain EVM + BTC infinite scanner with retries (HD via 12-word blocks or random keypool)")
+    p = argparse.ArgumentParser(description="HD-only multi-path scanner (BTC types + ETH/BSC/Polygon). Default --file seed.txt")
     p.add_argument("-t","--threads", type=int, default=3)
     p.add_argument("--chains", type=str, default="eth,bsc,polygon,btc")
-    p.add_argument("--start", type=int, default=0,
-                   help="Start block index for HD (0-based). For random mode ignored.")
-    p.add_argument("--addr-index", type=int, default=0,
-                   help="Address index inside each derived account (default 0).")
+    p.add_argument("--addr-index", type=int, default=0, help="address index i in paths (default 0)")
     p.add_argument("--delay", type=float, default=0.6)
-    p.add_argument("--backlog-mult", type=int, default=4,
-                   help="How many tasks per thread to keep queued (multiplier)")
+    p.add_argument("--backlog-mult", type=int, default=4, help="tasks per thread to keep queued")
     p.add_argument("--debug", action="store_true")
-    p.add_argument("--file", type=str, default=None,
-                   help="Path to file containing 2048 words, one per line. If provided => HD mode using non-overlapping 12-word blocks.")
-    p.add_argument("--passphrase", type=str, default="", help="Optional BIP39 passphrase for mnemonics")
+    p.add_argument("--file", type=str, default="seed.txt", help="2048-word file path (one word per line). Default seed.txt")
+    p.add_argument("--seen-file", type=str, default="scanned_mnemonics.txt", help="File to persist seen mnemonics (default scanned_mnemonics.txt)")
+    p.add_argument("--passphrase", type=str, default="", help="Optional BIP39 passphrase")
     return p.parse_args()
 
 # ----------------- Main -----------------
@@ -442,34 +498,46 @@ def main():
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    # Choose generator
-    if args.file:
-        try:
-            gen = hd_generator_from_file_12word_blocks(args.file, start_block=args.start, addr_index=args.addr_index, passphrase=args.passphrase)
-            log(f"[INFO] Using HD generator from file {args.file} starting at block {args.start}, addr-index {args.addr_index}", print_lock, debug=args.debug, always=True)
-            mode = "hd"
-        except Exception as e:
-            print(f"[ERROR] Failed to initialize HD generator from {args.file}: {e}", file=sys.stderr)
-            return
-    else:
-        gen = random_keypool_generator()
-        log("[INFO] Using random keypool (CSPRNG)", print_lock, debug=args.debug, always=True)
-        mode = "random"
+    # initialize generator (HD-only)
+    try:
+        gen = hd_unique_mnemonic_generator(
+            wordlist_path=args.file,
+            seen_path=args.seen_file,
+            addr_index=args.addr_index,
+            passphrase=args.passphrase,
+            debug=args.debug
+        )
+        log(f"[INFO] Using HD mode (wordlist {args.file}), persisting seen mnemonics -> {args.seen_file}", print_lock, debug=args.debug, always=True)
+    except Exception as e:
+        print(f"[ERROR] Failed to initialize HD generator: {e}", file=sys.stderr)
+        return
 
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
         futures = set()
         try:
-            for block_index, privs_dict, evm_priv in gen:
+            for mnemonic, privs_dict, evm_priv in gen:
                 if stop_event.is_set():
                     break
 
-                # Submit jobs: for each BTC priv, run the checks; also submit evm_priv to check EVM chains
-                # Note: In HD mode privs_dict contains four keys (p2pkh/p2sh/p2wpkh/p2tr). In random mode they are identical.
-                for kind, priv_bytes in privs_dict.items():
-                    f = executor.submit(process_index_priv, priv_bytes, checker, chains, print_lock, args.debug)
-                    futures.add(f)
-                # also submit evm_priv (may duplicate a previous task if equal to one of privs_dict - that's fine)
-                f = executor.submit(process_index_priv, evm_priv, checker, chains, print_lock, args.debug)
+                # debug print all 7 addresses before scanning if debug
+                if args.debug:
+                    debug_print_7_addresses(privs_dict, evm_priv)
+
+                # Submit BTC scans per derived priv (each priv corresponds to its address type)
+                # p2pkh priv -> P2PKH address scanning
+                f = executor.submit(scan_btc_address_from_priv, privs_dict['p2pkh'], checker, print_lock, args.debug)
+                futures.add(f)
+                # p2sh priv -> P2SH-P2WPKH
+                f = executor.submit(scan_btc_address_from_priv, privs_dict['p2sh'], checker, print_lock, args.debug)
+                futures.add(f)
+                # p2wpkh priv -> P2WPKH
+                f = executor.submit(scan_btc_address_from_priv, privs_dict['p2wpkh'], checker, print_lock, args.debug)
+                futures.add(f)
+                # p2tr priv -> P2TR
+                f = executor.submit(scan_btc_address_from_priv, privs_dict['p2tr'], checker, print_lock, args.debug)
+                futures.add(f)
+                # Submit EVM scan (ETH/BSC/POLYGON) from evm_priv
+                f = executor.submit(scan_evm_from_priv, evm_priv, checker, print_lock, args.debug)
                 futures.add(f)
 
                 # backpressure / backlog limit processing (same as original)
@@ -482,7 +550,7 @@ def main():
                         except Exception as e:
                             log(f"[ERROR] task failed: {e}", print_lock, always=True)
 
-            # after loop: cancel outstanding futures if any
+            # cancel outstanding futures if any
             if futures:
                 try:
                     for fut in list(futures):
