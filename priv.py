@@ -2,7 +2,7 @@
 import argparse
 import time
 import signal
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import threading
 import requests
 from coincurve import PrivateKey
@@ -13,7 +13,6 @@ SECP256K1_ORDER = int(
 )
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
-YELLOW = "\033[33m"
 LIGHT_GREEN = "\033[92m"
 RESET = "\033[0m"
 
@@ -63,7 +62,7 @@ def p2sh_p2wpkh(pub: bytes) -> str:
     redeem_script = b"\x00\x14" + hash160(pub)
     return base58check_encode(b"\x05" + hash160(redeem_script))
 
-# ----------------- Bech32 -----------------
+# ----------------- Bech32 / Taproot helpers -----------------
 BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 def bech32_polymod(values):
     GENERATORS = [0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3]
@@ -106,7 +105,7 @@ def convertbits(data: bytes, frombits: int, tobits: int, pad: bool = True) -> by
     return bytes(ret)
 
 def bech32_encode(hrp: str, data: bytes, bech32m: bool = False) -> str:
-    combined = bytes(list(data) + list(bech32_create_checksum(hrp, data, bech32m)))
+    combined = bytes(list(data) + list(bech32_create_checksum(hrp, data, bech32m=bech32m)))
     return hrp + "1" + "".join(BECH32_CHARSET[b] for b in combined)
 
 def p2wpkh_bech32(pub: bytes) -> str:
@@ -114,7 +113,6 @@ def p2wpkh_bech32(pub: bytes) -> str:
     data = bytes([0]) + convertbits(h160, 8, 5)
     return bech32_encode("bc", data, bech32m=False)
 
-# ----------------- Taproot -----------------
 def tagged_hash(tag: str, msg: bytes) -> bytes:
     tag_hash = sha256(tag.encode())
     return sha256(tag_hash + tag_hash + msg)
@@ -141,9 +139,12 @@ def p2tr_from_privkey(priv_bytes: bytes) -> str:
 def eth_address_from_priv(priv_bytes: bytes) -> str:
     pk = PrivateKey(priv_bytes)
     uncompressed = pk.public_key.format(compressed=False)
-    keccak_hash = keccak.new(digest_bits=256)
-    keccak_hash.update(uncompressed[1:])
-    return "0x" + keccak_hash.digest()[-20:].hex()
+    k = keccak.new(digest_bits=256)
+    k.update(uncompressed[1:])
+    return "0x" + k.digest()[-20:].hex()
+
+# ----------------- Stop Event (global) -----------------
+stop_event = threading.Event()
 
 # ----------------- AddrChecker -----------------
 class AddrChecker:
@@ -157,6 +158,8 @@ class AddrChecker:
     def _get_with_retries(self, url, retries=3):
         last_exc = None
         for attempt in range(1, retries+1):
+            if stop_event.is_set():
+                raise RuntimeError("Stopped")
             try:
                 self.sem.acquire()
                 try:
@@ -189,16 +192,20 @@ class AddrChecker:
 
     def evm_balance(self, chain, addr):
         endpoints = {
-            "eth":"https://rpc.ankr.com/eth",
-            "bsc":"https://bsc-dataseed.binance.org/",
-            "polygon":"https://rpc.ankr.com/polygon"
+            "eth": "https://ethereum.publicnode.com",
+            "bsc": "https://bsc-dataseed.binance.org/",
+            "polygon": "https://polygon-rpc.com"
         }
         if chain not in endpoints:
             raise RuntimeError("Unknown chain: "+chain)
+        if stop_event.is_set():
+            raise RuntimeError("Stopped")
         url = endpoints[chain]
         payload = {"jsonrpc":"2.0","method":"eth_getBalance","params":[addr,"latest"],"id":1}
         self.sem.acquire()
         try:
+            if stop_event.is_set():
+                raise RuntimeError("Stopped")
             resp = self.session.post(url, json=payload, timeout=self.timeout)
         finally:
             self.sem.release()
@@ -219,18 +226,19 @@ def log(msg, print_lock=None, debug=False, always=False):
         else:
             print(msg, flush=True)
 
-# ----------------- Process single index -----------------
+# ----------------- Per-index processing -----------------
 def process_index(idx, checker, chains, print_lock, debug=False):
+    if stop_event.is_set():
+        return
     priv_bytes = idx.to_bytes(32, "big")
     priv_hex_0x = "0x" + priv_bytes.hex()
-
     log(f"[DEBUG] idx {idx}, priv {priv_hex_0x}", print_lock, debug)
 
     pk = PrivateKey(priv_bytes)
     pub = pk.public_key.format(compressed=True)
     wif = privkey_to_wif(priv_bytes, compressed=True)
 
-    # BTC
+    # BTC checks
     if "btc" in chains:
         btc_addrs = [p2pkh(pub), p2sh_p2wpkh(pub), p2wpkh_bech32(pub)]
         try:
@@ -238,57 +246,77 @@ def process_index(idx, checker, chains, print_lock, debug=False):
         except Exception as e:
             log(f"[DEBUG] Taproot skipped: {e}", print_lock, debug)
         for addr in btc_addrs:
+            if stop_event.is_set():
+                return
             try:
                 recvd = checker.btc_received(addr)
-                log(f"[DEBUG] BTC {addr} received {recvd}", print_lock, debug)
                 if recvd == 0:
                     continue
                 bal = checker.btc_balance(addr)
-                log(f"[DEBUG] BTC {addr} balance {bal}", print_lock, debug)
             except Exception as e:
                 log(f"[ERROR] BTC {addr} {e}", print_lock, always=True)
                 continue
-            log("\n"+"="*53, print_lock, always=True)
-            log("!!!!! FOUND BITCOIN ADDRESS WITH FUNDS !!!!!", print_lock, always=True)
-            log(f"WIF: {wif}", print_lock, always=True)
-            log(f"ADDRESS: {addr}", print_lock, always=True)
-            log(f"RECEIVED (sats): {YELLOW}{recvd}{RESET}", print_lock, always=True)
-            log(f"BALANCE (sats): {LIGHT_GREEN}{bal}{RESET}", print_lock, always=True)
-            log("="*53+"\n", print_lock, always=True)
+            btc_balance_btc = bal / 1e8
+            if btc_balance_btc > 0:
+                with print_lock:
+                    print("\n" + "="*53, flush=True)
+                    print("!!!!! FOUND BITCOIN ADDRESS WITH FUNDS !!!!!", flush=True)
+                    print("", flush=True)
+                    print("WIF:", wif, flush=True)
+                    print("ADDRESS:", addr, flush=True)
+                    print("RECEIVED (BTC):", f"{recvd/1e8:.14f}", flush=True)
+                    # only balance value colored
+                    print("BALANCE (BTC):", f"{LIGHT_GREEN}{btc_balance_btc:.14f}{RESET}", flush=True)
+                    print("="*53 + "\n", flush=True)
 
-    # ETH/BSC/Polygon
+    # EVM checks
     for chain in ["eth","bsc","polygon"]:
         if chain not in chains:
             continue
+        if stop_event.is_set():
+            return
         addr = eth_address_from_priv(priv_bytes)
         try:
             bal = checker.evm_balance(chain, addr)
-            if bal == 0:
-                continue
             native_bal = bal / 1e18
         except Exception as e:
             log(f"[ERROR] {chain.upper()} {addr} {e}", print_lock, always=True)
             continue
-        log("\n"+"="*53, print_lock, always=True)
-        log(f"!!!!! FOUND ADDRESS WITH FUNDS !!!!!", print_lock, always=True)
-        log(f"PRIVATE KEY (hex): {priv_hex_0x}", print_lock, always=True)
-        log(f"ADDRESS: {addr}", print_lock, always=True)
-        log(f"COINS: {chain.upper()}", print_lock, always=True)
-        log(f"BALANCE (wei): {bal}", print_lock, always=True)
-        log(f"BALANCE (native): {native_bal:.18f} {chain.upper()}", print_lock, always=True)
-        log("="*53+"\n", print_lock, always=True)
+        if native_bal > 0:
+            with print_lock:
+                print("\n" + "="*53, flush=True)
+                print("!!!!! FOUND ADDRESS WITH FUNDS !!!!!", flush=True)
+                print("", flush=True)
+                print("PRIVATE KEY (hex):", priv_hex_0x, flush=True)
+                print("ADDRESS:", addr, flush=True)
+                print("COINS:", chain.upper(), flush=True)
+                print("BALANCE (wei):", bal, flush=True)
+                # only balance value colored
+                print("BALANCE (native):", f"{LIGHT_GREEN}{native_bal:.18f} {chain.upper()}{RESET}", flush=True)
+                print("="*53 + "\n", flush=True)
 
-# ----------------- Main -----------------
+# ----------------- Infinite index generator -----------------
+def infinite_indices(start=1):
+    i = start
+    while not stop_event.is_set():
+        yield i
+        i += 1
+        if i >= SECP256K1_ORDER:
+            i = 1
+
+# ----------------- CLI -----------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Multi-chain EVM + BTC scanner")
+    p = argparse.ArgumentParser(description="Multi-chain EVM + BTC infinite scanner")
     p.add_argument("-t","--threads", type=int, default=3)
     p.add_argument("--chains", type=str, default="eth,bsc,polygon,btc")
     p.add_argument("--start", type=int, default=1)
-    p.add_argument("--count", type=int, default=1000)
     p.add_argument("--delay", type=float, default=0.6)
+    p.add_argument("--backlog-mult", type=int, default=4,
+                   help="How many tasks per thread to keep queued (multiplier)")
     p.add_argument("--debug", action="store_true")
     return p.parse_args()
 
+# ----------------- Main -----------------
 def main():
     args = parse_args()
     chains = [x.lower() for x in args.chains.split(",")]
@@ -297,26 +325,55 @@ def main():
     checker = AddrChecker(session, sem, delay=args.delay, debug=args.debug)
     print_lock = threading.Lock()
 
-    indices = range(args.start, args.start + args.count)
+    backlog_limit = max(2, args.threads * args.backlog_mult)
 
-    stop_event = threading.Event()
     def _signal_handler(sig, frame):
         stop_event.set()
-        print("\n[INFO] Interrupted by user.", flush=True)
+        print("\n[INFO] Interrupted by user. Stopping new submissions...", flush=True)
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        futures = {executor.submit(process_index, idx, checker, chains, print_lock, args.debug): idx for idx in indices}
-        for future in as_completed(futures):
-            if stop_event.is_set():
-                break
+        futures = set()
+        try:
+            for idx in infinite_indices(args.start):
+                if stop_event.is_set():
+                    break
+                # submit until backlog limit reached
+                while len(futures) >= backlog_limit and not stop_event.is_set():
+                    # wait for at least one to complete
+                    done, _ = wait(futures, return_when=FIRST_COMPLETED, timeout=1)
+                    for d in done:
+                        futures.discard(d)
+                        try:
+                            d.result()
+                        except Exception as e:
+                            log(f"[ERROR] task failed: {e}", print_lock, always=True)
+                if stop_event.is_set():
+                    break
+                f = executor.submit(process_index, idx, checker, chains, print_lock, args.debug)
+                futures.add(f)
+            # after breaking (stop_event set), wait briefly for running tasks to notice stop_event
+            # and then try to cancel pending futures
+            if futures:
+                try:
+                    # try to cancel not-started futures (Python 3.9+ supports cancel_futures in shutdown,
+                    # but also try to cancel here)
+                    for fut in list(futures):
+                        if not fut.done():
+                            fut.cancel()
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"[ERROR] main loop exception: {e}", print_lock, always=True)
+        finally:
+            # best-effort shutdown immediately
             try:
-                future.result()
-            except Exception as e:
-                log(f"[ERROR] idx={futures[future]} failed: {e}", print_lock, always=True)
-
-    print("[INFO] All tasks completed.", flush=True)
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                # older Python: cancel_futures not supported
+                executor.shutdown(wait=False)
+            print("[INFO] Shutdown requested, exiting.", flush=True)
 
 if __name__ == "__main__":
     main()
