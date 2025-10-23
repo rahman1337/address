@@ -146,7 +146,7 @@ def eth_address_from_priv(priv_bytes: bytes) -> str:
 # ----------------- Stop Event (global) -----------------
 stop_event = threading.Event()
 
-# ----------------- AddrChecker -----------------
+# ----------------- AddrChecker with Retry -----------------
 class AddrChecker:
     def __init__(self, session: requests.Session, sem: threading.Semaphore, delay=0.6, timeout=10, debug=False):
         self.session = session
@@ -154,21 +154,24 @@ class AddrChecker:
         self.delay = delay
         self.timeout = timeout
         self.debug = debug
+        self.backoffs = [1,3,5]  # retry backoff seconds
 
-    def _get_with_retries(self, url, retries=3):
+    def _request_with_retries(self, method, url, **kwargs):
         last_exc = None
-        for attempt in range(1, retries+1):
+        for attempt, backoff in enumerate(self.backoffs, start=1):
             if stop_event.is_set():
                 raise RuntimeError("Stopped")
             try:
                 self.sem.acquire()
                 try:
-                    resp = self.session.get(url, timeout=self.timeout)
+                    if method.lower() == "get":
+                        resp = self.session.get(url, timeout=self.timeout)
+                    elif method.lower() == "post":
+                        resp = self.session.post(url, timeout=self.timeout, **kwargs)
+                    else:
+                        raise RuntimeError(f"Unsupported HTTP method: {method}")
                 finally:
                     self.sem.release()
-            except Exception as e:
-                last_exc = e
-            else:
                 if resp.status_code == 200:
                     time.sleep(self.delay)
                     return resp
@@ -176,18 +179,21 @@ class AddrChecker:
                     last_exc = RuntimeError("HTTP 429 Too Many Requests")
                 else:
                     last_exc = RuntimeError(f"HTTP {resp.status_code}")
-            if attempt < retries:
-                time.sleep(self.delay)
+            except Exception as e:
+                last_exc = e
+            print(f"[WARN] Attempt {attempt} failed for {url}: {last_exc}")
+            if attempt < len(self.backoffs):
+                time.sleep(backoff)
         raise last_exc
 
     def btc_received(self, addr):
         url = f"https://blockchain.info/q/getreceivedbyaddress/{addr}"
-        resp = self._get_with_retries(url)
+        resp = self._request_with_retries("get", url)
         return int(resp.text.strip())
 
     def btc_balance(self, addr):
         url = f"https://api.blockcypher.com/v1/btc/main/addrs/{addr}/balance"
-        resp = self._get_with_retries(url)
+        resp = self._request_with_retries("get", url)
         return int(resp.json().get("final_balance", 0))
 
     def evm_balance(self, chain, addr):
@@ -198,19 +204,9 @@ class AddrChecker:
         }
         if chain not in endpoints:
             raise RuntimeError("Unknown chain: "+chain)
-        if stop_event.is_set():
-            raise RuntimeError("Stopped")
         url = endpoints[chain]
         payload = {"jsonrpc":"2.0","method":"eth_getBalance","params":[addr,"latest"],"id":1}
-        self.sem.acquire()
-        try:
-            if stop_event.is_set():
-                raise RuntimeError("Stopped")
-            resp = self.session.post(url, json=payload, timeout=self.timeout)
-        finally:
-            self.sem.release()
-        resp.raise_for_status()
-        time.sleep(self.delay)
+        resp = self._request_with_retries("post", url, json=payload)
         data = resp.json()
         result_hex = data.get("result")
         if not result_hex:
@@ -265,7 +261,6 @@ def process_index(idx, checker, chains, print_lock, debug=False):
                     print("WIF:", wif, flush=True)
                     print("ADDRESS:", addr, flush=True)
                     print("RECEIVED (BTC):", f"{recvd/1e8:.14f}", flush=True)
-                    # only balance value colored
                     print("BALANCE (BTC):", f"{LIGHT_GREEN}{btc_balance_btc:.14f}{RESET}", flush=True)
                     print("="*53 + "\n", flush=True)
 
@@ -291,7 +286,6 @@ def process_index(idx, checker, chains, print_lock, debug=False):
                 print("ADDRESS:", addr, flush=True)
                 print("COINS:", chain.upper(), flush=True)
                 print("BALANCE (wei):", bal, flush=True)
-                # only balance value colored
                 print("BALANCE (native):", f"{LIGHT_GREEN}{native_bal:.18f} {chain.upper()}{RESET}", flush=True)
                 print("="*53 + "\n", flush=True)
 
@@ -306,7 +300,7 @@ def infinite_indices(start=1):
 
 # ----------------- CLI -----------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Multi-chain EVM + BTC infinite scanner")
+    p = argparse.ArgumentParser(description="Multi-chain EVM + BTC infinite scanner with retries")
     p.add_argument("-t","--threads", type=int, default=3)
     p.add_argument("--chains", type=str, default="eth,bsc,polygon,btc")
     p.add_argument("--start", type=int, default=1)
@@ -339,9 +333,7 @@ def main():
             for idx in infinite_indices(args.start):
                 if stop_event.is_set():
                     break
-                # submit until backlog limit reached
                 while len(futures) >= backlog_limit and not stop_event.is_set():
-                    # wait for at least one to complete
                     done, _ = wait(futures, return_when=FIRST_COMPLETED, timeout=1)
                     for d in done:
                         futures.discard(d)
@@ -353,12 +345,8 @@ def main():
                     break
                 f = executor.submit(process_index, idx, checker, chains, print_lock, args.debug)
                 futures.add(f)
-            # after breaking (stop_event set), wait briefly for running tasks to notice stop_event
-            # and then try to cancel pending futures
             if futures:
                 try:
-                    # try to cancel not-started futures (Python 3.9+ supports cancel_futures in shutdown,
-                    # but also try to cancel here)
                     for fut in list(futures):
                         if not fut.done():
                             fut.cancel()
@@ -367,11 +355,9 @@ def main():
         except Exception as e:
             log(f"[ERROR] main loop exception: {e}", print_lock, always=True)
         finally:
-            # best-effort shutdown immediately
             try:
                 executor.shutdown(wait=False, cancel_futures=True)
             except TypeError:
-                # older Python: cancel_futures not supported
                 executor.shutdown(wait=False)
             print("[INFO] Shutdown requested, exiting.", flush=True)
 
