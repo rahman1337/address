@@ -7,6 +7,7 @@ import threading
 import requests
 from coincurve import PrivateKey
 from Crypto.Hash import SHA256, RIPEMD160, keccak
+import secrets  # new import for secure random generation
 
 SECP256K1_ORDER = int(
     "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16
@@ -289,14 +290,18 @@ def process_index(idx, checker, chains, print_lock, debug=False):
                 print("BALANCE (native):", f"{LIGHT_GREEN}{native_bal:.18f} {chain.upper()}{RESET}", flush=True)
                 print("="*53 + "\n", flush=True)
 
-# ----------------- Infinite index generator -----------------
+# ----------------- Random valid private-key generator -----------------
 def infinite_indices(start=1):
-    i = start
+    """
+    Generates cryptographically-secure random private keys as integers
+    uniformly in the valid secp256k1 range: 1 .. SECP256K1_ORDER-1.
+
+    Note: kept the same function name so minimal changes are needed elsewhere.
+    The `start` parameter is ignored for compatibility with the CLI.
+    """
     while not stop_event.is_set():
-        yield i
-        i += 1
-        if i >= SECP256K1_ORDER:
-            i = 1
+        # secrets.randbelow returns 0..n-1, so use order-1 then add 1
+        yield secrets.randbelow(SECP256K1_ORDER - 1) + 1
 
 # ----------------- CLI -----------------
 def parse_args():
