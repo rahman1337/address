@@ -168,26 +168,35 @@ def persist_seen(path,mnemonic):
 
 # ----------------- Scan function -----------------
 def scan_address(priv_bytes, addr_type, checker, mnemonic, account, change, index):
-    if stop_event.is_set(): return
-    pub = PrivateKey(priv_bytes).public_key.format(compressed=True)
-    if addr_type=="p2pkh": addr = p2pkh(pub)
-    elif addr_type=="p2sh": addr = p2sh_p2wpkh(pub)
-    elif addr_type=="p2wpkh": addr = p2wpkh_bech32(pub)
-    else: return
-    recvd = checker.btc_received(addr)
-    if recvd > 0:
-        bal = checker.btc_balance(addr)
+    try:
+        pub = PrivateKey(priv_bytes).public_key.format(compressed=True)
+        if addr_type=="p2pkh": addr = p2pkh(pub)
+        elif addr_type=="p2sh": addr = p2sh_p2wpkh(pub)
+        elif addr_type=="p2wpkh": addr = p2wpkh_bech32(pub)
+        else: return
+
+        # ----- DEBUG PRINT -----
         with print_lock:
-            print("\n" + "="*60)
-            print("!!!!! FOUND BITCOIN ADDRESS !!!!!")
-            print(f"MNEMONIC: {mnemonic}")
-            print(f"WIF: {privkey_to_wif(priv_bytes)}")
-            print(f"Address type: {addr_type}")
-            print(f"Derivation path: account={account} change={change} index={index}")
-            print(f"ADDRESS: {addr}")
-            print(f"RECEIVED (BTC): {recvd/1e8}")
-            print(f"BALANCE (BTC): {bal/1e8 if bal is not None else 'NONE'}")
-            print("="*60 + "\n")
+            print(f"[DEBUG] Scanning {addr_type} address {addr} (account={account} change={change} index={index})")
+
+        recvd = checker.btc_received(addr)
+        bal = checker.btc_balance(addr)
+
+        if recvd > 0:
+            with print_lock:
+                print("\n" + "="*60)
+                print("!!!!! FOUND BITCOIN ADDRESS !!!!!")
+                print(f"MNEMONIC: {mnemonic}")
+                print(f"WIF: {privkey_to_wif(priv_bytes)}")
+                print(f"Address type: {addr_type}")
+                print(f"Derivation path: account={account} change={change} index={index}")
+                print(f"ADDRESS: {addr}")
+                print(f"RECEIVED (BTC): {recvd/1e8}")
+                print(f"BALANCE (BTC): {bal/1e8 if bal is not None else 'NONE'}")
+                print("="*60 + "\n")
+    except Exception as e:
+        with print_lock:
+            print(f"[ERROR] {addr_type} account={account} change={change} index={index} exception: {e}")
 
 # ----------------- Thread task -----------------
 def scan_type_for_mnemonic(seed, mnemonic, addr_type, purpose, checker):
@@ -200,7 +209,7 @@ def scan_type_for_mnemonic(seed, mnemonic, addr_type, purpose, checker):
                     scan_address(priv, addr_type, checker, mnemonic, account, change, index)
                 except Exception as e:
                     with print_lock:
-                        print(f"[WARN] Derivation failed for {addr_type} a={account} c={change} i={index}: {e}")
+                        print(f"[WARN] Failed derivation {addr_type} a={account} c={change} i={index}: {e}")
 
 # ----------------- Main -----------------
 def main():
