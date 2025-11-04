@@ -15,6 +15,8 @@ Features:
 - Normal mode: prints only found results (formatted)
 - Debug mode (-d): prints full progress, web responses, balances, errors
 - RPC calls include fallback retries (max 3 attempts with sleeps 1,2,3s)
+- Uses pure-python ed25519 package for Solana key generation (no cryptography required)
+- Adds sanity checks to avoid "crazy random" invalid/trivial keys before making RPC calls
 """
 
 import os
@@ -28,6 +30,10 @@ from typing import Optional
 
 # ---- dependency imports with auto-install if needed ----
 def ensure_import(name, package=None):
+    """
+    Try importing `name`. If not found, install `package` (or name) via pip and import.
+    Returns the imported module object.
+    """
     try:
         return __import__(name)
     except Exception:
@@ -40,17 +46,22 @@ def ensure_import(name, package=None):
 # packages used by the script
 requests = ensure_import("requests")
 base58 = ensure_import("base58")
-# cryptography will be used for Solana ed25519 keypair generation
-_ = ensure_import("cryptography")
+# ed25519 (pure-python) will be used for Solana ed25519 keypair generation
+ed25519_mod = None
+try:
+    ed25519_mod = __import__("ed25519")
+except Exception:
+    # attempt to install and import
+    try:
+        ed25519_mod = ensure_import("ed25519")
+    except Exception:
+        ed25519_mod = None  # we'll handle None at runtime with clear error
+
 eth_keys = ensure_import("eth_keys")
 eth_utils = ensure_import("eth_utils")
 
 from eth_keys import keys as eth_keys_keys
 from eth_utils import to_checksum_address
-
-# cryptography imports (after ensuring package present)
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 import secrets
 
@@ -135,18 +146,98 @@ def bsc_priv_to_address(priv_bytes: bytes) -> str:
 
 def gen_solana_keypair():
     """
-    Generate an ed25519 keypair for Solana using cryptography.
+    Generate an ed25519 keypair for Solana using the pure-python `ed25519` package.
     Returns (seed_bytes, base58_pubkey_address).
-    Approach: generate a 32-byte seed and construct the private key object
-    via Ed25519PrivateKey.from_private_bytes(seed). This is broadly compatible.
+    seed_bytes is 32 bytes (hex stored as private representation).
     """
+    if ed25519_mod is None:
+        raise RuntimeError(
+            "ed25519 module not available — please install it with: pip install ed25519\n"
+            "Or run with Solana disabled (remove the Solana worker submission in main)."
+        )
+
     # 32-byte seed
     seed = secrets.token_bytes(32)
-    # construct private key object from seed bytes
-    priv_obj = Ed25519PrivateKey.from_private_bytes(seed)
-    pub_raw = priv_obj.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    address = base58.b58encode(pub_raw).decode()
-    return seed, address
+    # ed25519.SigningKey accepts a 32-byte seed in the common pure-python package
+    # The API: ed25519.SigningKey(seed) -> sk, and sk.get_verifying_key() -> vk
+    # vk.to_bytes() (or vk.to_bytes() style) yields 32-byte public key
+    try:
+        sk = ed25519_mod.SigningKey(seed)
+        vk = sk.get_verifying_key()
+        if hasattr(vk, "to_bytes"):
+            pub_raw = vk.to_bytes()
+        else:
+            pub_raw = bytes(vk)
+        address = base58.b58encode(pub_raw).decode()
+        return seed, address
+    except Exception as e:
+        # make the error message actionable
+        raise RuntimeError(f"ed25519 key derivation failed: {e}. "
+                           "If this persists, try `pip install ed25519` or disable Solana worker.")
+
+# ---- Sanity-check functions (new) ----
+def sanity_check_secp256k1_privkey(priv_bytes: bytes) -> bool:
+    """
+    Basic sanity checks for secp256k1 private key bytes:
+    - 32 bytes
+    - integer in [1, SECP256K1_N - 1]
+    - not trivially small (e.g. > 2**16)
+    - not low-entropy pattern (all zeros, single repeated byte)
+    - requires at least 4 distinct byte values
+    """
+    try:
+        if not isinstance(priv_bytes, (bytes, bytearray)) or len(priv_bytes) != 32:
+            return False
+        priv_int = int.from_bytes(priv_bytes, "big")
+        if not (1 <= priv_int < SECP256K1_N):
+            return False
+        # avoid trivially small values (e.g., 0x1, 0x2... often indicative of bad RNG/test vectors)
+        if priv_int <= 2**16:
+            return False
+        s = set(priv_bytes)
+        if len(s) <= 1:
+            # all bytes identical (e.g., all zeros or all 0xff)
+            return False
+        if len(s) < 4:
+            # too few distinct byte values -> likely low-entropy pattern
+            return False
+        return True
+    except Exception:
+        return False
+
+def sanity_check_ed25519_seed(seed: bytes) -> bool:
+    """
+    Basic sanity checks for ed25519 32-byte seed:
+    - 32 bytes
+    - not all zeros or all identical bytes
+    - at least 4 distinct bytes
+    - try deriving public key and ensure public key length is 32 and not all-zero
+    """
+    try:
+        if not isinstance(seed, (bytes, bytearray)) or len(seed) != 32:
+            return False
+        s = set(seed)
+        if len(s) <= 1:
+            return False
+        if len(s) < 4:
+            return False
+        if ed25519_mod is None:
+            # can't fully validate without module; at least pass the basic checks
+            return True
+        # attempt to derive public key
+        sk = ed25519_mod.SigningKey(seed)
+        vk = sk.get_verifying_key()
+        if hasattr(vk, "to_bytes"):
+            pub_raw = vk.to_bytes()
+        else:
+            pub_raw = bytes(vk)
+        if not isinstance(pub_raw, (bytes, bytearray)) or len(pub_raw) != 32:
+            return False
+        if set(pub_raw) == {0}:
+            return False
+        return True
+    except Exception:
+        return False
 
 # ---- RPC helper with retries ----
 def rpc_post_with_retries(url: str, json_payload: dict, debug: bool=False, max_attempts: int=3):
@@ -235,12 +326,20 @@ def worker_eth(chain_name, rpc_url, debug=False):
     while not stop_event.is_set():
         try:
             priv = gen_eth_privkey_bytes()
+            # sanity-check the generated private key BEFORE deriving address / RPC
+            if not sanity_check_secp256k1_privkey(priv):
+                if debug:
+                    print(f"[{chain_name}][sanity] rejected priv (failed sanity check): {priv.hex()}")
+                # skip and continue generating
+                continue
+
             privhex = priv.hex()
             key_repr = f"{chain_name}:{privhex}"
             if key_repr in in_memory_scanned:
                 if debug:
                     print(f"[{chain_name}] duplicate key, skipping {privhex}")
                 continue
+
             address = eth_priv_to_address(priv)
             append_scanned(key_repr)
 
@@ -283,6 +382,12 @@ def worker_solana(chain_name, rpc_url, debug=False):
     while not stop_event.is_set():
         try:
             seed, address = gen_solana_keypair()
+            # sanity-check the seed BEFORE using it
+            if not sanity_check_ed25519_seed(seed):
+                if debug:
+                    print(f"[{chain_name}][sanity] rejected seed (failed sanity check): {seed.hex()}")
+                continue
+
             privhex = seed.hex()
             key_repr = f"{chain_name}:{privhex}"
             if key_repr in in_memory_scanned:
@@ -336,6 +441,7 @@ def main():
         futures = []
         futures.append(ex.submit(worker_eth, "ethereum", ETH_RPC, debug))
         futures.append(ex.submit(worker_bsc, "bsc", BSC_RPC, debug))
+        # If you cannot install ed25519, remove or comment the next line to disable Solana worker
         futures.append(ex.submit(worker_solana, "solana", SOL_RPC, debug))
 
         try:
