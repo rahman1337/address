@@ -222,29 +222,15 @@ def _pubkey_from_priv_compressed(priv_bytes: bytes) -> bytes:
 def btc_priv_to_addresses(priv_bytes: bytes):
     pub = _pubkey_from_priv_compressed(priv_bytes)
     h160 = _hash160(pub)
-
-    # Legacy P2PKH
     p2pkh = base58.b58encode_check(b"\x00" + h160).decode()
-
-    # Nested P2SH-P2WPKH
     redeem_script = b"\x00\x14" + h160
     redeem_h160 = _hash160(redeem_script)
     p2sh = base58.b58encode_check(b"\x05" + redeem_h160).decode()
-
-    # Native SegWit Bech32
     data = [0] + _convertbits(h160, 8, 5)
     bech32 = _bech32_encode("bc", data)
-
-    # WIF (compressed)
     wif_bytes = b"\x80" + priv_bytes + b"\x01"
     wif = base58.b58encode_check(wif_bytes).decode()
-
-    return {
-        "legacy": p2pkh,
-        "nested": p2sh,
-        "bech32": bech32,
-        "wif": wif
-    }
+    return {"legacy": p2pkh, "nested": p2sh, "bech32": bech32, "wif": wif}
 
 # ----- RPC helpers -----
 async def rpc_post_with_retries(url: str, json_payload: dict, session: aiohttp.ClientSession, debug: bool=False, max_attempts: int=3):
@@ -279,7 +265,7 @@ async def btc_get_balance(rpc_url, address, session, debug=False):
     if "error" in j: raise RuntimeError(f"RPC error: {j['error']}")
     return int(j.get("result", 0))
 
-# ----- Workers -----
+# ----- WORKERS -----
 async def worker_eth_async(chain_name, rpc_url, debug=False):
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         while not stop_event.is_set():
@@ -287,17 +273,25 @@ async def worker_eth_async(chain_name, rpc_url, debug=False):
                 priv = gen_eth_privkey_bytes()
                 privhex = priv.hex()
                 key_repr = f"{chain_name}:{privhex}"
-                if key_repr in in_memory_tried: await asyncio.sleep(0.02); continue
+                if key_repr in in_memory_tried: 
+                    await asyncio.sleep(0.02)
+                    continue
                 append_tried(key_repr)
                 address = eth_priv_to_address(priv)
-                try: bal_wei = await eth_like_get_balance(rpc_url, address, session, debug)
-                except: await asyncio.sleep(0.2); continue
+                try: 
+                    bal_wei = await eth_like_get_balance(rpc_url, address, session, debug)
+                except: 
+                    await asyncio.sleep(0.2)
+                    continue
                 if bal_wei > 0:
-                    bal_str = f"{bal_wei / 10**18:.18f} (wei={bal_wei})"
-                    print(format_found_block(chain_name, privhex, address, bal_str))
-                    append_found(f"{chain_name} | {privhex} | {address} | {bal_str}")
+                    bal_eth = bal_wei / 10**18
+                    if bal_eth > 0.00000001:  # only print if above threshold
+                        bal_str = f"{bal_eth:.18f} (wei={bal_wei})"
+                        print(format_found_block(chain_name, privhex, address, bal_str))
+                        append_found(f"{chain_name} | {privhex} | {address} | {bal_str}")
                 await asyncio.sleep(0.02)
-            except: await asyncio.sleep(0.05)
+            except: 
+                await asyncio.sleep(0.05)
 
 async def worker_bsc_async(chain_name, rpc_url, debug=False):
     await worker_eth_async(chain_name, rpc_url, debug)
