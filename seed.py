@@ -7,10 +7,9 @@
 - RPC retries with backoff (1,2,3s)
 - Bitcoin prints 3 address types + WIF
 """
-import os, sys, time, threading, asyncio, struct, random, traceback
+import os, sys, time, threading, asyncio, struct, traceback
 from hashlib import pbkdf2_hmac
 from concurrent.futures import ThreadPoolExecutor
-from argparse import ArgumentParser
 
 def ensure_import(name, package=None):
     try: return __import__(name)
@@ -122,11 +121,12 @@ def mnemonic_to_seed(mnemonic:str, passphrase:str="")->bytes:
     return pbkdf2_hmac("sha512", mnemonic.encode("utf-8"), salt, 2048)
 
 # ---------------- BIP32 / BIP44 ----------------
-def derive_secp256k1_bip44(seed_bytes:bytes, coin_type:int, indices=(0,1,2)):
+def derive_secp256k1_bip44(seed_bytes: bytes, coin_type: int, indices=(0,1,2)):
     from bip32utils import BIP32Key
     master = BIP32Key.fromEntropy(seed_bytes)
-    k = master.ChildKey(44+BIP32Key.HARDEN).ChildKey(coin_type+BIP32Key.HARDEN).ChildKey(0+BIP32Key.HARDEN).ChildKey(0)
-    out=[]
+    # m/44'/coin_type'/0'/0
+    k = master.ChildKey(44 + 0x80000000).ChildKey(coin_type + 0x80000000).ChildKey(0 + 0x80000000).ChildKey(0)
+    out = []
     for i in indices:
         ki = k.ChildKey(i)
         priv_bytes = ki.PrivateKey()
@@ -163,7 +163,7 @@ def derive_slip10_ed25519_path(seed_bytes:bytes,path:str):
 CHARSET="qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 def _bech32_polymod(values):
     GEN=[0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3];chk=1
-    for v in values:top=chk>>25;chk=((chk&0x1ffffff)<<5)^v;chk^=sum([GENERATORS[i] for i in range(5) if (top>>i)&1])
+    for v in values:top=chk>>25;chk=((chk&0x1ffffff)<<5)^v;chk^=sum([GEN[i] for i in range(5) if (top>>i)&1])
     return chk
 def _bech32_hrp_expand(hrp): return [ord(x)>>5 for x in hrp]+[0]+[ord(x)&31 for x in hrp]
 def _bech32_create_checksum(hrp,data): values=_bech32_hrp_expand(hrp)+data;polymod=_bech32_polymod(values+[0]*6)^1;return [(polymod>>(5*(5-i)))&31 for i in range(6)]
@@ -229,20 +229,32 @@ async def btc_get_balance(rpc_url,address,session,debug=False):
     if "error" in j: raise RuntimeError(f"RPC error: {j['error']}")
     return int(j.get("result",0))
 
+async def sui_get_balance(rpc_url,address,session,debug=False):
+    payload = {
+        "jsonrpc":"2.0",
+        "id":1,
+        "method":"sui_getBalance",
+        "params":[address,"0x2::sui::SUI"]
+    }
+    j = await rpc_post_with_retries(rpc_url,payload,session,debug)
+    if "error" in j: raise RuntimeError(f"Sui RPC error: {j['error']}")
+    return int(j.get("result",{}).get("totalBalance",0))
+
 # ---------------- Worker ----------------
 async def worker_chain(chain_name,rpc_url,debug=False):
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         while not stop_event.is_set():
             try:
-                mnemonic=gen_mnemonic_12()
+                mnemonic = gen_mnemonic_12()
                 if mnemonic in in_memory_scanned:
                     await asyncio.sleep(0.01)
                     continue
                 append_scanned(mnemonic)
-                seed=mnemonic_to_seed(mnemonic)
-                # scan 3 accounts/indices
+                seed = mnemonic_to_seed(mnemonic)
+
                 if chain_name in ["ethereum","bsc","polygon"]:
-                    for priv,addr in derive_secp256k1_bip44(seed,0,indices=(0,1,2)):
+                    coin_map={"ethereum":60,"bsc":60,"polygon":137}
+                    for priv,addr in derive_secp256k1_bip44(seed,coin_map[chain_name],indices=(0,1,2)):
                         privhex=priv.hex()
                         try: bal_wei=await eth_like_get_balance(rpc_url,addr,session,debug)
                         except Exception as e: print(f"[error][{chain_name}] {e}"); continue
@@ -250,20 +262,37 @@ async def worker_chain(chain_name,rpc_url,debug=False):
                             bal_str=f"{bal_wei/1e18:.18f} (wei={bal_wei})"
                             print(format_found_block(chain_name,mnemonic,privhex,addr,bal_str))
                             append_found(f"{chain_name} | {mnemonic} | {privhex} | {addr} | {bal_str}")
-                elif chain_name in ["solana","sui"]:
+
+                elif chain_name=="solana":
                     for i in range(3):
                         path=f"m/44'/501'/{i}'/0'"
                         priv=derive_slip10_ed25519_path(seed,path)
                         sk=ed25519_mod.SigningKey(priv)
                         vk=sk.get_verifying_key()
-                        pub=vk.to_bytes()
-                        addr=base58.b58encode(pub).decode()
+                        pub_raw=vk.to_bytes()
+                        addr=base58.b58encode(pub_raw).decode()
                         try: lamports=await solana_get_balance(rpc_url,addr,session,debug)
-                        except Exception as e: print(f"[error][{chain_name}] {e}"); continue
+                        except Exception as e: print(f"[error][solana] {e}"); continue
                         if lamports>0:
                             bal_str=f"{lamports} lamports ({lamports/1e9:.9f} SOL)"
-                            print(format_found_block(chain_name,mnemonic,priv.hex(),addr,bal_str))
-                            append_found(f"{chain_name} | {mnemonic} | {priv.hex()} | {addr} | {bal_str}")
+                            print(format_found_block("solana",mnemonic,priv.hex(),addr,bal_str))
+                            append_found(f"solana | {mnemonic} | {priv.hex()} | {addr} | {bal_str}")
+
+                elif chain_name=="sui":
+                    for i in range(3):
+                        path=f"m/44'/784'/{i}'/0'"
+                        priv=derive_slip10_ed25519_path(seed,path)
+                        sk=ed25519_mod.SigningKey(priv)
+                        vk=sk.get_verifying_key()
+                        pub_raw=vk.to_bytes()
+                        addr=base58.b58encode(pub_raw).decode()
+                        try: balance=await sui_get_balance(rpc_url,addr,session,debug)
+                        except Exception as e: print(f"[error][sui] {e}"); continue
+                        if balance>0:
+                            bal_str=f"{balance} (SUI)"
+                            print(format_found_block("sui",mnemonic,priv.hex(),addr,bal_str))
+                            append_found(f"sui | {mnemonic} | {priv.hex()} | {addr} | {bal_str}")
+
                 elif chain_name=="bitcoin":
                     for priv,addr in derive_secp256k1_bip44(seed,0,indices=(0,1,2)):
                         privhex=priv.hex()
@@ -276,6 +305,7 @@ async def worker_chain(chain_name,rpc_url,debug=False):
                                 bal_str=f"{sat/1e8:.8f} BTC ({sat} satoshis)"
                                 print(format_found_block("bitcoin",mnemonic,privhex,a,bal_str,addrs['wif']))
                                 append_found(f"bitcoin | {mnemonic} | {privhex} | {a} | {bal_str} | {addrs['wif']}")
+
             except Exception as e:
                 print(f"[error][{chain_name}] Unexpected exception: {e}")
                 print(traceback.format_exc())
@@ -285,10 +315,12 @@ def run_async_worker(coro_func,*args,**kwargs):
     try: asyncio.run(coro_func(*args,**kwargs))
     except Exception as e: print(f"[worker][fatal] {e}")
 
+# ---------------- Main ----------------
 def main():
-    parser=ArgumentParser()
+    from argparse import ArgumentParser
+    parser = ArgumentParser()
     parser.add_argument("-d","--debug",action="store_true")
-    args=parser.parse_args()
+    args = parser.parse_args()
     debug=args.debug
 
     print(f"[info] Starting scanner. Debug={debug}. Press Ctrl+C to stop.")
