@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""
-Scanner with improved Solana deterministic seeds that are predictable
-but high-entropy (SHA256(salt || counter)) so wallets will accept them.
-"""
-
 import os
 import sys
 import time
 import threading
+import traceback
 import asyncio
-import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from argparse import ArgumentParser
 from typing import Optional
@@ -21,7 +16,7 @@ def ensure_import(name, package=None):
         pkg = package or name
         print(f"[setup] package '{pkg}' not found, attempting to install...", file=sys.stderr)
         import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "-q", "install", pkg])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
         return __import__(name)
 
 aiohttp = ensure_import("aiohttp")
@@ -49,7 +44,6 @@ found_lock = threading.Lock()
 in_memory_tried = set()
 stop_event = threading.Event()
 
-# Load already tried keys
 if os.path.exists(TRIED_FILE):
     try:
         with open(TRIED_FILE, "r", encoding="utf-8") as f:
@@ -68,31 +62,49 @@ def append_tried(key_repr: str):
             f.write(key_repr + "\n")
         in_memory_tried.add(key_repr)
 
-def append_found_line_by_line(chain, privhex, address, balance_str):
-    """Writes found entry line by line to found.txt"""
+def append_found(line: str):
     with found_lock:
         with open(FOUND_FILE, "a", encoding="utf-8") as f:
-            f.write(f"CHAIN: {chain}\n")
-            f.write(f"PRIVATE_KEY: {privhex}\n")
-            f.write(f"ADDRESS: {address}\n")
-            f.write(f"BALANCE: {balance_str}\n")
-            f.write("="*60 + "\n")
+            f.write(line + "\n")
+
+def format_found_block(chain, privhex, address, balance_str):
+    border = "=" * 60
+    return "\n".join([
+        border,
+        f"CHAIN: {chain}",
+        f"PRIVATE_KEY: {privhex}",
+        f"ADDRESS: {address}",
+        f"BALANCE: {balance_str}",
+        border
+    ])
 
 SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
-# ---------------- Ethereum/BSC Generators ----------------
+# ----- Counters / indexes for various generators -----
 sequential_counter_eth = 0
 repetitive_patterns = [b'a', b'b', b'c', b'd', b'e', b'f', b'1', b'2', b'3', b'4']
 repetitive_index_eth = 0
+repetitive_index_solana = 0
+
 MIXED_PATTERNS = b'abcdefghijklmnopqrstuvwxyz0123456789'
 mixed_index_eth = 0
-GENERATOR_MODES = ['repetitive', 'sequential', 'mixed']  # user-overridable
-mode_index_eth = 0
+mixed_index_solana = 0
 
+GENERATOR_MODES = ['repetitive', 'sequential', 'mixed']
+mode_index_eth = 0
+mode_index_solana = 0
+
+# ----- GENERATORS -----
 def gen_repetitive_eth():
     global repetitive_index_eth
     letter = repetitive_patterns[repetitive_index_eth % len(repetitive_patterns)]
     repetitive_index_eth += 1
+    return letter * 32
+
+def gen_repetitive_solana():
+    global repetitive_index_solana
+    letter = repetitive_patterns[repetitive_index_solana % len(repetitive_patterns)]
+    repetitive_index_solana += 1
     return letter * 32
 
 def gen_sequential_numeric_eth():
@@ -108,6 +120,15 @@ def gen_mixed_sequence_eth():
     mixed_index_eth += 1
     return bytes(key)
 
+def gen_mixed_sequence_solana():
+    global mixed_index_solana
+    seed = bytearray(32)
+    for i in range(32):
+        seed[i] = MIXED_PATTERNS[(mixed_index_solana + i) % len(MIXED_PATTERNS)]
+    mixed_index_solana += 1
+    return bytes(seed)
+
+# ----- WRAPPERS -----
 def gen_eth_privkey_bytes():
     global mode_index_eth
     mode = GENERATOR_MODES[mode_index_eth % len(GENERATOR_MODES)]
@@ -121,31 +142,30 @@ def gen_eth_privkey_bytes():
     else:
         return gen_sequential_numeric_eth()
 
-# ---------------- Simplified deterministic Solana generator ----------------
-hashed_index_solana = 0
-DEFAULT_SOLANA_SALT = b"scanner-salt-v1"  
+def gen_solana_keypair():
+    global mode_index_solana
+    mode = GENERATOR_MODES[mode_index_solana % len(GENERATOR_MODES)]
+    mode_index_solana += 1
+    if mode == 'sequential':
+        mode = 'repetitive'
 
-def gen_hashed_solana_seed(salt: bytes):
-    """Return a 32-byte deterministic SHA256(salt || counter) seed."""
-    global hashed_index_solana
-    counter_bytes = hashed_index_solana.to_bytes(8, "big")
-    hashed_index_solana += 1
-    h = hashlib.sha256()
-    h.update(salt)
-    h.update(counter_bytes)
-    return h.digest()
+    if mode == 'repetitive':
+        seed = gen_repetitive_solana()
+    elif mode == 'mixed':
+        seed = gen_mixed_sequence_solana()
+    else:
+        seed = gen_repetitive_solana()
 
-def gen_solana_keypair_direct(salt: bytes):
-    """Generate seed + address in one deterministic step."""
-    seed = gen_hashed_solana_seed(salt)
+    if ed25519_mod is None:
+        raise RuntimeError("ed25519 module not available — please install it with: pip install ed25519")
+
     sk = ed25519_mod.SigningKey(seed)
     vk = sk.get_verifying_key()
-    pub_bytes = vk.to_bytes() if hasattr(vk, "to_bytes") else bytes(vk)
-    address = base58.b58encode(pub_bytes).decode()
-    full_sk_bytes = seed + pub_bytes  # 64 bytes, wallet-importable
-    return full_sk_bytes.hex(), address
+    pub_raw = vk.to_bytes() if hasattr(vk, "to_bytes") else bytes(vk)
+    address = base58.b58encode(pub_raw).decode()
+    return seed, address
 
-# ---------------- Address derivation ----------------
+# ----- Address derivation -----
 def eth_priv_to_address(priv_bytes: bytes) -> str:
     pk = coincurve.PrivateKey(priv_bytes)
     pub_uncompressed = pk.public_key.format(compressed=False)
@@ -156,7 +176,7 @@ def eth_priv_to_address(priv_bytes: bytes) -> str:
 def bsc_priv_to_address(priv_bytes: bytes) -> str:
     return eth_priv_to_address(priv_bytes)
 
-# ---------------- RPC helpers ----------------
+# ----- RPC helpers -----
 async def rpc_post_with_retries(url: str, json_payload: dict, session: aiohttp.ClientSession, debug: bool=False, max_attempts: int=3):
     last_exc = None
     for attempt in range(1, max_attempts + 1):
@@ -193,7 +213,7 @@ async def solana_get_balance(rpc_url: str, address: str, session: aiohttp.Client
         raise RuntimeError("No value in RPC result")
     return int(result["value"])
 
-# ---------------- Workers ----------------
+# ----- Workers -----
 async def worker_eth_async(chain_name, rpc_url, debug=False):
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -203,8 +223,6 @@ async def worker_eth_async(chain_name, rpc_url, debug=False):
                 privhex = priv.hex()
                 key_repr = f"{chain_name}:{privhex}"
                 if key_repr in in_memory_tried:
-                    if debug:
-                        print(f"[{chain_name}] duplicate key, skipping {privhex}")
                     await asyncio.sleep(0.02)
                     continue
                 append_tried(key_repr)
@@ -221,7 +239,9 @@ async def worker_eth_async(chain_name, rpc_url, debug=False):
                 if bal_wei and bal_wei > 0:
                     bal_eth = bal_wei / 10**18
                     bal_str = f"{bal_eth:.18f} (wei={bal_wei})"
-                    append_found_line_by_line(chain_name, privhex, address, bal_str)
+                    out = format_found_block(chain_name, privhex, address, bal_str)
+                    print(out)
+                    append_found(f"{chain_name} | {privhex} | {address} | {bal_str}")
                 await asyncio.sleep(0.02)
             except Exception:
                 await asyncio.sleep(0.05)
@@ -229,23 +249,26 @@ async def worker_eth_async(chain_name, rpc_url, debug=False):
 async def worker_bsc_async(chain_name, rpc_url, debug=False):
     await worker_eth_async(chain_name, rpc_url, debug=debug)
 
-async def worker_solana_async(chain_name, rpc_url, salt_bytes, debug=False):
+async def worker_solana_async(chain_name, rpc_url, debug=False):
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while not stop_event.is_set():
             try:
-                full_privhex, address = gen_solana_keypair_direct(salt_bytes)
-                key_repr = f"{chain_name}:{full_privhex}"
-                if key_repr in in_memory_tried:
+                try:
+                    seed, address = gen_solana_keypair()
+                except RuntimeError as e:
                     if debug:
-                        print(f"[{chain_name}] duplicate seed, skipping {full_privhex[:16]}...")
+                        print(f"[{chain_name}][error] {e}")
+                    await asyncio.sleep(1.0)
+                    continue
+                privhex = seed.hex()
+                key_repr = f"{chain_name}:{privhex}"
+                if key_repr in in_memory_tried:
                     await asyncio.sleep(0.02)
                     continue
                 append_tried(key_repr)
-
                 if debug:
-                    print(f"[{chain_name}] trying priv={full_privhex[:16]}... -> addr={address}")
-
+                    print(f"[{chain_name}] trying seed={privhex} -> addr={address}")
                 try:
                     lamports = await solana_get_balance(rpc_url, address, session, debug=debug)
                 except Exception as rpc_e:
@@ -253,15 +276,15 @@ async def worker_solana_async(chain_name, rpc_url, salt_bytes, debug=False):
                         print(f"[{chain_name}][rpc error] {rpc_e}")
                     await asyncio.sleep(0.2)
                     continue
-
                 if lamports and lamports > 0:
                     sol_str = f"{lamports} lamports ({lamports / 1e9:.9f} SOL)"
-                    append_found_line_by_line(chain_name, full_privhex, address, sol_str)
+                    out = format_found_block(chain_name, privhex, address, sol_str)
+                    print(out)
+                    append_found(f"{chain_name} | {privhex} | {address} | {sol_str}")
                 await asyncio.sleep(0.02)
             except Exception:
                 await asyncio.sleep(0.05)
 
-# ---------------- Runner ----------------
 def run_async_worker(coro_func, *args, **kwargs):
     try:
         asyncio.run(coro_func(*args, **kwargs))
@@ -271,13 +294,15 @@ def run_async_worker(coro_func, *args, **kwargs):
 def main():
     parser = ArgumentParser()
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
-    parser.add_argument("--solana-salt", type=str, default=DEFAULT_SOLANA_SALT.decode(),
-                        help="Salt used for deterministic hashed Solana seeds (default: 'scanner-salt-v1')")
+    parser.add_argument("--modes", nargs="+", choices=['repetitive','sequential','mixed'], help="Override generator modes and order (space-separated)")
     args = parser.parse_args()
     debug = args.debug
-    salt_bytes = args.solana_salt.encode()
 
-    print(f"[info] Starting scanner. Debug={debug}. Solana-salt={args.solana_salt}. Press Ctrl+C to stop.")
+    if args.modes:
+        global GENERATOR_MODES
+        GENERATOR_MODES = args.modes
+
+    print(f"[info] Starting scanner. Debug={debug}. Modes={GENERATOR_MODES}. Press Ctrl+C to stop.")
 
     open(TRIED_FILE, "a").close()
     open(FOUND_FILE, "a").close()
@@ -286,7 +311,7 @@ def main():
         futures = []
         futures.append(ex.submit(run_async_worker, worker_eth_async, "ethereum", ETH_RPC, debug))
         futures.append(ex.submit(run_async_worker, worker_bsc_async, "bsc", BSC_RPC, debug))
-        futures.append(ex.submit(run_async_worker, worker_solana_async, "solana", SOL_RPC, salt_bytes, debug))
+        futures.append(ex.submit(run_async_worker, worker_solana_async, "solana", SOL_RPC, debug))
         try:
             while not stop_event.is_set():
                 time.sleep(0.5)
