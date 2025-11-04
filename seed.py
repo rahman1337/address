@@ -41,7 +41,6 @@ SEED_FILE = "seed.txt"
 
 LIGHT_GREEN="\033[92m"
 RESET_COLOR="\033[0m"
-HARDENED = 0x80000000
 GENERATOR_MODES = ['repetitive','sequential','mixed']
 
 # ---------------- STATE ----------------
@@ -104,7 +103,7 @@ def mnemonic_to_seed(mnemonic: str) -> bytes:
 
 # ---------------- KEY DERIVATIONS ----------------
 def valid_secp256k1_privkey(seed_bytes: bytes) -> bytes:
-    n = coincurve.PrivateKey().public_key.curve.order
+    n = coincurve.PrivateKey().public_key.format().curve.order if hasattr(coincurve.PrivateKey().public_key,"curve") else 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
     key_int=int.from_bytes(seed_bytes,"big")%(n-1)+1
     return int_to_bytes_padded(key_int,32)
 
@@ -214,13 +213,16 @@ def main():
         ex.submit(run_async_worker,worker_chain,"polygon",POLYGON_RPC,debug)
         ex.submit(run_async_worker,worker_chain,"solana",SOL_RPC,debug)
         ex.submit(run_async_worker,worker_chain,"sui",SUI_RPC,debug)
-        ex.submit(run_async_worker,worker_chain,"bitcoin",None,debug)
+        ex.submit(run_async_worker,worker_chain,"bitcoin","",debug)
+
         try:
             while not stop_event.is_set(): time.sleep(0.5)
         except KeyboardInterrupt:
+            print("\n[info] Ctrl+C detected, shutting down...")
             stop_event.set()
             time.sleep(0.2)
-    print("[info] Scanner stopped.")
+
+    print("[info] Scanner stopped. Goodbye.")
 
 if __name__=="__main__":
     main()
