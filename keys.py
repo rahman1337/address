@@ -36,7 +36,7 @@ except Exception as e:
     raise
 
 # Files
-TRIED_FILE = "tried.txt"
+TRIED_FILE = "tried_keys.txt"
 FOUND_FILE = "found.txt"
 
 # Concurrency & locks
