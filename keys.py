@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""
+Multi-chain scanner (ethereum, bsc, solana)
+- Default: 6 threads (2 threads per chain)
+- Normal mode: prints found balances and errors
+- Debug mode (-d): prints everything (generated keys, RPC attempts/responses, tracebacks)
+- Retries: exact backoff 1s,2s,3s for RPC POSTs (3 attempts)
+- Solana private keys: Base58-encoded 64-byte secret (seed||pubkey)
+"""
 import os
 import sys
 import time
@@ -8,7 +16,7 @@ import asyncio
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 
-# networking / crypto libs
+# dependencies (must be installed)
 try:
     import aiohttp
 except Exception as e:
@@ -84,12 +92,12 @@ def append_found(line: str):
         with open(FOUND_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
-def format_found_block(chain, privhex, address, balance_str):
+def format_found_block(chain, privrepr, address, balance_str):
     border = "=" * 60
     return "\n".join([
         border,
         f"CHAIN: {chain}",
-        f"PRIVATE_KEY: {privhex}",
+        f"PRIVATE_KEY: {privrepr}",
         f"ADDRESS: {address}",
         f"BALANCE: {LIGHT_GREEN}{balance_str}{RESET_COLOR}",
         border
@@ -107,14 +115,51 @@ def eth_priv_to_address(priv_bytes: bytes) -> str:
     addr_bytes = keccak(pub_raw)[-20:]
     return "0x" + addr_bytes.hex()  # lowercase, 0x-prefixed
 
-def gen_solana_seed():
-    """Return 32 random bytes for ed25519 seed."""
-    return os.urandom(32)
-
-def solana_seed_to_address(seed: bytes) -> str:
+# ---------- Solana: produce Base58 64-byte secret (seed||pub) ----------
+def gen_solana_privkey_base58():
+    """
+    Generate a valid Solana private key string:
+      - 32 random seed bytes
+      - ed25519 SigningKey from that seed
+      - secret_64 = seed || pubkey (64 bytes)
+      - return base58(secret_64) and pub_raw bytes
+    """
+    seed = os.urandom(32)
     sk = ed25519.SigningKey(seed)
+    try:
+        # Some ed25519 libs expose to_bytes() for seed; otherwise fallback to original seed
+        priv_seed_bytes = sk.to_bytes()
+        # if to_bytes returns 32 bytes, good; else fallback
+        if not (isinstance(priv_seed_bytes, (bytes, bytearray)) and len(priv_seed_bytes) == 32):
+            priv_seed_bytes = seed
+    except Exception:
+        priv_seed_bytes = seed
     vk = sk.get_verifying_key()
     pub_raw = vk.to_bytes() if hasattr(vk, "to_bytes") else bytes(vk)
+    secret_64 = priv_seed_bytes + pub_raw  # 64 bytes
+    priv_b58 = base58.b58encode(secret_64).decode()
+    return priv_b58, pub_raw
+
+def solana_privbase58_to_address(priv_b58_or_pubraw):
+    """
+    Accept either a base58-encoded 64-byte secret or raw pub bytes and return base58 address.
+    If passed base58 secret, decode and extract pubkey (last 32 bytes).
+    """
+    if isinstance(priv_b58_or_pubraw, str):
+        try:
+            decoded = base58.b58decode(priv_b58_or_pubraw)
+            if len(decoded) >= 64:
+                pub_raw = decoded[-32:]
+            elif len(decoded) == 32:
+                pub_raw = decoded
+            else:
+                # fall back: treat as base58 pub string
+                pub_raw = decoded
+        except Exception:
+            # If decoding fails, treat input as already-base58 pub string and return it
+            return priv_b58_or_pubraw
+    else:
+        pub_raw = priv_b58_or_pubraw
     return base58.b58encode(pub_raw).decode()
 
 # ---------- RPC with retries and exact backoff ----------
@@ -163,7 +208,6 @@ async def solana_get_balance(rpc_url, address, session, debug: bool=False):
     j = await rpc_post_with_retries(rpc_url, payload, session, debug)
     if isinstance(j, dict) and "error" in j:
         raise RuntimeError(f"RPC error: {j['error']}")
-    # Structure: {"jsonrpc":"2.0","result":{"context":{...},"value":<lamports>},"id":1}
     if isinstance(j, dict):
         return int(j.get("result", {}).get("value", 0))
     return 0
@@ -179,21 +223,21 @@ async def worker_generic_ethlike(chain_name: str, rpc_url: str, debug: bool=Fals
         while not stop_event.is_set():
             try:
                 priv = gen_eth_privkey_bytes()
-                privhex = "0x" + priv.hex()
-                key_repr = f"{chain_name}:{privhex}"
+                privrepr = "0x" + priv.hex()
+                key_repr = f"{chain_name}:{privrepr}"
 
                 # Record tried atomically (with lock)
                 was_new = append_tried_atomic(key_repr)
                 if not was_new:
                     if debug:
-                        print(f"[debug] Skipping already-tried key: {privhex} on {chain_name}")
+                        print(f"[debug] Skipping already-tried key: {privrepr} on {chain_name}")
                     await asyncio.sleep(0.01)
                     continue
 
                 address = eth_priv_to_address(priv)
                 if debug:
                     generated += 1
-                    print(f"[debug][{chain_name}][gen #{generated}] priv={privhex} address={address}")
+                    print(f"[debug][{chain_name}][gen #{generated}] priv={privrepr} address={address}")
 
                 try:
                     bal_wei = await eth_like_get_balance(rpc_url, address, session, debug)
@@ -207,9 +251,9 @@ async def worker_generic_ethlike(chain_name: str, rpc_url: str, debug: bool=Fals
                 if bal_wei and bal_wei > 0:
                     bal_eth = bal_wei / 10**18
                     bal_str = f"{bal_eth:.18f} {chain_name.upper()} (wei={bal_wei})"
-                    out = format_found_block(chain_name, privhex, address, bal_str)
+                    out = format_found_block(chain_name, privrepr, address, bal_str)
                     print(out)
-                    append_found(f"{chain_name} | {privhex} | {address} | {bal_str}")
+                    append_found(f"{chain_name} | {privrepr} | {address} | {bal_str}")
 
                 await asyncio.sleep(0.005)
             except Exception as e:
@@ -220,28 +264,27 @@ async def worker_generic_ethlike(chain_name: str, rpc_url: str, debug: bool=Fals
 
 async def worker_solana(chain_name: str, rpc_url: str, debug: bool=False):
     """
-    Worker for Solana chain.
+    Worker for Solana chain using Base58 private keys (seed+pub) and base58 addresses.
     """
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         generated = 0
         while not stop_event.is_set():
             try:
-                seed = gen_solana_seed()
-                privhex = seed.hex()  # seed hex (no 0x)
-                key_repr = f"{chain_name}:{privhex}"
+                priv_b58, pub_raw = gen_solana_privkey_base58()
+                key_repr = f"{chain_name}:{priv_b58}"
 
                 was_new = append_tried_atomic(key_repr)
                 if not was_new:
                     if debug:
-                        print(f"[debug] Skipping already-tried solana seed: {privhex}")
+                        print(f"[debug] Skipping already-tried solana priv: {priv_b58}")
                     await asyncio.sleep(0.01)
                     continue
 
-                address = solana_seed_to_address(seed)
+                address = base58.b58encode(pub_raw).decode()
                 if debug:
                     generated += 1
-                    print(f"[debug][{chain_name}][gen #{generated}] seed={privhex} address={address}")
+                    print(f"[debug][{chain_name}][gen #{generated}] priv={priv_b58} address={address}")
 
                 try:
                     lamports = await solana_get_balance(rpc_url, address, session, debug)
@@ -254,9 +297,9 @@ async def worker_solana(chain_name: str, rpc_url: str, debug: bool=False):
 
                 if lamports and lamports > 0:
                     sol_str = f"{lamports} lamports ({lamports / 1e9:.9f} SOL)"
-                    out = format_found_block(chain_name, privhex, address, sol_str)
+                    out = format_found_block(chain_name, priv_b58, address, sol_str)
                     print(out)
-                    append_found(f"{chain_name} | {privhex} | {address} | {sol_str}")
+                    append_found(f"{chain_name} | {priv_b58} | {address} | {sol_str}")
 
                 await asyncio.sleep(0.005)
             except Exception as e:
