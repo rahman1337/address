@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""
+Ethereum sequential key scanner
+- 5 threads (ThreadPoolExecutor)
+- Retries with backoff: 1s, 2s, 3s
+- Resumable (resume.txt)
+- Normal mode: only found (>0) + errors
+- Debug mode (-d): prints all + stats
+- Batching: process multiple keys per worker (BATCH_SIZE)
+"""
+
 import requests
 import time
 import threading
@@ -18,6 +28,7 @@ getcontext().prec = 40
 BASE_HEX = "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"
 RPC_URL = "https://ethereum.publicnode.com"
 THREADS = 5
+BATCH_SIZE = 100
 RETRY_SLEEP = [1, 2, 3]  # seconds between retries
 
 colorama_init(autoreset=True)
@@ -38,7 +49,7 @@ def signal_handler(sig, frame):
     global running
     running = False
     with print_lock:
-        print("\nSignal received. stopping scanner... (waiting for threads to finish)")
+        print("\nSignal received — stopping scanner... (waiting for threads to finish)")
 
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -118,33 +129,62 @@ def load_resume():
         return 1
 
 
-def worker(priv_int, idx, debug=False):
+def worker(start_priv_int, start_idx, debug=False, batch_size=1):
     """
-    Worker runs in a thread: derive address, query balance with retries,
+    Worker runs in a thread: process a batch of keys starting from start_priv_int
+    (which corresponds to start_idx). For each key: derive address, query balance,
     print according to mode, and persist found blocks.
+    start_priv_int is the integer private key for start_idx (base_int - start_idx).
+    The loop decrements from start_priv_int for subsequent keys.
     """
     global total_tried
-    priv_hex, addr = derive_address(priv_int)
+    # Reuse a single session per worker for the whole batch
     try:
         with requests.Session() as s:
-            bal = rpc_get_balance_with_retries(s, addr, debug)
+            for i in range(batch_size):
+                # check for graceful shutdown opportunity
+                if not running:
+                    if debug:
+                        with print_lock:
+                            print(f"[DEBUG] Worker received shutdown signal, ending batch early (start_idx={start_idx}, i={i})")
+                    break
+
+                priv_int = start_priv_int - i
+                idx = start_idx + i
+                if priv_int <= 0:
+                    # no more valid keys
+                    if debug:
+                        with print_lock:
+                            print(f"[DEBUG] Reached priv_int <= 0 at idx={idx}, stopping batch.")
+                    break
+
+                priv_hex, addr = derive_address(priv_int)
+                try:
+                    bal = rpc_get_balance_with_retries(s, addr, debug)
+                except Exception as e:
+                    with print_lock:
+                        print(f"[ERROR] idx={idx} addr={addr} {e}")
+                    # continue with next key in batch
+                    with counter_lock:
+                        total_tried += 1
+                    continue
+
+                with counter_lock:
+                    total_tried += 1
+
+                if debug:
+                    with print_lock:
+                        print(f"[DEBUG] idx={idx} addr={addr} balance={bal}")
+
+                if bal > 0:
+                    block = format_found(idx, priv_hex, addr, bal)
+                    with print_lock:
+                        print(block)
+                    append_found(block)
     except Exception as e:
+        # If the session setup itself or other unexpected error occurs, log it.
         with print_lock:
-            print(f"[ERROR] idx={idx} addr={addr} {e}")
-        return None
-
-    with counter_lock:
-        total_tried += 1
-
-    if debug:
-        with print_lock:
-            print(f"[DEBUG] idx={idx} addr={addr} balance={bal}")
-
-    if bal > 0:
-        block = format_found(idx, priv_hex, addr, bal)
-        with print_lock:
-            print(block)
-        append_found(block)
+            print(f"[ERROR] batch start_idx={start_idx} unexpected error: {e}")
     return None
 
 
@@ -180,6 +220,7 @@ def main(base_hex, debug=False):
 
     with print_lock:
         print(f"Starting scanner with {THREADS} threads. Debug={debug}")
+        print(f"Batch size: {BATCH_SIZE} keys per task.")
         print("Press Ctrl+C to stop.\n")
 
     try:
@@ -188,14 +229,24 @@ def main(base_hex, debug=False):
                 futures = []
                 # feed exactly THREADS tasks so the pool stays busy
                 for _ in range(THREADS):
-                    priv_int = base_int - offset
-                    if priv_int <= 0:
+                    start_priv_int = base_int - offset
+                    if start_priv_int <= 0:
                         with print_lock:
                             print("Reached end of key range.")
                         running = False
                         break
-                    futures.append(exe.submit(worker, priv_int, offset, debug))
-                    offset += 1
+
+                    # compute how many keys this batch can actually process (avoid priv_int <= 0)
+                    max_possible = start_priv_int  # number of positive private keys remaining
+                    actual_batch = BATCH_SIZE if max_possible >= BATCH_SIZE else int(max_possible)
+                    if actual_batch <= 0:
+                        with print_lock:
+                            print("Reached end of key range.")
+                        running = False
+                        break
+
+                    futures.append(exe.submit(worker, start_priv_int, offset, debug, actual_batch))
+                    offset += actual_batch
 
                 # wait for this set to finish (keeps steady number of concurrent tasks)
                 for _ in as_completed(futures):
