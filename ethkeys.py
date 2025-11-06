@@ -206,11 +206,11 @@ async def worker_task(priv_int: int, idx: int, session: aiohttp.ClientSession, s
     Derives address, queries balance (with retries), appends tried line, returns found tuple if balance > 0.
     """
     global total_tried
+
     # derive (sync, fast)
     try:
         priv_hex, address = derive_address_from_priv_int(priv_int)
     except Exception as e:
-        # shouldn't happen, but log and skip
         if debug:
             print(f"[DEBUG] idx={idx} derive error: {e}")
         return None
@@ -220,13 +220,9 @@ async def worker_task(priv_int: int, idx: int, session: aiohttp.ClientSession, s
         try:
             balance_eth = await eth_get_balance_with_retries(session, address, debug=debug)
         except Exception as e:
-            # append tried line and increase counters
+            # append tried line and count even if failed
             await append_tried_line(idx, priv_hex, address)
             async with total_tried_lock:
-                nonlocal_total = globals()
-            # safely increment global counter in async
-            async with total_tried_lock:
-                global total_tried
                 total_tried += 1
             if debug:
                 print(f"[DEBUG] idx={idx} address={address} error after retries: {e}")
@@ -237,7 +233,6 @@ async def worker_task(priv_int: int, idx: int, session: aiohttp.ClientSession, s
     # append tried line and increment
     await append_tried_line(idx, priv_hex, address)
     async with total_tried_lock:
-        global total_tried
         total_tried += 1
 
     if balance_eth > 0:
