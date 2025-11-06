@@ -1,50 +1,40 @@
 #!/usr/bin/env python3
-"""
-Fast Ethereum key scanner with coincurve + threading + resume.
-- 5 threads (ThreadPoolExecutor)
-- Saves resume.txt (last index)
-- Prints and saves ALL balances (even zero)
-- Uses coincurve + keccak for address derivation
-- Writes only found.txt (for any checked key)
-"""
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from coincurve import PrivateKey
-from eth_utils import keccak, to_checksum_address
-from decimal import Decimal, getcontext
-from colorama import Fore, Style, init as colorama_init
-from datetime import datetime
 import requests
-import threading
 import time
-import os
-import argparse
+import threading
 import signal
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from decimal import Decimal, getcontext
+from colorama import init as colorama_init, Fore, Style
+from eth_utils import keccak, to_checksum_address
+from coincurve import PrivateKey
+from datetime import datetime
+import argparse
 
+# precision for Decimal
 getcontext().prec = 40
-colorama_init(autoreset=True)
 
+BASE_HEX = "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"
 RPC_URL = "https://ethereum.publicnode.com"
 THREADS = 5
-BATCH_SIZE = 20
-SLEEP_BETWEEN_BATCHES = 0.1
-RETRY_SLEEP = [1, 2, 3]
-BASE_HEX = "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"
-RESUME_FILE = "resume.txt"
-FOUND_FILE = "found.txt"
+RETRY_SLEEP = [1, 2, 3]  # seconds between retries
 
-file_lock = threading.Lock()
+colorama_init(autoreset=True)
+
+# globals
+running = True
 counter_lock = threading.Lock()
 print_lock = threading.Lock()
-running = True
+file_lock = threading.Lock()
 total_tried = 0
 
 
 def signal_handler(sig, frame):
     global running
-    print("\nStopping scanner...")
     running = False
+    with print_lock:
+        print("\nStopping scanner... bye")
     sys.exit(0)
 
 
@@ -52,146 +42,168 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 
-def wei_hex_to_eth(wei_hex: str) -> Decimal:
+def wei_hex_to_eth(wei_hex):
     return Decimal(int(wei_hex, 16)) / Decimal(10**18)
 
 
-def derive_address(priv_int: int):
+def derive_address(priv_int):
     priv_bytes = priv_int.to_bytes(32, "big")
-    pub = PrivateKey(priv_bytes).public_key.format(compressed=False)[1:]
-    address = to_checksum_address("0x" + keccak(pub)[-20:].hex())
-    priv_hex = f"0x{priv_int:064x}"
-    return priv_hex, address
+    pubkey = PrivateKey(priv_bytes).public_key.format(compressed=False)[1:]
+    addr = to_checksum_address(keccak(pubkey)[-20:])
+    return f"0x{priv_int:064x}", addr
 
 
-def eth_get_balance_with_retries(session: requests.Session, address: str, debug=False) -> Decimal:
+def rpc_get_balance_with_retries(session, address, debug=False):
     payload = {
         "jsonrpc": "2.0",
         "method": "eth_getBalance",
         "params": [address, "latest"],
         "id": 1,
     }
-    for attempt, sleep_time in enumerate([0] + RETRY_SLEEP):
+    last_exc = None
+    for attempt, delay in enumerate([0] + RETRY_SLEEP, start=1):
         try:
             resp = session.post(RPC_URL, json=payload, timeout=10)
             resp.raise_for_status()
             j = resp.json()
             if "result" not in j:
-                raise ValueError(f"Bad RPC response: {j}")
+                raise RuntimeError(f"Invalid RPC response: {j}")
             return wei_hex_to_eth(j["result"])
         except Exception as e:
+            last_exc = e
             if debug:
-                print(f"[DEBUG] RPC retry {attempt+1} for {address}: {e}")
-            time.sleep(sleep_time)
-    raise Exception("RPC failed after retries")
+                with print_lock:
+                    print(f"[DEBUG] RPC attempt {attempt} for {address} failed: {e}")
+            if attempt < len(RETRY_SLEEP) + 1:
+                time.sleep(delay)
+    raise last_exc
 
 
-def format_block(idx: int, priv_hex: str, address: str, balance: Decimal):
-    bal_str = f"{balance:.18f}"  # full precision, no threshold
-    border = "+" + "-" * 60 + "+"
-    block = (
-        f"{border}\n"
-        f"| Index  : {idx}\n"
-        f"| Priv   : {priv_hex}\n"
-        f"| Address: {address}\n"
-        f"| Balance: {bal_str} ETH\n"
-        f"{border}\n"
-    )
+def format_found(idx, priv_hex, address, bal):
+    bal_str = f"{bal:.18f}"
+    color = Fore.GREEN
+    border = "+" + "-" * 70 + "+"
+    lines = [
+        f"| Index  : {idx}",
+        f"| Priv   : {priv_hex}",
+        f"| Address: {address}",
+        f"| Balance: {color}{bal_str} ETH{Style.RESET_ALL}",
+    ]
+    block = "\n".join([border] + lines + [border])
     return block
 
 
-def save_resume(idx: int):
-    with open(RESUME_FILE, "w") as f:
-        f.write(str(idx))
-
-
-def load_resume() -> int:
-    if os.path.exists(RESUME_FILE):
-        try:
-            with open(RESUME_FILE) as f:
-                return int(f.read().strip())
-        except ValueError:
-            return 1
-    return 1
-
-
-def append_found_block(block: str):
+def append_found(block):
     with file_lock:
-        with open(FOUND_FILE, "a") as f:
-            f.write(block)
+        with open("found.txt", "a") as f:
+            f.write(block + "\n")
 
 
-def worker_task(priv_int: int, idx: int, debug: bool):
-    global total_tried
+def save_resume(offset):
+    with file_lock:
+        with open("resume.txt", "w") as f:
+            f.write(str(offset))
+
+
+def load_resume():
     try:
-        priv_hex, address = derive_address(priv_int)
-        with requests.Session() as session:
-            balance = eth_get_balance_with_retries(session, address, debug)
-        block = format_block(idx, priv_hex, address, balance)
-        with print_lock:
-            print(block, end="")
-        append_found_block(block)
+        with open("resume.txt") as f:
+            return int(f.read().strip())
+    except:
+        return 1
+
+
+def worker(priv_int, idx, debug=False):
+    global total_tried
+    priv_hex, addr = derive_address(priv_int)
+    try:
+        with requests.Session() as s:
+            bal = rpc_get_balance_with_retries(s, addr, debug)
     except Exception as e:
-        if debug:
-            with print_lock:
-                print(f"[DEBUG] idx={idx} error: {e}")
+        with print_lock:
+            print(f"[ERROR] idx={idx} addr={addr} {e}")
+        return None
+
     with counter_lock:
         total_tried += 1
 
+    if debug:
+        with print_lock:
+            print(f"[DEBUG] idx={idx} addr={addr} balance={bal}")
 
-def stats_monitor(debug: bool, stop_event: threading.Event):
-    last = 0
-    last_time = time.time()
+    if bal > 0:
+        block = format_found(idx, priv_hex, addr, bal)
+        with print_lock:
+            print(block)
+        append_found(block)
+    return None
+
+
+def stats_monitor(start_time, debug_flag, stop_event):
+    last_count = 0
+    last_time = start_time
     while not stop_event.is_set():
         time.sleep(10)
-        if not debug:
+        if not debug_flag:
             continue
         now = time.time()
         with counter_lock:
             curr = total_tried
-        rate = (curr - last) / (now - last_time)
-        print(Fore.GREEN + f"[STATS] {rate:.2f} keys/s (total {curr})" + Style.RESET_ALL)
-        last, last_time = curr, now
+        delta = curr - last_count
+        dt = now - last_time
+        kps = delta / dt if dt > 0 else 0
+        with print_lock:
+            print(Fore.GREEN + f"[STATS] {kps:.2f} keys/s (total: {curr})" + Style.RESET_ALL)
+        last_count = curr
+        last_time = now
 
 
-def main_loop(base_hex: str, start_offset: int, batch_size: int, debug: bool):
+def main(base_hex, debug=False):
     base_int = int(base_hex, 16)
-    offset = start_offset
+    offset = load_resume()
     stop_event = threading.Event()
-    threading.Thread(target=stats_monitor, args=(debug, stop_event), daemon=True).start()
 
-    print(f"Starting scanner from offset {offset}, threads={THREADS}, batch={batch_size}")
-    while running:
-        items = []
-        for i in range(batch_size):
-            priv_int = base_int - (offset + i)
-            if priv_int <= 0:
-                print("Reached end of range.")
-                stop_event.set()
-                return
-            items.append((priv_int, offset + i))
+    monitor_thread = threading.Thread(
+        target=stats_monitor, args=(time.time(), debug, stop_event), daemon=True
+    )
+    monitor_thread.start()
 
+    with print_lock:
+        print(f"Starting scanner with {THREADS} threads. Debug={debug}")
+        print("Press Ctrl+C to stop.\n")
+
+    try:
         with ThreadPoolExecutor(max_workers=THREADS) as exe:
-            futures = [exe.submit(worker_task, priv, idx, debug) for priv, idx in items]
-            for _ in as_completed(futures):
-                pass
+            while running:
+                futures = []
+                for _ in range(THREADS):
+                    priv_int = base_int - offset
+                    if priv_int <= 0:
+                        with print_lock:
+                            print("Reached end of key range.")
+                        running = False
+                        break
+                    futures.append(exe.submit(worker, priv_int, offset, debug))
+                    offset += 1
 
-        offset += batch_size
+                for _ in as_completed(futures):
+                    pass
+
+                save_resume(offset)
+                time.sleep(0.1)
+    finally:
+        stop_event.set()
+        monitor_thread.join(timeout=1)
         save_resume(offset)
-        time.sleep(SLEEP_BETWEEN_BATCHES)
-
-    stop_event.set()
-    print("Scanner stopped.")
+        with print_lock:
+            print("Scanner stopped.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fast Ethereum key scanner")
-    parser.add_argument("-d", "--debug", action="store_true", help="enable debug mode")
-    parser.add_argument("--batch", type=int, default=BATCH_SIZE, help="batch size per cycle")
+    parser = argparse.ArgumentParser(description="Ethereum key scanner (5-thread continuous)")
+    parser.add_argument("-d", "--debug", action="store_true", help="Enable debug mode")
     args = parser.parse_args()
-
-    start_offset = load_resume()
     try:
-        main_loop(BASE_HEX, start_offset, args.batch, debug=args.debug)
+        main(BASE_HEX, debug=args.debug)
     except KeyboardInterrupt:
-        print("\nStopped by user.")
+        print("\nInterrupted by user, exiting.")
