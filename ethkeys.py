@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""
-Ethereum sequential key scanner
-- 5 threads (ThreadPoolExecutor)
-- Retries with backoff: 1s, 2s, 3s
-- Resumable (resume.txt)
-- Normal mode: only found (>0) + errors
-- Debug mode (-d): prints all + stats
-"""
-
 import requests
 import time
 import threading
@@ -47,7 +38,7 @@ def signal_handler(sig, frame):
     global running
     running = False
     with print_lock:
-        print("\nSignal received — stopping scanner... (waiting for threads to finish)")
+        print("\nSignal received. stopping scanner... (waiting for threads to finish)")
 
 
 signal.signal(signal.SIGINT, signal_handler)
