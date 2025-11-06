@@ -1,40 +1,55 @@
 #!/usr/bin/env python3
 """
-Fast async Ethereum key scanner (resumable).
-- Uses coincurve + eth_utils.keccak for key derivation
-- aiohttp async RPC requests
-- 5 concurrent workers
-- Retries with backoff
-- Saves resume.txt (last scanned index)
-- Writes only found addresses to found.txt
-- Debug mode (-d) prints progress + keys/s
+Fast Ethereum key scanner with coincurve + threading + resume.
+- 5 threads (ThreadPoolExecutor)
+- Saves resume.txt (last index)
+- Prints and saves ALL balances (even zero)
+- Uses coincurve + keccak for address derivation
+- Writes only found.txt (for any checked key)
 """
 
-import asyncio
-import aiohttp
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from coincurve import PrivateKey
+from eth_utils import keccak, to_checksum_address
 from decimal import Decimal, getcontext
 from colorama import Fore, Style, init as colorama_init
-from eth_utils import keccak, to_checksum_address
-from coincurve import PrivateKey
-import argparse
+from datetime import datetime
+import requests
+import threading
+import time
 import os
+import argparse
+import signal
+import sys
 
 getcontext().prec = 40
 colorama_init(autoreset=True)
 
 RPC_URL = "https://ethereum.publicnode.com"
 THREADS = 5
-BATCH_SIZE = 10
+BATCH_SIZE = 20
 SLEEP_BETWEEN_BATCHES = 0.2
-THRESHOLD_ETH = Decimal("0.0000001")
 RETRY_SLEEP = [1, 2, 3]
 BASE_HEX = "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"
 RESUME_FILE = "resume.txt"
 FOUND_FILE = "found.txt"
 
+file_lock = threading.Lock()
+counter_lock = threading.Lock()
+print_lock = threading.Lock()
+running = True
 total_tried = 0
-total_tried_lock = asyncio.Lock()
+
+
+def signal_handler(sig, frame):
+    global running
+    print("\nStopping scanner...")
+    running = False
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 
 def wei_hex_to_eth(wei_hex: str) -> Decimal:
@@ -49,7 +64,7 @@ def derive_address(priv_int: int):
     return priv_hex, address
 
 
-async def eth_get_balance(session: aiohttp.ClientSession, address: str, debug: bool):
+def eth_get_balance_with_retries(session: requests.Session, address: str, debug=False) -> Decimal:
     payload = {
         "jsonrpc": "2.0",
         "method": "eth_getBalance",
@@ -58,46 +73,31 @@ async def eth_get_balance(session: aiohttp.ClientSession, address: str, debug: b
     }
     for attempt, sleep_time in enumerate([0] + RETRY_SLEEP):
         try:
-            async with session.post(RPC_URL, json=payload, timeout=10) as resp:
-                r = await resp.json()
-                if "result" not in r:
-                    raise Exception(f"Invalid RPC response: {r}")
-                return wei_hex_to_eth(r["result"])
+            resp = session.post(RPC_URL, json=payload, timeout=10)
+            resp.raise_for_status()
+            j = resp.json()
+            if "result" not in j:
+                raise ValueError(f"Bad RPC response: {j}")
+            return wei_hex_to_eth(j["result"])
         except Exception as e:
             if debug:
-                print(f"[DEBUG] Retry {attempt + 1} for {address}: {e}")
-            await asyncio.sleep(sleep_time)
+                print(f"[DEBUG] RPC retry {attempt+1} for {address}: {e}")
+            time.sleep(sleep_time)
     raise Exception("RPC failed after retries")
 
 
-def format_found(idx: int, priv_hex: str, address: str, balance: Decimal):
-    bal_str = f"{balance:.8f}"
-    color = Fore.GREEN if balance > 0 else ""
+def format_block(idx: int, priv_hex: str, address: str, balance: Decimal):
+    bal_str = f"{balance:.18f}"  # full precision, no threshold
     border = "+" + "-" * 60 + "+"
     block = (
         f"{border}\n"
         f"| Index  : {idx}\n"
         f"| Priv   : {priv_hex}\n"
         f"| Address: {address}\n"
-        f"| Balance: {color}{bal_str} ETH{Style.RESET_ALL}\n"
+        f"| Balance: {bal_str} ETH\n"
         f"{border}\n"
     )
     return block
-
-
-def save_found(block: str):
-    with open(FOUND_FILE, "a") as f:
-        f.write(block)
-
-
-def load_resume() -> int:
-    if os.path.exists(RESUME_FILE):
-        with open(RESUME_FILE) as f:
-            try:
-                return int(f.read().strip())
-            except ValueError:
-                return 1
-    return 1
 
 
 def save_resume(idx: int):
@@ -105,79 +105,93 @@ def save_resume(idx: int):
         f.write(str(idx))
 
 
-async def worker(priv_int: int, idx: int, session: aiohttp.ClientSession, sem: asyncio.Semaphore, debug: bool):
-    global total_tried
-    priv_hex, address = derive_address(priv_int)
-
-    async with sem:
+def load_resume() -> int:
+    if os.path.exists(RESUME_FILE):
         try:
-            balance = await eth_get_balance(session, address, debug)
-        except Exception as e:
-            if debug:
-                print(f"[DEBUG] {idx} {address} failed: {e}")
-            return None
+            with open(RESUME_FILE) as f:
+                return int(f.read().strip())
+        except ValueError:
+            return 1
+    return 1
 
-    async with total_tried_lock:
+
+def append_found_block(block: str):
+    with file_lock:
+        with open(FOUND_FILE, "a") as f:
+            f.write(block)
+
+
+def worker_task(priv_int: int, idx: int, debug: bool):
+    global total_tried
+    try:
+        priv_hex, address = derive_address(priv_int)
+        with requests.Session() as session:
+            balance = eth_get_balance_with_retries(session, address, debug)
+        block = format_block(idx, priv_hex, address, balance)
+        with print_lock:
+            print(block, end="")
+        append_found_block(block)
+    except Exception as e:
+        if debug:
+            with print_lock:
+                print(f"[DEBUG] idx={idx} error: {e}")
+    with counter_lock:
         total_tried += 1
 
-    if balance > 0:
-        block = format_found(idx, priv_hex, address, balance)
-        print(block)
-        save_found(block)
-    elif debug:
-        print(f"[DEBUG] idx={idx} balance=0")
 
-    return None
-
-
-async def stats_monitor(start_time: float, debug: bool, stop_event: asyncio.Event):
+def stats_monitor(debug: bool, stop_event: threading.Event):
     last = 0
-    last_t = start_time
+    last_time = time.time()
     while not stop_event.is_set():
-        await asyncio.sleep(10)
+        time.sleep(10)
         if not debug:
             continue
         now = time.time()
-        async with total_tried_lock:
+        with counter_lock:
             curr = total_tried
-        rate = (curr - last) / (now - last_t)
+        rate = (curr - last) / (now - last_time)
         print(Fore.GREEN + f"[STATS] {rate:.2f} keys/s (total {curr})" + Style.RESET_ALL)
-        last, last_t = curr, now
+        last, last_time = curr, now
 
 
-async def main_loop(base_hex: str, start_idx: int, debug: bool):
+def main_loop(base_hex: str, start_offset: int, batch_size: int, debug: bool):
     base_int = int(base_hex, 16)
-    sem = asyncio.Semaphore(THREADS)
-    stop_event = asyncio.Event()
-    asyncio.create_task(stats_monitor(time.time(), debug, stop_event))
+    offset = start_offset
+    stop_event = threading.Event()
+    threading.Thread(target=stats_monitor, args=(debug, stop_event), daemon=True).start()
 
-    offset = start_idx
-    print(f"Starting from offset {offset}, threads={THREADS}, batch={BATCH_SIZE}")
+    print(f"Starting scanner from offset {offset}, threads={THREADS}, batch={batch_size}")
+    while running:
+        items = []
+        for i in range(batch_size):
+            priv_int = base_int - (offset + i)
+            if priv_int <= 0:
+                print("Reached end of range.")
+                stop_event.set()
+                return
+            items.append((priv_int, offset + i))
 
-    async with aiohttp.ClientSession() as session:
-        while True:
-            tasks = []
-            for i in range(BATCH_SIZE):
-                priv_int = base_int - (offset + i)
-                if priv_int <= 0:
-                    print("Reached end of key range.")
-                    stop_event.set()
-                    return
-                tasks.append(worker(priv_int, offset + i, session, sem, debug))
+        with ThreadPoolExecutor(max_workers=THREADS) as exe:
+            futures = [exe.submit(worker_task, priv, idx, debug) for priv, idx in items]
+            for _ in as_completed(futures):
+                pass
 
-            await asyncio.gather(*tasks)
-            offset += BATCH_SIZE
-            save_resume(offset)
-            await asyncio.sleep(SLEEP_BETWEEN_BATCHES)
+        offset += batch_size
+        save_resume(offset)
+        time.sleep(SLEEP_BETWEEN_BATCHES)
+
+    stop_event.set()
+    print("Scanner stopped.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Async Ethereum key scanner")
-    parser.add_argument("-d", "--debug", action="store_true", help="debug mode")
+    parser = argparse.ArgumentParser(description="Fast Ethereum key scanner")
+    parser.add_argument("-d", "--debug", action="store_true", help="enable debug mode")
+    parser.add_argument("--batch", type=int, default=BATCH_SIZE, help="batch size per cycle")
     args = parser.parse_args()
 
-    start_idx = load_resume()
+    start_offset = load_resume()
     try:
-        asyncio.run(main_loop(BASE_HEX, start_idx, debug=args.debug))
+        main_loop(BASE_HEX, start_offset, args.batch, debug=args.debug)
     except KeyboardInterrupt:
         print("\nStopped by user.")
