@@ -15,7 +15,7 @@ from decimal import Decimal
 
 # ---- config ----
 RPC_URL = "https://ethereum.publicnode.com"
-NUM_THREADS = 3
+NUM_THREADS = 10
 RPC_TIMEOUT = 10  # seconds for HTTP requests
 TRIED_FILE = "triedeth.txt"
 FOUND_FILE = "found.txt"
@@ -269,7 +269,7 @@ def main():
                 with total_counter["lock"]:
                     elapsed = time.time() - start_time
                     rate = total_counter["count"] / elapsed if elapsed > 0 else 0
-                    print(f"[STATS] {elapsed:.1f}s elapsed | {total_counter['count']} total keys | {rate:.1f} keys/sec")
+                    print(f"\n\n\n\n[STATS] {elapsed:.1f}s elapsed | {total_counter['count']} total keys | {rate:.1f} keys/sec\n\n\n\n")
         threading.Thread(target=stats_loop, daemon=True).start()
 
     # start worker threads
