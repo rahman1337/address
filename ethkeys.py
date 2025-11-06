@@ -15,7 +15,7 @@ from decimal import Decimal
 
 # ---- config ----
 RPC_URL = "https://ethereum.publicnode.com"
-NUM_THREADS = 10
+NUM_THREADS = 5
 RPC_TIMEOUT = 10  # seconds for HTTP requests
 TRIED_FILE = "triedeth.txt"
 FOUND_FILE = "found.txt"
