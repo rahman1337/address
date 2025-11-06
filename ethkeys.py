@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""
+Ethereum sequential key scanner
+- 5 threads (ThreadPoolExecutor)
+- Retries with backoff: 1s, 2s, 3s
+- Resumable (resume.txt)
+- Normal mode: only found (>0) + errors
+- Debug mode (-d): prints all + stats
+"""
+
 import requests
 import time
 import threading
@@ -31,11 +40,14 @@ total_tried = 0
 
 
 def signal_handler(sig, frame):
+    """
+    On signal, set running=False so main loop can exit cleanly.
+    Do NOT call sys.exit here; allow graceful shutdown.
+    """
     global running
     running = False
     with print_lock:
-        print("\nStopping scanner... bye")
-    sys.exit(0)
+        print("\nSignal received — stopping scanner... (waiting for threads to finish)")
 
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -61,6 +73,7 @@ def rpc_get_balance_with_retries(session, address, debug=False):
         "id": 1,
     }
     last_exc = None
+    # attempts: initial (delay 0) + retries with delays in RETRY_SLEEP
     for attempt, delay in enumerate([0] + RETRY_SLEEP, start=1):
         try:
             resp = session.post(RPC_URL, json=payload, timeout=10)
@@ -74,6 +87,7 @@ def rpc_get_balance_with_retries(session, address, debug=False):
             if debug:
                 with print_lock:
                     print(f"[DEBUG] RPC attempt {attempt} for {address} failed: {e}")
+            # only sleep if we will retry
             if attempt < len(RETRY_SLEEP) + 1:
                 time.sleep(delay)
     raise last_exc
@@ -109,11 +123,15 @@ def load_resume():
     try:
         with open("resume.txt") as f:
             return int(f.read().strip())
-    except:
+    except Exception:
         return 1
 
 
 def worker(priv_int, idx, debug=False):
+    """
+    Worker runs in a thread: derive address, query balance with retries,
+    print according to mode, and persist found blocks.
+    """
     global total_tried
     priv_hex, addr = derive_address(priv_int)
     try:
@@ -159,6 +177,7 @@ def stats_monitor(start_time, debug_flag, stop_event):
 
 
 def main(base_hex, debug=False):
+    global running  # IMPORTANT: assign to the module-level flag
     base_int = int(base_hex, 16)
     offset = load_resume()
     stop_event = threading.Event()
@@ -176,6 +195,7 @@ def main(base_hex, debug=False):
         with ThreadPoolExecutor(max_workers=THREADS) as exe:
             while running:
                 futures = []
+                # feed exactly THREADS tasks so the pool stays busy
                 for _ in range(THREADS):
                     priv_int = base_int - offset
                     if priv_int <= 0:
@@ -186,11 +206,15 @@ def main(base_hex, debug=False):
                     futures.append(exe.submit(worker, priv_int, offset, debug))
                     offset += 1
 
+                # wait for this set to finish (keeps steady number of concurrent tasks)
                 for _ in as_completed(futures):
+                    # we don't need results, worker printed/persisted as needed
                     pass
 
+                # persist progress frequently
                 save_resume(offset)
-                time.sleep(0.1)
+                # tiny sleep so signal handler can run promptly
+                time.sleep(0.05)
     finally:
         stop_event.set()
         monitor_thread.join(timeout=1)
@@ -206,4 +230,5 @@ if __name__ == "__main__":
     try:
         main(BASE_HEX, debug=args.debug)
     except KeyboardInterrupt:
+        # signal handler should handle graceful stop; catch double Ctrl+C here
         print("\nInterrupted by user, exiting.")
