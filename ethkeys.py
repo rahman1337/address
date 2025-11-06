@@ -1,310 +1,388 @@
 #!/usr/bin/env python3
-import argparse
-import os
-import json
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
-import concurrent.futures
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from coincurve import PrivateKey
-from sha3 import keccak_256
-from decimal import Decimal
+"""
+Async Ethereum key scanner using aiohttp and coincurve for fast derivation.
 
-# ---- config ----
+- Uses coincurve + eth_utils.keccak for pubkey -> address
+- Uses asyncio + aiohttp for non-blocking RPC requests
+- Keeps concurrency to 5 simultaneous workers via asyncio.Semaphore
+- Appends every tried key to triedeth.txt so the run can resume
+- Appends found blocks (non-colored) to found.txt
+- Debug mode (-d) prints every progress line and every 10s prints keys/s
+"""
+
+import asyncio
+import argparse
+import sys
+import signal
+import os
+import re
+from datetime import datetime
+from decimal import Decimal, getcontext
+from colorama import init as colorama_init, Fore, Style
+from typing import Optional, Tuple, List
+
+# cryptography & utils
+try:
+    import coincurve
+    from eth_utils import keccak, to_checksum_address
+except Exception as e:
+    print("ERROR: coincurve and eth_utils are required. Install with: pip install coincurve eth-utils")
+    raise
+
+import aiohttp
+import aiohttp.client_exceptions
+
+# precision for Decimal
+getcontext().prec = 40
+
+# ---- Config ----
+BASE_HEX = "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"
 RPC_URL = "https://ethereum.publicnode.com"
-NUM_THREADS = 5
-RPC_TIMEOUT = 10  # seconds for HTTP requests
+CONCURRENCY = 5  # keep 5 "threads" worth of concurrency
+BATCH_SIZE = 20   # smaller default batch (you can change via --batch)
+SLEEP_BETWEEN_BATCHES = 1.0
+THRESHOLD_ETH = Decimal("0.0000001")
+RETRY_SLEEP = [1, 2, 3]  # backoff sequence (seconds)
 TRIED_FILE = "triedeth.txt"
 FOUND_FILE = "found.txt"
+STATS_INTERVAL = 10.0  # seconds for debug stats print
+TIMEOUT = 10  # seconds for RPC call timeout
+# -----------------
 
-# secp256k1 curve order (decimal)
-SECP256K1_ORDER = int("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
+colorama_init(autoreset=True)
 
-# ---- shutdown event ----
-_stop_event = threading.Event()
+# locks for synchronous file writing (we'll run file IO in threadpool to avoid blocking)
+# use a simple asyncio-compatible wrapper via asyncio.to_thread
+_file_lock = asyncio.Lock()
 
-# ---- thread-safe printing ----
-_print_lock = threading.Lock()
-def safe_print(*args, **kwargs):
-    with _print_lock:
-        print(*args, **kwargs, flush=True)
+# regex to strip ANSI for width computations
+_ansi_re = re.compile(r'\x1b\[[0-9;]*m')
 
-# ---- tried file handling ----
-_tried_lock = threading.Lock()
-_tried_set = set()
-def load_tried():
+# global counters
+total_tried = 0
+total_tried_lock = asyncio.Lock()
+
+# shutdown flag
+shutdown_flag = False
+
+
+def strip_ansi(s: str) -> str:
+    return _ansi_re.sub('', s)
+
+
+def derive_address_from_priv_int(priv_int: int) -> Tuple[str, str]:
+    """
+    Fast derivation using coincurve + keccak. Returns (priv_hex, checksum_address).
+    """
+    priv_bytes = priv_int.to_bytes(32, byteorder="big")
+    pk = coincurve.PrivateKey(priv_bytes)
+    pub_uncompressed = pk.public_key.format(compressed=False)  # 65 bytes, 0x04 prefix
+    pub_no_prefix = pub_uncompressed[1:]
+    addr_bytes = keccak(pub_no_prefix)[-20:]
+    address = to_checksum_address("0x" + addr_bytes.hex())
+    priv_hex = f"0x{priv_int:064x}"
+    return priv_hex, address
+
+
+def format_found_block(idx: int, priv_hex: str, address: str, balance_eth: Decimal) -> Tuple[str, str]:
+    bal_str = f"{balance_eth.normalize():f}"
+    color = Fore.GREEN if balance_eth >= THRESHOLD_ETH else Fore.RED
+    lines = [
+        f"Index  : {idx}",
+        f"Priv   : {priv_hex}",
+        f"Address: {address}",
+        f"Balance: {bal_str} ETH"
+    ]
+    width = max(len(strip_ansi(l)) for l in lines) + 2
+    border = "+" + "-" * width + "+"
+    # file block (no color)
+    file_block = "\n".join([
+        border,
+        "| " + f"Index  : {idx}".ljust(width - 2) + " |",
+        "| " + f"Priv   : {priv_hex}".ljust(width - 2) + " |",
+        "| " + f"Address: {address}".ljust(width - 2) + " |",
+        "| " + f"Balance: {bal_str} ETH".ljust(width - 2) + " |",
+        border
+    ]) + "\n"
+    # console block (colored balance)
+    printable_lines = [
+        border,
+        "| " + f"Index  : {idx}".ljust(width - 2) + " |",
+        "| " + f"Priv   : {priv_hex}".ljust(width - 2) + " |",
+        "| " + f"Address: {address}".ljust(width - 2) + " |",
+        "| " + f"Balance: {color}{bal_str} ETH{Style.RESET_ALL}".ljust(width - 2 + len(color) + len(Style.RESET_ALL)) + " |",
+        border
+    ]
+    console_block = "\n".join(printable_lines) + "\n"
+    return console_block, file_block
+
+
+async def append_tried_line(idx: int, priv_hex: str, address: str):
+    line = f"{idx},{priv_hex},{address},{datetime.utcnow().isoformat()}Z\n"
+    async with _file_lock:
+        # do actual write in a thread so we don't block event loop for disk IO
+        await asyncio.to_thread(_append_to_file, TRIED_FILE, line)
+
+
+async def append_found_block(file_block: str):
+    async with _file_lock:
+        await asyncio.to_thread(_append_to_file, FOUND_FILE, file_block)
+
+
+def _append_to_file(filename: str, text: str):
+    # helper running in threadpool (sync)
+    with open(filename, "a", encoding="utf-8") as f:
+        f.write(text)
+
+
+def read_resume_offset_from_triedfile() -> int:
+    """
+    Reads TRIED_FILE synchronously and returns next start offset (max idx + 1).
+    If file doesn't exist or empty, returns 1.
+    This runs at startup (sync is fine).
+    """
     if not os.path.exists(TRIED_FILE):
-        open(TRIED_FILE, "a").close()
-        return
+        return 1
+    max_idx = 0
     try:
-        with open(TRIED_FILE, "r") as f:
+        with open(TRIED_FILE, "r", encoding="utf-8") as f:
             for line in f:
-                s = line.strip()
-                if not s:
+                line = line.strip()
+                if not line:
                     continue
-                if s.startswith("0x") or s.startswith("0X"):
-                    s = s[2:]
-                _tried_set.add(s.lower())
-    except Exception as e:
-        safe_print(f"[WARN] could not load {TRIED_FILE}: {e}")
-
-def append_tried(priv_hex):
-    """Append private key (hex without 0x) to triedeth.txt and memory set. Returns True if added."""
-    priv_hex = priv_hex.lower()
-    with _tried_lock:
-        if priv_hex in _tried_set:
-            return False
-        try:
-            with open(TRIED_FILE, "a") as f:
-                f.write("0x" + priv_hex + "\n")
-            _tried_set.add(priv_hex)
-            return True
-        except Exception as e:
-            safe_print(f"[WARN] could not write to {TRIED_FILE}: {e}")
-            # still add to in-memory set to avoid immediate retry
-            _tried_set.add(priv_hex)
-            return True
-
-# ---- crypto (coincurve) ----
-def generate_private_key():
-    """Generate a secure 32-byte private key that is valid for secp256k1."""
-    while not _stop_event.is_set():
-        priv = os.urandom(32)
-        priv_int = int.from_bytes(priv, "big")
-        if 1 <= priv_int < SECP256K1_ORDER:
-            return priv
-    raise KeyboardInterrupt  # if stopping
-
-def private_key_to_public_key(priv_bytes):
-    """
-    Return uncompressed public key bytes (65 bytes: 0x04 || X || Y) using coincurve.
-    """
-    pk = PrivateKey(priv_bytes)
-    pub = pk.public_key.format(compressed=False)  # 65 bytes, starts with 0x04
-    return pub
-
-# ---- address derivation ----
-def public_key_to_address_lower(pub_bytes):
-    """Return lowercase 40-char hex address (no 0x)."""
-    assert pub_bytes[0] == 0x04
-    k = keccak_256()
-    k.update(pub_bytes[1:])
-    digest = k.digest()
-    return digest[-20:].hex()
-
-def to_checksum_address(address_hex):
-    """EIP-55 checksum; input: 40-char hex (case-insensitive), returns 0x-prefixed mixed-case."""
-    addr = address_hex.lower()
-    k = keccak_256()
-    k.update(addr.encode('ascii'))
-    hash_hex = k.hexdigest()
-    out = []
-    for i, c in enumerate(addr):
-        if c in '0123456789':
-            out.append(c)
-        else:
-            out.append(c.upper() if int(hash_hex[i], 16) >= 8 else c)
-    return "0x" + "".join(out)
-
-# ---- HTTP session helper (persistent connections) ----
-def make_session():
-    s = requests.Session()
-    adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=Retry(total=1, backoff_factor=0.1))
-    s.mount("https://", adapter)
-    s.headers.update({"Content-Type": "application/json"})
-    return s
-
-def rpc_eth_getBalance_session(session, address_hex_with_0x):
-    """Use requests.Session to POST JSON-RPC and return integer wei."""
-    payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [address_hex_with_0x, "latest"], "id": 1}
-    try:
-        resp = session.post(RPC_URL, json=payload, timeout=RPC_TIMEOUT)
-        resp.raise_for_status()
-        js = resp.json()
-        if "error" in js:
-            raise RuntimeError(f"RPC error: {js['error']}")
-        result = js.get("result")
-        if result is None:
-            raise RuntimeError("No result in RPC response")
-        return int(result, 16)
-    except requests.exceptions.HTTPError as e:
-        raise RuntimeError(f"HTTPError: {e}")
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"RequestException: {e}")
+                parts = line.split(",")
+                try:
+                    idx = int(parts[0])
+                    if idx > max_idx:
+                        max_idx = idx
+                except Exception:
+                    continue
     except Exception:
-        raise
+        return 1
+    return max_idx + 1
 
-# ---- formatting / files for found ----
-def wei_to_eth_str(wei_int):
-    eth = Decimal(wei_int) / Decimal(10**18)
-    return format(eth.normalize(), 'f')
 
-def append_found_block_to_file(priv_hex, addr_lower_0x, addr_checksum, balance_wei, balance_eth_str):
-    block_lines = []
-    block_lines.append("FOUND -->")
-    block_lines.append(f"  Private key (hex): 0x{priv_hex}")
-    block_lines.append(f"  Address (lowercase): {addr_lower_0x}")
-    block_lines.append(f"  Address (EIP-55) :    {addr_checksum}")
-    block_lines.append(f"  Balance (wei):     {balance_wei}")
-    block_lines.append(f"  Balance (ETH):     {balance_eth_str}")
-    block_lines.append("-" * 60)
-    try:
-        with open(FOUND_FILE, "a") as f:
-            for ln in block_lines:
-                f.write(ln + "\n")
-    except Exception as e:
-        safe_print(f"[WARN] could not write to {FOUND_FILE}: {e}")
+def wei_hex_to_decimal_eth(wei_hex: str) -> Decimal:
+    wei_int = int(wei_hex, 16)
+    return Decimal(wei_int) / Decimal(10**18)
 
-# ---- worker loop ----
-def worker_loop(worker_id, debug=False, total_counter=None):
+
+async def eth_get_balance_with_retries(session: aiohttp.ClientSession, address: str, debug: bool=False) -> Decimal:
     """
-    Each worker uses its own persistent HTTP session and fast coincurve crypto.
-    Exits quickly when _stop_event is set.
+    Async eth_getBalance with retry/backoff. Uses aiohttp session.
     """
-    session = make_session()
-    tries = 0
-    while not _stop_event.is_set():
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_getBalance",
+        "params": [address, "latest"],
+        "id": 1,
+    }
+    attempt = 0
+    last_exc = None
+    max_attempts = 1 + len(RETRY_SLEEP)
+    while attempt < max_attempts and not shutdown_flag:
         try:
-            # generate unique private key not in tried set
-            while not _stop_event.is_set():
-                priv = generate_private_key()
-                priv_hex = priv.hex()
-                with _tried_lock:
-                    already = priv_hex in _tried_set
-                if already:
-                    continue
-                append_tried(priv_hex)
-                break
-            if _stop_event.is_set():
-                break
-
-            pub = private_key_to_public_key(priv)
-            addr_hex = public_key_to_address_lower(pub)
-            addr_lower_0x = "0x" + addr_hex
-            addr_checksum = to_checksum_address(addr_hex)
-
-            tries += 1
-            if debug:
-                safe_print(f"[worker {worker_id}] try #{tries} priv=0x{priv_hex} addr_lower={addr_lower_0x} addr_checksum={addr_checksum} ... checking")
-
-            # RPC call via persistent session
-            try:
-                balance_wei = rpc_eth_getBalance_session(session, addr_checksum)
-            except Exception as e:
-                safe_print(f"[ERROR] worker={worker_id} addr={addr_checksum} rpc_error={e}")
-                # count attempt even on error
-                if total_counter is not None:
-                    with total_counter["lock"]:
-                        total_counter["count"] += 1
-                # quick responsive sleep that breaks early on shutdown
-                for _ in range(5):
-                    if _stop_event.is_set():
-                        break
-                    time.sleep(0.1)
-                continue
-
-            if debug:
-                safe_print(f"[worker {worker_id}] {addr_checksum} balance_wei={balance_wei}")
-
-            if total_counter is not None:
-                with total_counter["lock"]:
-                    total_counter["count"] += 1
-
-            if balance_wei and balance_wei > 0:
-                balance_eth_str = wei_to_eth_str(balance_wei)
-                safe_print("FOUND -->")
-                safe_print(f"  Private key (hex): 0x{priv_hex}")
-                safe_print(f"  Address (lowercase): {addr_lower_0x}")
-                safe_print(f"  Address (EIP-55) :    {addr_checksum}")
-                safe_print(f"  Balance (wei):     {balance_wei}")
-                safe_print(f"  Balance (ETH):     {balance_eth_str}")
-                safe_print("-" * 60)
-                append_found_block_to_file(priv_hex, addr_lower_0x, addr_checksum, balance_wei, balance_eth_str)
-
-            # brief throttle split into small sleeps so shutdown is responsive
-            for _ in range(10):  # total ~0.01s
-                if _stop_event.is_set():
-                    break
-                time.sleep(0.001)
-
-        except KeyboardInterrupt:
-            break
+            async with session.post(RPC_URL, json=payload, timeout=TIMEOUT) as resp:
+                text = await resp.text()
+                resp.raise_for_status()
+                j = await resp.json()
+                if "result" not in j:
+                    raise RuntimeError(f"Invalid RPC response: {j} (text={text})")
+                return wei_hex_to_decimal_eth(j["result"])
         except Exception as e:
-            if _stop_event.is_set():
+            last_exc = e
+            attempt += 1
+            if debug:
+                print(f"[DEBUG] RPC attempt {attempt}/{max_attempts} for {address} failed: {e}")
+            if attempt >= max_attempts or shutdown_flag:
                 break
-            safe_print(f"[ERROR] worker={worker_id} unexpected error: {e}")
-            for _ in range(4):
-                if _stop_event.is_set():
-                    break
-                time.sleep(0.05)
-    if debug:
-        safe_print(f"[worker {worker_id}] exiting")
+            sleep_time = RETRY_SLEEP[attempt - 1] if (attempt - 1) < len(RETRY_SLEEP) else RETRY_SLEEP[-1]
+            await asyncio.sleep(sleep_time)
+    raise last_exc
 
-# ---- main ----
+
+async def worker_task(priv_int: int, idx: int, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, debug: bool):
+    """
+    Derives address, queries balance (with retries), appends tried line, returns found tuple if balance > 0.
+    """
+    global total_tried
+    # derive (sync, fast)
+    try:
+        priv_hex, address = derive_address_from_priv_int(priv_int)
+    except Exception as e:
+        # shouldn't happen, but log and skip
+        if debug:
+            print(f"[DEBUG] idx={idx} derive error: {e}")
+        return None
+
+    async with semaphore:
+        # perform RPC with retries
+        try:
+            balance_eth = await eth_get_balance_with_retries(session, address, debug=debug)
+        except Exception as e:
+            # append tried line and increase counters
+            await append_tried_line(idx, priv_hex, address)
+            async with total_tried_lock:
+                nonlocal_total = globals()
+            # safely increment global counter in async
+            async with total_tried_lock:
+                global total_tried
+                total_tried += 1
+            if debug:
+                print(f"[DEBUG] idx={idx} address={address} error after retries: {e}")
+            else:
+                print(f"[ERROR] idx={idx} address={address} error: {e}")
+            return None
+
+    # append tried line and increment
+    await append_tried_line(idx, priv_hex, address)
+    async with total_tried_lock:
+        global total_tried
+        total_tried += 1
+
+    if balance_eth > 0:
+        return (idx, priv_hex, address, balance_eth)
+    else:
+        if debug:
+            print(f"[DEBUG] idx={idx} address={address} balance=0")
+        return None
+
+
+async def stats_printer(debug: bool, stop_event: asyncio.Event):
+    """
+    Every STATS_INTERVAL seconds, if debug enabled, print keys/sec averaged over interval.
+    """
+    last_count = 0
+    last_time = asyncio.get_event_loop().time()
+    while not stop_event.is_set():
+        await asyncio.sleep(STATS_INTERVAL)
+        if not debug:
+            continue
+        now = asyncio.get_event_loop().time()
+        async with total_tried_lock:
+            curr = total_tried
+        delta = curr - last_count
+        dt = now - last_time
+        kps = delta / dt if dt > 0 else 0.0
+        print(Fore.GREEN + f"[STATS] {kps:.2f} keys/s over last {dt:.1f}s (total tried: {curr})" + Style.RESET_ALL)
+        last_count = curr
+        last_time = now
+
+
+def generate_priv_ints_for_batch(base_int: int, start_offset: int, count: int):
+    """
+    Yield (priv_int, idx) pairs for offsets start_offset .. start_offset+count-1
+    priv_int = base_int - idx
+    """
+    for i in range(count):
+        idx = start_offset + i
+        priv_int = base_int - idx
+        if priv_int <= 0:
+            break
+        yield priv_int, idx
+
+
+async def main_async(base_hex: str, start_offset: int = 1, batch_size: int = BATCH_SIZE, debug: bool = False, resume: bool = True):
+    global shutdown_flag, total_tried
+
+    base_int = int(base_hex, 16)
+    if resume:
+        resumed = read_resume_offset_from_triedfile()
+        if resumed > start_offset:
+            print(f"Resuming from tried file: setting start_offset {start_offset} -> {resumed}")
+            start_offset = resumed
+
+    offset = start_offset
+
+    # aiohttp session reused for all requests
+    connector = aiohttp.TCPConnector(limit=0)  # no limit here; concurrency controlled by our semaphore
+    async with aiohttp.ClientSession(connector=connector) as session:
+        semaphore = asyncio.Semaphore(CONCURRENCY)
+        stop_event = asyncio.Event()
+        stats_task = asyncio.create_task(stats_printer(debug, stop_event))
+
+        print(f"Starting async scanner against {RPC_URL} with concurrency={CONCURRENCY}, batch_size={batch_size}, debug={debug}")
+        print("Press Ctrl+C to stop.")
+        try:
+            while not shutdown_flag:
+                items = list(generate_priv_ints_for_batch(base_int, offset, batch_size))
+                if not items:
+                    print("Reached zero or no more positive private keys. Stopping.")
+                    break
+
+                # spawn tasks for this batch
+                tasks = [
+                    asyncio.create_task(worker_task(priv_int, idx, session, semaphore, debug))
+                    for (priv_int, idx) in items
+                ]
+
+                # as tasks complete, handle results
+                for coro in asyncio.as_completed(tasks):
+                    try:
+                        result = await coro
+                        if result:
+                            idx, priv_hex, address, balance_eth = result
+                            console_block, file_block = format_found_block(idx, priv_hex, address, balance_eth)
+                            # print console block
+                            print(console_block, end="", flush=True)
+                            # persist file block (run in thread)
+                            await append_found_block(file_block)
+                    except Exception as e:
+                        if debug:
+                            print(f"[DEBUG] Unexpected worker exception: {e}")
+                        else:
+                            print(f"[ERROR] Unexpected worker exception: {e}")
+
+                offset += batch_size
+                if shutdown_flag:
+                    break
+                await asyncio.sleep(SLEEP_BETWEEN_BATCHES)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            stop_event.set()
+            await asyncio.sleep(0)  # allow stats_task to notice
+            if not stats_task.done():
+                stats_task.cancel()
+                try:
+                    await stats_task
+                except asyncio.CancelledError:
+                    pass
+
+    print("Scanner stopped.")
+
+
+def handle_sigint():
+    global shutdown_flag
+    shutdown_flag = True
+    print("\nStopping scanner... (signal caught)")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Ethereum key scanner (multi-threaded).")
-    parser.add_argument("--debug", "-d", action="store_true", help="print all scanning progress (verbose)")
-    parser.add_argument("--threads", "-t", type=int, default=NUM_THREADS, help="number of threads (default 3)")
+    parser = argparse.ArgumentParser(description="Async Ethereum key scanner (coincurve + aiohttp)")
+    parser.add_argument("-d", "--debug", action="store_true", help="enable debug mode (very verbose + keys/s)")
+    parser.add_argument("--batch", type=int, default=BATCH_SIZE, help="batch size per loop")
+    parser.add_argument("--start-offset", type=int, default=1, help="start offset (1 => base-1)")
+    parser.add_argument("--no-resume", dest="no_resume", action="store_true", help="do not read triedeth.txt to resume")
     args = parser.parse_args()
 
-    # load tried keys
-    load_tried()
-
-    safe_print(f"Starting eth_scanner with {args.threads} threads. RPC: {RPC_URL}")
-    if args.debug:
-        safe_print("Debug mode: ON (printing all progress).")
-    else:
-        safe_print("Normal mode: ON (printing only found balances and errors).")
-
-    # performance counter (debug only)
-    total_counter = {"count": 0, "lock": threading.Lock()}
-    start_time = time.time()
-    if args.debug:
-        def stats_loop():
-            while not _stop_event.is_set():
-                time.sleep(10)
-                with total_counter["lock"]:
-                    elapsed = time.time() - start_time
-                    rate = total_counter["count"] / elapsed if elapsed > 0 else 0
-                    print(f"\n\n\n\n[STATS] {elapsed:.1f}s elapsed | {total_counter['count']} total keys | {rate:.1f} keys/sec\n\n\n\n")
-        threading.Thread(target=stats_loop, daemon=True).start()
-
-    # start worker threads
-    futures = []
-    with ThreadPoolExecutor(max_workers=args.threads) as exe:
+    # setup shutdown handlers
+    loop = asyncio.get_event_loop()
+    for signame in ('SIGINT', 'SIGTERM'):
         try:
-            for i in range(args.threads):
-                futures.append(exe.submit(worker_loop, i+1, args.debug, total_counter))
-            # main waits; Ctrl+C handled here
-            while not _stop_event.is_set():
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            safe_print("KeyboardInterrupt received, signalling workers to stop...")
-            _stop_event.set()
-        finally:
-            # attempt graceful shutdown
-            try:
-                # stop accepting new tasks
-                exe.shutdown(wait=False)
-            except Exception:
-                pass
-            # wait briefly for threads to exit
-            deadline = time.time() + 5.0
-            while any(not f.done() for f in futures) and time.time() < deadline:
-                time.sleep(0.1)
-            # final wait (best-effort)
-            try:
-                exe.shutdown(wait=True, timeout=2)
-            except TypeError:
-                # older Python might not support timeout param
-                try:
-                    exe.shutdown(wait=True)
-                except Exception:
-                    pass
-            safe_print("Shutdown complete.")
+            loop.add_signal_handler(getattr(signal, signame), handle_sigint)
+        except NotImplementedError:
+            # Windows: fallback to signal.signal
+            signal.signal(getattr(signal, signame), lambda s, f: handle_sigint())
+
+    try:
+        asyncio.run(main_async(BASE_HEX, start_offset=args.start_offset, batch_size=args.batch, debug=args.debug, resume=(not args.no_resume)))
+    except KeyboardInterrupt:
+        print("\nInterrupted by user, exiting.")
+    except Exception as e:
+        print(f"[FATAL] {e}")
+        raise
+
 
 if __name__ == "__main__":
     main()
