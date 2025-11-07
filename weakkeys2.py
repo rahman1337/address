@@ -44,13 +44,13 @@ if os.path.exists(TRIED_FILE):
     except Exception as e:
         print(f"[warn] Could not load {TRIED_FILE}: {e}", file=sys.stderr)
 
-def append_tried_batch(batch_keys):
+def append_tried(key_repr: str):
     with scanned_lock:
-        new_keys = [k for k in batch_keys if k not in in_memory_tried]
-        if new_keys:
-            with open(TRIED_FILE, "a", encoding="utf-8") as f:
-                f.write("\n".join(new_keys) + "\n")
-            in_memory_tried.update(new_keys)
+        if key_repr in in_memory_tried:
+            return
+        with open(TRIED_FILE, "a", encoding="utf-8") as f:
+            f.write(key_repr + "\n")
+        in_memory_tried.add(key_repr)
 
 def append_found(line: str):
     with found_lock:
@@ -144,45 +144,42 @@ async def eth_get_balance(rpc_url: str, address: str, session: aiohttp.ClientSes
         raise RuntimeError("No result field in RPC response")
     return int(result, 16)
 
-# ----- Ethereum worker with optimized async batch -----
+# ----- Ethereum worker with batching -----
 async def worker_eth_async(worker_id, rpc_url, debug=False, batch_size=100):
     chain_name = f"ethereum-{worker_id}"
-    timeout = aiohttp.ClientTimeout(total=60)
+    timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while not stop_event.is_set():
             try:
                 batch = []
-                batch_keys_repr = set()
-                # generate batch and avoid duplicates in-memory
+                # generate 100 keys per batch
                 for _ in range(batch_size):
                     priv = gen_eth_privkey_bytes()
                     privhex = priv.hex()
                     key_repr = f"{chain_name}:{privhex}"
-                    if key_repr in in_memory_tried or key_repr in batch_keys_repr:
+                    if key_repr in in_memory_tried:
                         continue
-                    batch_keys_repr.add(key_repr)
+                    append_tried(key_repr)
                     address = eth_priv_to_address(priv)
                     batch.append((privhex, address))
 
-                # Write all new keys at once
-                append_tried_batch(batch_keys_repr)
-
-                # async RPC calls for the batch
-                async def fetch_balance(privhex, address):
+                # process balances for each key in batch
+                for privhex, address in batch:
                     try:
                         bal_wei = await eth_get_balance(rpc_url, address, session, debug=debug)
-                        if bal_wei and bal_wei > 0:
-                            bal_eth = bal_wei / 10**18
-                            bal_str = f"{bal_eth:.18f} (wei={bal_wei})"
-                            out = format_found_block(chain_name, privhex, address, bal_str)
-                            print(out)
-                            append_found(f"{chain_name} | {privhex} | {address} | {bal_str}")
-                    except Exception as e:
+                    except Exception as rpc_e:
                         if debug:
-                            print(f"[{chain_name}][rpc error] {e}")
+                            print(f"[{chain_name}][rpc error] {rpc_e}")
+                        await asyncio.sleep(0.2)
+                        continue
+                    if bal_wei and bal_wei > 0:
+                        bal_eth = bal_wei / 10**18
+                        bal_str = f"{bal_eth:.18f} (wei={bal_wei})"
+                        out = format_found_block(chain_name, privhex, address, bal_str)
+                        print(out)
+                        append_found(f"{chain_name} | {privhex} | {address} | {bal_str}")
 
-                await asyncio.gather(*(fetch_balance(privhex, address) for privhex, address in batch))
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.02)
             except Exception as e:
                 if debug:
                     traceback.print_exc()
