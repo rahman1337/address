@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Optimized Offline Bitcoin-address scanner
-- 5 worker threads (concurrent)
+- Threaded workers (default 5)
 - batch size = 1000 keys per task
 - uses coincurve for fast secp256k1 operations
 - reads three files: btc1.txt, btc2.txt, btc3.txt (addresses, one per line)
 - prints found blocks only when there’s a hit
-- debug mode (-d) prints progress every 10s
+- debug mode (-d) prints startup & progress every 10s
 """
 
 import os
@@ -14,29 +14,24 @@ import sys
 import time
 import argparse
 import threading
-from typing import Set
 
-# External dependency: coincurve
+# External dependencies: coincurve, base58
 try:
     from coincurve import PrivateKey
 except ImportError:
     print("Missing dependency: coincurve. Install with `pip install coincurve`", file=sys.stderr)
     raise
 
+try:
+    import base58
+except ImportError:
+    print("Missing dependency: base58. Install with `pip install base58`", file=sys.stderr)
+    raise
+
 import hashlib
-import binascii
-import base58
 
 #########################
-# Base58Check
-#########################
-def base58check_encode(payload: bytes, version: bytes = b"\x00") -> str:
-    data = version + payload
-    checksum = hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4]
-    return base58.b58encode(data + checksum).decode()
-
-#########################
-# Bech32 (minimal)
+# Bech32 minimal helpers
 #########################
 CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 CHARSET_MAP = {c: i for i, c in enumerate(CHARSET)}
@@ -82,19 +77,32 @@ def encode_bech32(hrp, witver, witprog):
     combined = data + bech32_create_checksum(hrp, data)
     return hrp + "1" + "".join([CHARSET[d] for d in combined])
 
-# minimal Bech32 decode (v0 only)
+# Minimal Bech32 decode (does not validate checksum thoroughly but suits our use)
 def bech32_decode(addr):
-    addr = addr.lower()
+    addr = addr.strip().lower()
     if '1' not in addr:
         return None, None
-    hrp, data = addr.rsplit('1', 1)
-    data_vals = [CHARSET_MAP.get(c, -1) for c in data]
-    if -1 in data_vals or len(data_vals) < 6:
+    hrp, data_part = addr.rsplit('1', 1)
+    data_vals = []
+    for ch in data_part:
+        v = CHARSET_MAP.get(ch)
+        if v is None:
+            return None, None
+        data_vals.append(v)
+    if len(data_vals) < 6:
         return None, None
     return hrp, data_vals
 
 #########################
-# Bitcoin address derivations
+# Base58Check encode helper (use base58 lib for speed)
+#########################
+def base58check_encode(payload: bytes, version: bytes = b"\x00") -> str:
+    data = version + payload
+    checksum = hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4]
+    return base58.b58encode(data + checksum).decode()
+
+#########################
+# Hash helpers and address derivation
 #########################
 def sha256(b: bytes) -> bytes:
     return hashlib.sha256(b).digest()
@@ -176,79 +184,100 @@ def pretty_found_block(priv_hex: str, wif: str, addr: str) -> str:
     return "\n".join(lines)
 
 #########################
-# Load BTC addresses as hash sets
+# Load BTC addresses into hash sets (h160 for P2PKH/P2WPKH, p2sh hashes for 3... addrs)
 #########################
 def load_address_hashes(filename: str):
-    h160_set = set()
-    bech32_set = set()
+    """
+    Returns (h160_set, bech32_witprog_set)
+    - For base58 addresses (1... or 3...) we decode the Base58Check and store payload bytes for fast comparison.
+    - For bech32 (bc1...) we decode the witness program bytes and store them.
+    """
+    h160_set = set()     # contains 20-byte payloads used for P2PKH check or P2SH check (we store payloads as bytes)
+    bech32_set = set()   # contains witness program bytes (20 bytes for P2WPKH)
     try:
         with open(filename, "r", encoding="utf-8") as f:
             for line in f:
                 addr = line.strip()
                 if not addr:
                     continue
+                # P2PKH / P2SH (base58)
                 if addr.startswith("1") or addr.startswith("3"):
                     try:
-                        data = base58.b58decode_check(addr)
-                        h160_set.add(data[1:])
+                        decoded = base58.b58decode_check(addr)  # bytes: version + payload
+                        # store payload (skip version byte)
+                        payload = decoded[1:]
+                        # payload length for P2PKH is 20; for P2SH it's also 20 (hash160)
+                        if len(payload) in (20,):
+                            h160_set.add(bytes(payload))
                     except Exception:
+                        # skip malformed/unknown
                         continue
+                # Bech32 (assume bc1..., v0 P2WPKH)
                 elif addr.startswith("bc1"):
                     hrp, data_vals = bech32_decode(addr)
                     if data_vals:
-                        witprog = convertbits(data_vals[1:-6], 5, 8, False)
+                        # data_vals includes [witver + data + checksum(6)]
+                        # remove witver (first) and checksum (last 6)
+                        core = data_vals[1:-6]
+                        witprog = convertbits(core, 5, 8, False)
                         if witprog:
                             bech32_set.add(bytes(witprog))
+                else:
+                    # unknown format -> skip
+                    continue
     except FileNotFoundError:
-        print(f"[WARN] file not found: {filename}", file=sys.stderr)
+        print(f"[WARN] file not found: {filename}. Continuing with empty set.", file=sys.stderr)
     return h160_set, bech32_set
 
 #########################
-# Optimized batch check
+# Optimized batch check: compute h160 once, test with sets, only encode strings on hit
 #########################
 def check_batch_and_print(batch_privs: list, found_sets: tuple, debug: bool = False):
     for priv_bytes in batch_privs:
         try:
             pk = PrivateKey(priv_bytes)
-            pub_compressed = pk.public_key.format(compressed=True)
+            pub_compressed = pk.public_key.format(compressed=True)  # 33 bytes
             h160 = hash160(pub_compressed)
             hit_addr = None
 
+            # check against each provided set pair
             for hset, bset in found_sets:
+                # P2PKH direct match (1...)
                 if h160 in hset:
                     hit_addr = pubkey_to_p2pkh(pub_compressed)
                     break
+                # P2SH-P2WPKH: redeem_script = 0x00 0x14 <20-byte keyhash>; then hash160(redeem_script) is the P2SH payload
                 redeem_script = b"\x00\x14" + h160
                 p2sh_hash = hash160(redeem_script)
                 if p2sh_hash in hset:
                     hit_addr = pubkey_to_p2sh_p2wpkh(pub_compressed)
                     break
+                # Native segwit P2WPKH (bech32) match: compare witness program
                 if h160 in bset:
                     hit_addr = pubkey_to_bech32(pub_compressed)
                     break
 
             if hit_addr:
                 priv_hex = priv_bytes.hex()
-                wif = priv_to_wif(priv_bytes, compressed=True)
+                wif = priv_to_wif(priv_bytes, compressed=True)  # compute WIF only on hit
                 state.inc_found(1)
                 print(pretty_found_block(priv_hex, wif, hit_addr))
+
         except Exception as e:
             state.inc_errors(1)
             if debug:
                 print(format_border(f"ERROR deriving addresses: {e}"))
+    # Count keys processed (batch length)
     state.inc_keys(len(batch_privs))
 
 #########################
-# Worker thread
+# Worker thread and reporter
 #########################
 def worker_loop(batch_size: int, found_sets: tuple, stop_event: threading.Event, debug: bool):
     while not stop_event.is_set():
         batch = [generate_valid_privkey_bytes() for _ in range(batch_size)]
         check_batch_and_print(batch, found_sets, debug)
 
-#########################
-# Reporter thread
-#########################
 def reporter(period: int, stop_event: threading.Event, debug: bool):
     last_total = 0
     last_time = state.start_time
@@ -276,7 +305,9 @@ def reporter(period: int, stop_event: threading.Event, debug: bool):
 #########################
 def parse_args():
     p = argparse.ArgumentParser(description="Optimized Bitcoin address scanner (threaded)")
-    p.add_argument("-d", "--debug", action="store_true", help="debug mode: print progress every 10s")
+    p.add_argument("-d", "--debug", action="store_true", help="debug mode: print startup + progress every 10s")
+    p.add_argument("-w", "--workers", type=int, default=5, help="number of worker threads (default 5)")
+    p.add_argument("-b", "--batch", type=int, default=1000, help="batch size per worker iteration (default 1000)")
     return p.parse_args()
 
 #########################
@@ -293,20 +324,27 @@ def main():
                   (s2_h160, s2_bech32),
                   (s3_h160, s3_bech32))
 
-    print(format_border(f"Loaded sets: btc1={len(s1_h160)+len(s1_bech32)} "
-                        f"btc2={len(s2_h160)+len(s2_bech32)} "
-                        f"btc3={len(s3_h160)+len(s3_bech32)}"))
+    # Startup prints
+    print(format_border("Starting Bitcoin address scanner"))
+    print("Loaded addresses from input files:")
+    print(f"  btc1.txt: {len(s1_h160) + len(s1_bech32)} addresses")
+    print(f"  btc2.txt: {len(s2_h160) + len(s2_bech32)} addresses")
+    print(f"  btc3.txt: {len(s3_h160) + len(s3_bech32)} addresses")
+    workers = max(1, args.workers)
+    batch_size = max(1, args.batch)
+    print(f"Using {workers} worker threads, batch size={batch_size}")
+    print("="*60)
 
-    workers = 5
-    batch_size = 1000
     stop_event = threading.Event()
 
+    # Start worker threads
     threads = []
     for i in range(workers):
         t = threading.Thread(target=worker_loop, args=(batch_size, found_sets, stop_event, args.debug), daemon=True)
         t.start()
         threads.append(t)
 
+    # Start reporter thread if debug
     if args.debug:
         rep_thread = threading.Thread(target=reporter, args=(10, stop_event, args.debug), daemon=True)
         rep_thread.start()
