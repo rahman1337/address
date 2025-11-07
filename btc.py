@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-Optimized Offline Bitcoin-address scanner
-- Threaded workers (default 5)
-- batch size = 1000 keys per task
-- uses coincurve for fast secp256k1 operations
-- reads three files: btc1.txt, btc2.txt, btc3.txt (addresses, one per line)
-- prints found blocks only when there’s a hit
-- debug mode (-d) prints startup & progress every 10s
+Instrumented Offline Bitcoin-address scanner (debug-friendly)
+- Adds immediate debug prints (flush=True)
+- Adds --test-batches to run a fixed number of batches per worker (useful for local testing)
+- More robust error logging & startup checks
+- Keeps original optimized batch checking logic
 """
 
 import os
@@ -14,24 +12,25 @@ import sys
 import time
 import argparse
 import threading
+import traceback
 
 # External dependencies: coincurve, base58
 try:
     from coincurve import PrivateKey
-except ImportError:
-    print("Missing dependency: coincurve. Install with `pip install coincurve`", file=sys.stderr)
+except Exception as e:
+    print("[FATAL] Missing dependency: coincurve. Install with `pip install coincurve`", file=sys.stderr, flush=True)
     raise
 
 try:
     import base58
-except ImportError:
-    print("Missing dependency: base58. Install with `pip install base58`", file=sys.stderr)
+except Exception as e:
+    print("[FATAL] Missing dependency: base58. Install with `pip install base58`", file=sys.stderr, flush=True)
     raise
 
 import hashlib
 
 #########################
-# Bech32 minimal helpers
+# Bech32 minimal helpers (unchanged)
 #########################
 CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 CHARSET_MAP = {c: i for i, c in enumerate(CHARSET)}
@@ -77,7 +76,6 @@ def encode_bech32(hrp, witver, witprog):
     combined = data + bech32_create_checksum(hrp, data)
     return hrp + "1" + "".join([CHARSET[d] for d in combined])
 
-# Minimal Bech32 decode (does not validate checksum thoroughly but suits our use)
 def bech32_decode(addr):
     addr = addr.strip().lower()
     if '1' not in addr:
@@ -187,46 +185,35 @@ def pretty_found_block(priv_hex: str, wif: str, addr: str) -> str:
 # Load BTC addresses into hash sets (h160 for P2PKH/P2WPKH, p2sh hashes for 3... addrs)
 #########################
 def load_address_hashes(filename: str):
-    """
-    Returns (h160_set, bech32_witprog_set)
-    - For base58 addresses (1... or 3...) we decode the Base58Check and store payload bytes for fast comparison.
-    - For bech32 (bc1...) we decode the witness program bytes and store them.
-    """
-    h160_set = set()     # contains 20-byte payloads used for P2PKH check or P2SH check (we store payloads as bytes)
-    bech32_set = set()   # contains witness program bytes (20 bytes for P2WPKH)
+    h160_set = set()
+    bech32_set = set()
     try:
         with open(filename, "r", encoding="utf-8") as f:
             for line in f:
                 addr = line.strip()
                 if not addr:
                     continue
-                # P2PKH / P2SH (base58)
                 if addr.startswith("1") or addr.startswith("3"):
                     try:
                         decoded = base58.b58decode_check(addr)  # bytes: version + payload
-                        # store payload (skip version byte)
                         payload = decoded[1:]
-                        # payload length for P2PKH is 20; for P2SH it's also 20 (hash160)
                         if len(payload) in (20,):
                             h160_set.add(bytes(payload))
                     except Exception:
-                        # skip malformed/unknown
                         continue
-                # Bech32 (assume bc1..., v0 P2WPKH)
                 elif addr.startswith("bc1"):
                     hrp, data_vals = bech32_decode(addr)
                     if data_vals:
-                        # data_vals includes [witver + data + checksum(6)]
-                        # remove witver (first) and checksum (last 6)
                         core = data_vals[1:-6]
                         witprog = convertbits(core, 5, 8, False)
                         if witprog:
                             bech32_set.add(bytes(witprog))
                 else:
-                    # unknown format -> skip
                     continue
     except FileNotFoundError:
-        print(f"[WARN] file not found: {filename}. Continuing with empty set.", file=sys.stderr)
+        print(f"[WARN] file not found: {filename}. Continuing with empty set.", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[ERROR] reading {filename}: {e}", file=sys.stderr, flush=True)
     return h160_set, bech32_set
 
 #########################
@@ -240,43 +227,44 @@ def check_batch_and_print(batch_privs: list, found_sets: tuple, debug: bool = Fa
             h160 = hash160(pub_compressed)
             hit_addr = None
 
-            # check against each provided set pair
             for hset, bset in found_sets:
-                # P2PKH direct match (1...)
                 if h160 in hset:
                     hit_addr = pubkey_to_p2pkh(pub_compressed)
                     break
-                # P2SH-P2WPKH: redeem_script = 0x00 0x14 <20-byte keyhash>; then hash160(redeem_script) is the P2SH payload
                 redeem_script = b"\x00\x14" + h160
                 p2sh_hash = hash160(redeem_script)
                 if p2sh_hash in hset:
                     hit_addr = pubkey_to_p2sh_p2wpkh(pub_compressed)
                     break
-                # Native segwit P2WPKH (bech32) match: compare witness program
                 if h160 in bset:
                     hit_addr = pubkey_to_bech32(pub_compressed)
                     break
 
             if hit_addr:
                 priv_hex = priv_bytes.hex()
-                wif = priv_to_wif(priv_bytes, compressed=True)  # compute WIF only on hit
+                wif = priv_to_wif(priv_bytes, compressed=True)
                 state.inc_found(1)
-                print(pretty_found_block(priv_hex, wif, hit_addr))
+                print(pretty_found_block(priv_hex, wif, hit_addr), flush=True)
 
         except Exception as e:
             state.inc_errors(1)
             if debug:
-                print(format_border(f"ERROR deriving addresses: {e}"))
-    # Count keys processed (batch length)
+                print(format_border(f"ERROR deriving addresses: {e}"), flush=True)
+                traceback.print_exc()
     state.inc_keys(len(batch_privs))
 
 #########################
 # Worker thread and reporter
 #########################
-def worker_loop(batch_size: int, found_sets: tuple, stop_event: threading.Event, debug: bool):
+def worker_loop(batch_size: int, found_sets: tuple, stop_event: threading.Event, debug: bool, test_batches: int = 0):
+    batches_done = 0
     while not stop_event.is_set():
         batch = [generate_valid_privkey_bytes() for _ in range(batch_size)]
         check_batch_and_print(batch, found_sets, debug)
+        batches_done += 1
+        if test_batches > 0 and batches_done >= test_batches:
+            # signal stop only for this worker's test mode
+            break
 
 def reporter(period: int, stop_event: threading.Event, debug: bool):
     last_total = 0
@@ -296,7 +284,7 @@ def reporter(period: int, stop_event: threading.Event, debug: bool):
             text = (f"[DEBUG] elapsed={elapsed:.1f}s total_keys={total} "
                     f"keys/s={keys_s:.1f} recent_keys={delta}/{delta_t:.1f}s "
                     f"found={found} errors={errors}")
-            print(format_border(text))
+            print(format_border(text), flush=True)
         last_total = total
         last_time = now
 
@@ -304,10 +292,12 @@ def reporter(period: int, stop_event: threading.Event, debug: bool):
 # Argument parser
 #########################
 def parse_args():
-    p = argparse.ArgumentParser(description="Optimized Bitcoin address scanner (threaded)")
+    p = argparse.ArgumentParser(description="Instrumented Bitcoin address scanner (threaded & debug)")
     p.add_argument("-d", "--debug", action="store_true", help="debug mode: print startup + progress every 10s")
     p.add_argument("-w", "--workers", type=int, default=5, help="number of worker threads (default 5)")
     p.add_argument("-b", "--batch", type=int, default=1000, help="batch size per worker iteration (default 1000)")
+    p.add_argument("--test-batches", type=int, default=0,
+                   help="(debug) run this many batches per worker then exit (0 = run forever)")
     return p.parse_args()
 
 #########################
@@ -315,65 +305,111 @@ def parse_args():
 #########################
 def main():
     args = parse_args()
+    # immediate debug prints
+    print("[STARTUP] Instrumented Bitcoin scanner starting", flush=True)
+    print(f"[STARTUP] PID={os.getpid()} PYTHON={sys.version.splitlines()[0]}", flush=True)
+    print(f"[STARTUP] args: {args}", flush=True)
 
-    # Load address sets
-    s1_h160, s1_bech32 = load_address_hashes("btc1.txt")
-    s2_h160, s2_bech32 = load_address_hashes("btc2.txt")
-    s3_h160, s3_bech32 = load_address_hashes("btc3.txt")
+    # quick sanity checks
+    try:
+        _ = PrivateKey
+        _ = base58.b58encode
+        print("[STARTUP] Dependencies OK", flush=True)
+    except Exception as e:
+        print(f"[FATAL] Dependency check failed: {e}", file=sys.stderr, flush=True)
+        raise
+
+    # check address input files
+    files = ["btc1.txt", "btc2.txt", "btc3.txt"]
+    for fn in files:
+        exists = os.path.exists(fn)
+        size = os.path.getsize(fn) if exists else 0
+        print(f"[STARTUP] file: {fn} exists={exists} size={size}", flush=True)
+
+    # Load address sets (wrap in try to catch errors)
+    try:
+        s1_h160, s1_bech32 = load_address_hashes("btc1.txt")
+        s2_h160, s2_bech32 = load_address_hashes("btc2.txt")
+        s3_h160, s3_bech32 = load_address_hashes("btc3.txt")
+    except Exception as e:
+        print(f"[FATAL] Error loading address files: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        return
+
     found_sets = ((s1_h160, s1_bech32),
                   (s2_h160, s2_bech32),
                   (s3_h160, s3_bech32))
 
-    # Startup prints
-    print(format_border("Starting Bitcoin address scanner"))
-    print("Loaded addresses from input files:")
-    print(f"  btc1.txt: {len(s1_h160) + len(s1_bech32)} addresses")
-    print(f"  btc2.txt: {len(s2_h160) + len(s2_bech32)} addresses")
-    print(f"  btc3.txt: {len(s3_h160) + len(s3_bech32)} addresses")
+    print(format_border("Starting Bitcoin address scanner (instrumented)"), flush=True)
+    print("Loaded addresses from input files:", flush=True)
+    print(f"  btc1.txt: {len(s1_h160) + len(s1_bech32)} addresses", flush=True)
+    print(f"  btc2.txt: {len(s2_h160) + len(s2_bech32)} addresses", flush=True)
+    print(f"  btc3.txt: {len(s3_h160) + len(s3_bech32)} addresses", flush=True)
     workers = max(1, args.workers)
     batch_size = max(1, args.batch)
-    print(f"Using {workers} worker threads, batch size={batch_size}")
-    print("="*60)
+    print(f"Using {workers} worker threads, batch size={batch_size}", flush=True)
+    if args.test_batches > 0:
+        print(f"[TEST MODE] Each worker will run {args.test_batches} batches then stop.", flush=True)
+    print("="*60, flush=True)
 
     stop_event = threading.Event()
 
     # Start worker threads
     threads = []
     for i in range(workers):
-        t = threading.Thread(target=worker_loop, args=(batch_size, found_sets, stop_event, args.debug), daemon=True)
+        t = threading.Thread(target=worker_loop,
+                             args=(batch_size, found_sets, stop_event, args.debug, args.test_batches),
+                             daemon= (args.test_batches == 0))  # make non-daemon in test mode so we can join
         t.start()
         threads.append(t)
+        print(f"[THREAD] started worker {i} (daemon={t.daemon})", flush=True)
 
     # Start reporter thread if debug
+    rep_thread = None
     if args.debug:
         rep_thread = threading.Thread(target=reporter, args=(10, stop_event, args.debug), daemon=True)
         rep_thread.start()
+        print("[THREAD] reporter started (10s interval)", flush=True)
 
     try:
-        while True:
-            time.sleep(1)
+        if args.test_batches > 0:
+            # Wait for all worker threads to finish their test batches
+            for t in threads:
+                t.join()
+            # set stop event to let reporter exit gracefully
+            stop_event.set()
+            if rep_thread:
+                rep_thread.join(timeout=1)
+        else:
+            # original behavior: run forever until keyboard interrupt
+            while True:
+                time.sleep(1)
     except KeyboardInterrupt:
+        print("\n[INTERRUPT] Stopping workers...", flush=True)
         stop_event.set()
-        print("\nStopping workers...")
         for t in threads:
             t.join(timeout=1)
-        if args.debug:
+        if rep_thread:
             rep_thread.join(timeout=1)
+    except Exception as e:
+        print(f"[FATAL] Unexpected error in main loop: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        stop_event.set()
 
-        elapsed = time.time() - state.start_time
-        with state.lock:
-            total = state.total_keys
-            found = state.total_found
-            errors = state.errors
+    elapsed = time.time() - state.start_time
+    with state.lock:
+        total = state.total_keys
+        found = state.total_found
+        errors = state.errors
 
-        print("="*40)
-        print("Interrupted by user (Ctrl+C)")
-        print(f"Elapsed    : {elapsed:.1f} s")
-        print(f"Total keys : {total}")
-        print(f"Keys/s     : {total/elapsed:.1f}")
-        print(f"Found      : {found}")
-        print(f"Errors     : {errors}")
-        print("="*40)
+    print("="*40, flush=True)
+    print("Exiting scanner", flush=True)
+    print(f"Elapsed    : {elapsed:.1f} s", flush=True)
+    print(f"Total keys : {total}", flush=True)
+    print(f"Keys/s     : {total/elapsed:.1f}" if elapsed > 0 else "Keys/s     : N/A", flush=True)
+    print(f"Found      : {found}", flush=True)
+    print(f"Errors     : {errors}", flush=True)
+    print("="*40, flush=True)
 
 if __name__ == "__main__":
     main()
