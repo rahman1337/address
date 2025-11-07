@@ -25,7 +25,6 @@ eth_utils = ensure_import("eth_utils")
 from eth_utils import to_checksum_address, keccak
 
 ETH_RPC = "https://ethereum.publicnode.com"
-
 TRIED_FILE = "tried.txt"
 FOUND_FILE = "found.txt"
 scanned_lock = threading.Lock()
@@ -69,13 +68,11 @@ def format_found_block(chain, privhex, address, balance_str):
     ])
 
 # ----- Generators -----
-sequential_counter_eth = 0
 repetitive_patterns = [b'a', b'b', b'c', b'd', b'e', b'f', b'1', b'2', b'3', b'4']
+sequential_counter_eth = 0
 repetitive_index_eth = 0
 MIXED_PATTERNS = b'abcdefghijklmnopqrstuvwxyz0123456789'
 mixed_index_eth = 0
-GENERATOR_MODES = ['repetitive', 'sequential', 'mixed']
-mode_index_eth = 0
 
 def gen_repetitive_eth():
     global repetitive_index_eth
@@ -95,6 +92,9 @@ def gen_mixed_sequence_eth():
         key[i] = MIXED_PATTERNS[(mixed_index_eth + i) % len(MIXED_PATTERNS)]
     mixed_index_eth += 1
     return bytes(key)
+
+GENERATOR_MODES = ['repetitive', 'sequential', 'mixed']
+mode_index_eth = 0
 
 def gen_eth_privkey_bytes():
     global mode_index_eth
@@ -134,87 +134,75 @@ async def rpc_post_with_retries(url: str, json_payload: dict, session: aiohttp.C
                 await asyncio.sleep(attempt)
     raise last_exc
 
-async def eth_get_balance(rpc_url: str, address: str, session: aiohttp.ClientSession, debug=False) -> Optional[int]:
+async def eth_like_get_balance(rpc_url: str, address: str, session: aiohttp.ClientSession, debug=False) -> int:
     payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_getBalance", "params": [address, "latest"]}
     j = await rpc_post_with_retries(rpc_url, payload, session=session, debug=debug, max_attempts=3)
-    if "error" in j:
-        raise RuntimeError(f"RPC error: {j['error']}")
     result = j.get("result")
-    if result is None:
-        raise RuntimeError("No result field in RPC response")
-    return int(result, 16)
+    return int(result, 16) if result else 0
 
-# ----- Ethereum worker with batching -----
-async def worker_eth_async(worker_id, rpc_url, debug=False, batch_size=100):
-    chain_name = f"ethereum-{worker_id}"
+# ----- Worker -----
+async def worker_eth_async(chain_name, rpc_url, debug=False):
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while not stop_event.is_set():
             try:
-                batch = []
-                # generate 100 keys per batch
-                for _ in range(batch_size):
-                    priv = gen_eth_privkey_bytes()
-                    privhex = priv.hex()
-                    key_repr = f"{chain_name}:{privhex}"
-                    if key_repr in in_memory_tried:
-                        continue
-                    append_tried(key_repr)
-                    address = eth_priv_to_address(priv)
-                    batch.append((privhex, address))
-
-                # process balances for each key in batch
-                for privhex, address in batch:
-                    try:
-                        bal_wei = await eth_get_balance(rpc_url, address, session, debug=debug)
-                    except Exception as rpc_e:
-                        if debug:
-                            print(f"[{chain_name}][rpc error] {rpc_e}")
-                        await asyncio.sleep(0.2)
-                        continue
-                    if bal_wei and bal_wei > 0:
-                        bal_eth = bal_wei / 10**18
-                        bal_str = f"{bal_eth:.18f} (wei={bal_wei})"
-                        out = format_found_block(chain_name, privhex, address, bal_str)
-                        print(out)
-                        append_found(f"{chain_name} | {privhex} | {address} | {bal_str}")
-
+                priv = gen_eth_privkey_bytes()
+                privhex = priv.hex()
+                key_repr = f"{chain_name}:{privhex}"
+                if key_repr in in_memory_tried:
+                    if debug:
+                        print(f"[{chain_name}] duplicate key, skipping {privhex}")
+                    await asyncio.sleep(0.02)
+                    continue
+                append_tried(key_repr)
+                address = eth_priv_to_address(priv)
+                if debug:
+                    print(f"[{chain_name}] trying priv={privhex} -> addr={address}")
+                try:
+                    bal_wei = await eth_like_get_balance(rpc_url, address, session, debug=debug)
+                except Exception as rpc_e:
+                    if debug:
+                        print(f"[{chain_name}][rpc error] {rpc_e}")
+                    await asyncio.sleep(0.2)
+                    continue
+                if bal_wei > 0:
+                    bal_eth = bal_wei / 10**18
+                    bal_str = f"{bal_eth:.18f} (wei={bal_wei})"
+                    out = format_found_block(chain_name, privhex, address, bal_str)
+                    print(out)
+                    append_found(f"{chain_name} | {privhex} | {address} | {bal_str}")
                 await asyncio.sleep(0.02)
             except Exception as e:
                 if debug:
                     traceback.print_exc()
                 await asyncio.sleep(0.05)
 
-def run_async_worker(worker_id, rpc_url, debug=False, batch_size=100):
+def run_async_worker(coro_func, *args, **kwargs):
     try:
-        asyncio.run(worker_eth_async(worker_id, rpc_url, debug=debug, batch_size=batch_size))
+        asyncio.run(coro_func(*args, **kwargs))
     except Exception as e:
-        print(f"[worker-{worker_id}][fatal] {e}")
+        print(f"[worker][fatal] {e}")
 
 def main():
     parser = ArgumentParser()
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
-    parser.add_argument("--modes", nargs="+", choices=['repetitive','sequential','mixed'], help="Override generator modes")
-    parser.add_argument("--batch", type=int, default=100, help="Number of keys per batch (default 100)")
-    parser.add_argument("--threads", type=int, default=5, help="Number of worker threads (default 5)")
+    parser.add_argument("--modes", nargs="+", choices=['repetitive','sequential','mixed'], help="Override generator modes and order")
     args = parser.parse_args()
     debug = args.debug
-    batch_size = args.batch
-    num_threads = args.threads
 
     if args.modes:
         global GENERATOR_MODES
         GENERATOR_MODES = args.modes
 
-    print(f"[info] Starting Ethereum scanner with {num_threads} threads, batch={batch_size}. Debug={debug}.")
-    print(f"[info] Modes={GENERATOR_MODES}. Press Ctrl+C to stop.")
+    print(f"[info] Starting Ethereum scanner. Debug={debug}. Modes={GENERATOR_MODES}. Press Ctrl+C to stop.")
 
     open(TRIED_FILE, "a").close()
     open(FOUND_FILE, "a").close()
 
-    with ThreadPoolExecutor(max_workers=num_threads) as ex:
-        for i in range(num_threads):
-            ex.submit(run_async_worker, i + 1, ETH_RPC, debug, batch_size)
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = []
+        for _ in range(5):
+            futures.append(ex.submit(run_async_worker, worker_eth_async, "ethereum", ETH_RPC, debug))
         try:
             while not stop_event.is_set():
                 time.sleep(0.5)
