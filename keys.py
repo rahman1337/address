@@ -17,10 +17,6 @@ STATS_INTERVAL = 10   # seconds
 MAX_RETRIES = 3
 RPC_TIMEOUT = 20      # seconds for aiohttp ClientTimeout
 
-# -------- GLOBAL STATE -------- #
-_total_keys = 0
-_total_keys_lock = asyncio.Lock()
-
 # -------- UTIL: keccak & checksum -------- #
 def keccak256(data: bytes) -> bytes:
     k = keccak.new(digest_bits=256)
@@ -84,8 +80,8 @@ def make_batch_payload(addresses: List[str], start_id: int) -> List[Dict]:
     return payload
 
 # -------- WORKER -------- #
-async def worker(worker_id: int, session: aiohttp.ClientSession, stop_event: asyncio.Event):
-    global _total_keys
+async def worker(worker_id: int, session: aiohttp.ClientSession,
+                 stop_event: asyncio.Event, total_keys_lock: asyncio.Lock, state: dict):
     id_counter = worker_id * 10_000_000
     while not stop_event.is_set():
         batch = []
@@ -95,7 +91,7 @@ async def worker(worker_id: int, session: aiohttp.ClientSession, stop_event: asy
             batch.append((priv_hex, addr))
 
         idx = 0
-        while idx < len(batch):
+        while idx < len(batch) and not stop_event.is_set():
             chunk = batch[idx: idx + BATCH_RPC_SIZE]
             addresses = [addr for (_, addr) in chunk]
             start_id = id_counter
@@ -128,8 +124,8 @@ async def worker(worker_id: int, session: aiohttp.ClientSession, stop_event: asy
             if result_map is None:
                 for priv_hex, addr in chunk:
                     print(f"[ERROR] Final failure fetching balances for chunk including {addr}")
-                    async with _total_keys_lock:
-                        _total_keys += 1
+                    async with total_keys_lock:
+                        state["total_keys"] += 1
                 idx += BATCH_RPC_SIZE
                 continue
 
@@ -146,8 +142,8 @@ async def worker(worker_id: int, session: aiohttp.ClientSession, stop_event: asy
                         print(f"[ERROR] Bad balance format for {addr}: {raw}")
                         balance_int = 0
 
-                async with _total_keys_lock:
-                    _total_keys += 1
+                async with total_keys_lock:
+                    state["total_keys"] += 1
 
                 if balance_int > 0:
                     eth_bal = balance_int / 10 ** 18
@@ -162,36 +158,49 @@ async def worker(worker_id: int, session: aiohttp.ClientSession, stop_event: asy
             idx += BATCH_RPC_SIZE
 
 # -------- STATS TASK -------- #
-async def stats_task(stop_event: asyncio.Event):
+async def stats_task(stop_event: asyncio.Event, total_keys_lock: asyncio.Lock, state: dict):
     prev = 0
     while not stop_event.is_set():
         await asyncio.sleep(STATS_INTERVAL)
-        async with _total_keys_lock:
-            now = _total_keys
+        async with total_keys_lock:
+            now = state["total_keys"]
         speed = (now - prev) / STATS_INTERVAL
         prev = now
         print(f"[STATS] {now} | {speed:.2f} keys/s")
 
 # -------- SIGNAL HANDLER -------- #
-def install_signal_handlers(stop_event: asyncio.Event):
-    loop = asyncio.get_event_loop()
+def install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event):
+    # set stop_event when SIGINT/SIGTERM received
+    def _set_done():
+        if not stop_event.is_set():
+            print("\n[INFO] Ctrl+C received — shutting down...")
+            stop_event.set()
+
     for s in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(s, lambda: stop_event.set())
+            loop.add_signal_handler(s, _set_done)
         except NotImplementedError:
-            signal.signal(s, lambda *_: stop_event.set())
+            signal.signal(s, lambda *_: _set_done())
 
 # -------- MAIN -------- #
 async def main():
-    stop_event = asyncio.Event()  # create inside loop
-    install_signal_handlers(stop_event)
+    # create stop_event and lock in the running event loop
+    stop_event = asyncio.Event()
+    total_keys_lock = asyncio.Lock()
+    state = {"total_keys": 0}
+
+    loop = asyncio.get_event_loop()
+    install_signal_handlers(loop, stop_event)
 
     timeout = aiohttp.ClientTimeout(total=RPC_TIMEOUT)
     conn = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(timeout=timeout, connector=conn) as session:
-        workers = [asyncio.create_task(worker(i, session, stop_event)) for i in range(CONCURRENCY)]
-        stats = asyncio.create_task(stats_task(stop_event))
+        workers = [asyncio.create_task(worker(i, session, stop_event, total_keys_lock, state))
+                   for i in range(CONCURRENCY)]
+        stats = asyncio.create_task(stats_task(stop_event, total_keys_lock, state))
+
         await stop_event.wait()
+
         for w in workers:
             w.cancel()
         stats.cancel()
@@ -200,7 +209,15 @@ async def main():
         print("[INFO] Shutdown complete.")
 
 if __name__ == "__main__":
+    # create and run a fresh event loop explicitly (avoids asyncio.run loop mismatch on some 3.9 setups)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        asyncio.run(main())
+        loop.run_until_complete(main())
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user.")
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
