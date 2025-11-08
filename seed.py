@@ -11,6 +11,7 @@ Ultra-fast ETH mnemonic generator + balance checker (threaded)
 import os, time, json, threading, requests
 from mnemonic import Mnemonic
 from eth_account import Account
+Account.enable_unaudited_hdwallet_features()
 
 mnemo = Mnemonic("english")
 BATCH = 1000
