@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 """
-fast_hd_longrun.py
+fast_hd_longrun_fixed.py
 
 High-throughput true BIP39 -> BIP32 -> Ethereum address scanner,
-designed for very long runs with minimal memory growth.
-
-Features:
-- Valid 12-word mnemonics only (mnemo.generate(128))
-- Deduplication via Bloom filters (mnemonics and addresses)
-- ThreadPoolExecutor for PBKDF2-heavy derivation (oversubscribe to CPU)
-- Async balance checking with aiohttp (no semaphores), retries + backoff
-- Bordered hit printing and hits.txt
-- Error logging to errors.log
-- Periodic [INFO] reporting
+long-run friendly, with unique addresses counter.
 """
 
 import os
@@ -31,16 +22,16 @@ import aiohttp
 import logging
 
 # ---------------- CONFIG ----------------
-WORKERS = 12           # threads for derivation (oversubscribe for 6 cores)
-BATCH_SIZE = 400       # number of valid mnemonics derived per batch task
+WORKERS = 12
+BATCH_SIZE = 400
 DERIVATION_PATH = "m/44'/60'/0'/0/0"
 RPC_URL = "https://ethereum.publicnode.com"
 HITS_FILE = "hits.txt"
 ERROR_LOG = "errors.log"
-REPORT_INTERVAL = 10   # seconds
+REPORT_INTERVAL = 10
 RPC_MAX_RETRIES = 3
-BLOOM_CAPACITY = 30_000_000   # expected number of items (mnemonics or addresses) to support
-BLOOM_ERROR_RATE = 1e-5       # target false-positive rate (very small)
+BLOOM_CAPACITY = 30_000_000
+BLOOM_ERROR_RATE = 1e-5
 # ------------------------------
 
 # Logging
@@ -66,41 +57,28 @@ rpc_success = 0
 rpc_errors = 0
 rpc_lock = threading.Lock()
 
+unique_addresses = 0
+unique_addr_lock = threading.Lock()
+
 # File handles
 hits_fp = open(HITS_FILE, "a", encoding="utf-8")
 
-# ---------------- Bloom Filter (simple, dependency-free) ----------------
+# ---------------- Bloom Filter ----------------
 class BloomFilter:
-    """
-    Simple Bloom filter using SHA-256 derived hashes.
-    - m bits, k hash functions
-    - operations: add(bytes_or_str), __contains__(bytes_or_str)
-    """
     def __init__(self, capacity: int, error_rate: float):
-        # m = -n ln(p) / (ln 2)^2
-        # k = (m/n) ln 2
-        if capacity <= 0:
-            raise ValueError("capacity must be > 0")
-        if not (0 < error_rate < 1):
-            raise ValueError("error_rate must be in (0,1)")
         m = -capacity * math.log(error_rate) / (math.log(2) ** 2)
         k = (m / capacity) * math.log(2)
         self.m = int(m)
         self.k = max(1, int(round(k)))
-        # store bits in bytearray
         self._bits = bytearray((self.m + 7) // 8)
         self._lock = threading.Lock()
 
     def _hashes(self, data: bytes):
-        # derive k different indexes from a base SHA256 by salting
-        # produce k 64-bit integers from repeated hashing
         h = hashlib.sha256(data).digest()
         idxs = []
-        # produce k indices by hashing h + counter
         counter = 0
         while len(idxs) < self.k:
             chunk = hashlib.sha256(h + counter.to_bytes(2, "big")).digest()
-            # take 8 bytes -> 64-bit int
             for i in range(0, len(chunk), 8):
                 if len(idxs) >= self.k:
                     break
@@ -127,7 +105,6 @@ class BloomFilter:
                     return False
         return True
 
-# create Bloom filters for mnemonics and addresses
 mnemonic_bloom = BloomFilter(capacity=BLOOM_CAPACITY, error_rate=BLOOM_ERROR_RATE)
 address_bloom = BloomFilter(capacity=BLOOM_CAPACITY, error_rate=BLOOM_ERROR_RATE)
 
@@ -136,25 +113,15 @@ def sha256_bytes(x: str) -> bytes:
     return hashlib.sha256(x.encode("utf-8")).digest()
 
 def generate_unique_mnemonic():
-    """
-    Generate a valid BIP39 mnemonic that is not present (by hash) in mnemonic_bloom.
-    Note: Bloom has tiny false positive rate; a false positive means we may skip a mnemonic
-    that we haven't actually tried yet (acceptable for long runs).
-    """
     while True:
-        m = mnemo.generate(128)  # always valid 12-word mnemonic
+        m = mnemo.generate(128)
         h = sha256_bytes(m)
         if h in mnemonic_bloom:
-            # seen (or false positive) -> skip
             continue
         mnemonic_bloom.add(h)
         return m
 
 def mnemonic_to_eth_privkey_and_address(mnemonic_phrase):
-    """
-    True BIP39 -> seed (PBKDF2) -> BIP32 -> privkey -> address (checksum).
-    Raises exception on unexpected failure.
-    """
     seed = mnemo.to_seed(mnemonic_phrase)
     bip32 = BIP32.from_seed(seed)
     privkey_bytes = bip32.get_privkey_from_path(DERIVATION_PATH)
@@ -163,11 +130,7 @@ def mnemonic_to_eth_privkey_and_address(mnemonic_phrase):
     return pk.to_hex(), address
 
 def process_batch(batch_size):
-    """
-    CPU-bound: generate batch_size valid unique mnemonics, derive addresses,
-    dedupe addresses with address_bloom, return list of (mnemonic, address, privhex)
-    """
-    global checked
+    global checked, unique_addresses
     results = []
     for _ in range(batch_size):
         try:
@@ -179,9 +142,10 @@ def process_batch(batch_size):
 
         addr_lower = address.lower()
         if addr_lower in address_bloom:
-            # skip addresses we likely tried
             continue
         address_bloom.add(addr_lower.encode("utf-8"))
+        with unique_addr_lock:
+            unique_addresses += 1
 
         with checked_lock:
             checked += 1
@@ -200,16 +164,17 @@ def print_hit(mnemonic, address, privhex, balance_eth):
     print(f"| Balance : {balance_eth} ETH".ljust(55)[:55] + "|")
     print("+" + border + "+\n")
     try:
-        hits_fp.write(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}\t{address}\t{balance_eth}\t{privhex}\t{mnemonic}\n")
+        hits_fp.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n{address}\n{balance_eth}\n{privhex}\n{mnemonic}\n")
         hits_fp.flush()
     except Exception:
         logging.error("Failed to write hit to file: %s", traceback.format_exc(limit=5))
 
-# ---------------- Async RPC with retries (no semaphores) ----------------
+# ---------------- Async RPC ----------------
 async def fetch_balance(session, address, max_retries=RPC_MAX_RETRIES):
     payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [address, "latest"], "id": 1}
     attempt = 0
     backoff_base = 1.2
+    global rpc_success, rpc_errors
     while attempt < max_retries:
         try:
             async with session.post(RPC_URL, json=payload, timeout=10) as resp:
@@ -219,13 +184,11 @@ async def fetch_balance(session, address, max_retries=RPC_MAX_RETRIES):
                 data = json.loads(text)
                 bal_wei = int(data.get("result", "0x0"), 16)
                 with rpc_lock:
-                    global rpc_success
                     rpc_success += 1
                 return bal_wei / 10**18
         except Exception as e:
             attempt += 1
             with rpc_lock:
-                global rpc_errors
                 rpc_errors += 1
             logging.warning("RPC error for %s attempt %d/%d: %s", address, attempt, max_retries, e)
             await asyncio.sleep(backoff_base ** attempt)
@@ -233,13 +196,8 @@ async def fetch_balance(session, address, max_retries=RPC_MAX_RETRIES):
     return 0.0
 
 async def check_balances(results):
-    """
-    results: list of (mnemonic, address, privhex)
-    returns hits: list of (mnemonic, address, privhex, balance)
-    """
     async with aiohttp.ClientSession() as session:
         tasks = [fetch_balance(session, addr) for _, addr, _ in results]
-        # gather all balances concurrently (no explicit concurrency limit)
         balances = await asyncio.gather(*tasks, return_exceptions=False)
         hits = []
         for (mnemonic, address, privhex), bal in zip(results, balances):
@@ -250,7 +208,7 @@ async def check_balances(results):
                 logging.error("Error processing balance result for %s: %s", address, traceback.format_exc(limit=5))
         return hits
 
-# ---------------- MAIN ORCHESTRATION ----------------
+# ---------------- Main loop ----------------
 async def main_loop():
     logging.info("START scanner: workers=%d, batch=%d, bloom_capacity=%d, bloom_err=%g",
                  WORKERS, BATCH_SIZE, BLOOM_CAPACITY, BLOOM_ERROR_RATE)
@@ -262,12 +220,10 @@ async def main_loop():
     try:
         TARGET_IN_FLIGHT = max(4, WORKERS * 2)
         while True:
-            # fill pipeline with CPU tasks
             while len(pending) < TARGET_IN_FLIGHT:
                 fut = asyncio.get_event_loop().run_in_executor(executor, process_batch, BATCH_SIZE)
                 pending.add(fut)
 
-            # wait for some to finish or timeout for reporting
             done, _ = await asyncio.wait(pending, timeout=REPORT_INTERVAL, return_when=asyncio.FIRST_COMPLETED)
             if done:
                 for fut in list(done):
@@ -281,7 +237,6 @@ async def main_loop():
                     if not results:
                         continue
 
-                    # check balances (async) for this batch of results
                     try:
                         hits = await check_balances(results)
                     except Exception as e:
@@ -291,17 +246,18 @@ async def main_loop():
                     for mnemonic, address, privhex, bal in hits:
                         print_hit(mnemonic, address, privhex, bal)
 
-            # periodic reporting
             now = time.time()
             if now - last_report >= REPORT_INTERVAL:
                 with checked_lock:
                     now_checked = checked
                 interval = now - last_report
                 speed = (now_checked - last_checked) / interval if interval > 0 else 0.0
+                with unique_addr_lock:
+                    ua = unique_addresses
                 with rpc_lock:
                     rs, re = rpc_success, rpc_errors
-                logging.info("[INFO] Checked: %s | Speed: %.2f valid mnemonics/sec | Unique addrs(bloom): %s | RPC ok: %d | RPC err: %d",
-                             f"{now_checked:,}", speed, f"~{len(seen_addresses):,}", rs, re)
+                logging.info("[INFO] Checked: %s | Speed: %.2f valid mnemonics/sec | Unique addrs(bloom): ~%s | RPC ok: %d | RPC err: %d",
+                             f"{now_checked:,}", speed, f"{ua:,}", rs, re)
                 last_report = now
                 last_checked = now_checked
 
