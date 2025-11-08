@@ -16,6 +16,7 @@ BATCH_RPC_SIZE = 5    # number of eth_getBalance calls per single POST
 STATS_INTERVAL = 10   # seconds
 MAX_RETRIES = 3
 RPC_TIMEOUT = 20      # seconds for aiohttp ClientTimeout
+FOUND_FILE = "found.txt"
 
 # -------- UTIL: keccak & checksum -------- #
 def keccak256(data: bytes) -> bytes:
@@ -49,8 +50,11 @@ def privkey_to_address_hex(priv_bytes: bytes) -> Tuple[str, str]:
     checksum = to_checksum_address(addr_hex)
     return priv_bytes.hex(), checksum
 
-# -------- RPC batching & retrying -------- #
+# -------- RPC batching & retrying (with debug) -------- #
 async def rpc_post(session: aiohttp.ClientSession, payload, attempt: int):
+    # debug: show the ids being sent and attempt
+    ids = [p.get("id") for p in payload] if isinstance(payload, list) else None
+    print(f"[DEBUG] Sending RPC batch (attempt {attempt+1}) ids={ids}")
     try:
         async with session.post(RPC_URL, json=payload) as resp:
             text = await resp.text()
@@ -81,7 +85,8 @@ def make_batch_payload(addresses: List[str], start_id: int) -> List[Dict]:
 
 # -------- WORKER -------- #
 async def worker(worker_id: int, session: aiohttp.ClientSession,
-                 stop_event: asyncio.Event, total_keys_lock: asyncio.Lock, state: dict):
+                 stop_event: asyncio.Event, total_keys_lock: asyncio.Lock,
+                 file_lock: asyncio.Lock, state: dict):
     id_counter = worker_id * 10_000_000
     while not stop_event.is_set():
         batch = []
@@ -148,11 +153,23 @@ async def worker(worker_id: int, session: aiohttp.ClientSession,
                 if balance_int > 0:
                     eth_bal = balance_int / 10 ** 18
                     border = "+" + "-" * 60 + "+"
-                    print(f"\n{border}")
-                    print(f"KEY: {priv_hex}")
-                    print(f"ADDRESS: {addr}")
-                    print(f"BALANCE: {eth_bal:.18f} ETH")
-                    print(f"{border}\n")
+                    block = (
+                        f"\n{border}\n"
+                        f"KEY: {priv_hex}\n"
+                        f"ADDRESS: {addr}\n"
+                        f"BALANCE: {eth_bal:.18f} ETH\n"
+                        f"{border}\n"
+                    )
+                    # print and append to file (same exact block)
+                    print(block, end="")
+
+                    # append to found.txt using file_lock to serialize writes
+                    async with file_lock:
+                        try:
+                            with open(FOUND_FILE, "a", encoding="utf-8") as fh:
+                                fh.write(block)
+                        except Exception as e:
+                            print(f"[ERROR] Failed to write to {FOUND_FILE}: {e}")
                 else:
                     print(f"{addr} | {0.0:.6f} ETH")
             idx += BATCH_RPC_SIZE
@@ -184,9 +201,10 @@ def install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asyncio
 
 # -------- MAIN -------- #
 async def main():
-    # create stop_event and lock in the running event loop
+    # create stop_event, locks and state in the running event loop
     stop_event = asyncio.Event()
     total_keys_lock = asyncio.Lock()
+    file_lock = asyncio.Lock()
     state = {"total_keys": 0}
 
     loop = asyncio.get_event_loop()
@@ -195,7 +213,7 @@ async def main():
     timeout = aiohttp.ClientTimeout(total=RPC_TIMEOUT)
     conn = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(timeout=timeout, connector=conn) as session:
-        workers = [asyncio.create_task(worker(i, session, stop_event, total_keys_lock, state))
+        workers = [asyncio.create_task(worker(i, session, stop_event, total_keys_lock, file_lock, state))
                    for i in range(CONCURRENCY)]
         stats = asyncio.create_task(stats_task(stop_event, total_keys_lock, state))
 
