@@ -164,13 +164,13 @@ def print_hit(mnemonic, address, privhex, balance_eth):
     print(f"| Balance : {balance_eth} ETH".ljust(55)[:55] + "|")
     print("+" + border + "+\n")
     try:
-        hits_fp.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n{address}\n{balance_eth}\n{privhex}\n{mnemonic}\n")
+        hits_fp.write(f"{mnemonic},{address},{privhex},{balance_eth}\n")
         hits_fp.flush()
     except Exception:
         logging.error("Failed to write hit to file: %s", traceback.format_exc(limit=5))
 
 # ---------------- Async RPC ----------------
-async def fetch_balance(session, address, max_retries=RPC_MAX_RETRIES):
+async def fetch_balance(session, address, max_retries=3):
     payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [address, "latest"], "id": 1}
     attempt = 0
     backoff_base = 1.2
