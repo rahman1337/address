@@ -1,30 +1,33 @@
 #!/usr/bin/env python3
 import asyncio
 import aiohttp
-import os
-import time
 from mnemonic import Mnemonic
 from eth_account import Account
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 # ---------------- SETTINGS ----------------
 RPC_URL = "https://ethereum.publicnode.com"
 MNEMONICS_PER_BATCH = 100
-PROCESS_WORKERS = os.cpu_count() or 4
-THREAD_WORKERS = 6  # Number of concurrent batches
+THREAD_WORKERS = 6  # just threads, no multiprocessing
+REPORT_INTERVAL = 5  # seconds
 
 mnemo = Mnemonic("english")
+
+# ---------------- GLOBALS ----------------
+mnemonics_checked = 0
 
 # ---------------- FUNCTIONS ----------------
 def generate_mnemonic():
     return mnemo.generate(strength=128)
 
 def derive_address(mnemonic_phrase):
+    global mnemonics_checked
     try:
         acct = Account.from_mnemonic(mnemonic_phrase)
         return acct.address, mnemonic_phrase
-    except:
-        return None, mnemonic_phrase
+    finally:
+        mnemonics_checked += 1
 
 async def fetch_balance(session, address):
     payload = {
@@ -42,11 +45,11 @@ async def fetch_balance(session, address):
     except:
         return 0
 
-async def process_batch(session, mnemonics, process_pool):
+async def process_batch(session, batch, executor):
     loop = asyncio.get_running_loop()
-    # Derive addresses in parallel
+    # Derive addresses using threads
     results = await asyncio.gather(*[
-        loop.run_in_executor(process_pool, derive_address, m) for m in mnemonics
+        loop.run_in_executor(executor, derive_address, m) for m in batch
     ])
 
     # Fetch balances asynchronously
@@ -64,21 +67,31 @@ async def process_batch(session, mnemonics, process_pool):
         if balance > 0:
             print(f"[HIT] {mnemonic_phrase} | {address} | {balance} ETH")
 
-async def worker(session, process_pool):
+async def worker(session, executor):
     while True:
         batch = [generate_mnemonic() for _ in range(MNEMONICS_PER_BATCH)]
-        await process_batch(session, batch, process_pool)
+        await process_batch(session, batch, executor)
+
+async def reporter():
+    global mnemonics_checked
+    last_count = 0
+    while True:
+        await asyncio.sleep(REPORT_INTERVAL)
+        checked_now = mnemonics_checked
+        speed = (checked_now - last_count) / REPORT_INTERVAL
+        print(f"[INFO] {checked_now} mnemonics checked | Speed: {speed:.2f} mnemonics/sec")
+        last_count = checked_now
 
 async def main():
-    print(f"[START] Ultimate Ethereum mnemonic checker")
-    print(f"Processes: {PROCESS_WORKERS}, Threads: {THREAD_WORKERS}, Batch size: {MNEMONICS_PER_BATCH}")
-    process_pool = ProcessPoolExecutor(max_workers=PROCESS_WORKERS)
+    print(f"[START] Ethereum mnemonic checker with speed report")
+    executor = ThreadPoolExecutor(max_workers=THREAD_WORKERS)
     async with aiohttp.ClientSession() as session:
-        workers = [worker(session, process_pool) for _ in range(THREAD_WORKERS)]
+        workers = [worker(session, executor) for _ in range(THREAD_WORKERS)]
+        workers.append(reporter())  # add reporter task
         await asyncio.gather(*workers)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[STOP] User interrupted")
+        print("\n[STOP] Stopped by user")
