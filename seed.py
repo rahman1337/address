@@ -1,25 +1,14 @@
 #!/usr/bin/env python3
-"""
-Scanner:
-- English mnemonics for ETH
-- Chinese Simplified mnemonics for BSC
-- 5 threads, batch 100
-- No repeated addresses
-- Retries on RPC errors
-- Live printing of address/balances in gray
-- Bordered hit block in light green + line-by-line hits.txt
-- Live addresses/sec counter
-"""
 
-import time, sys, requests, hashlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio, sys, time, hashlib
+from concurrent.futures import ThreadPoolExecutor
+import aiohttp
 from mnemonic import Mnemonic
 import coincurve
 from bip32 import BIP32
 
 # ---------------- CONFIG ----------------
 THREADS = 5
-BATCH_SIZE = 100
 DERIVATION_PATH = "m/44'/60'/0'/0/0"
 RPCS = {
     "eth": "https://ethereum.publicnode.com",
@@ -28,20 +17,15 @@ RPCS = {
 HITS_FILE = "hits.txt"
 RPC_RETRIES = 3
 REQUEST_TIMEOUT = 10
+CANDIDATE_CHUNK = 20  # number of mnemonics to generate per loop
 # ---------------------------------------
 
-# ANSI colors
-GREEN = "\033[92m"   # light green for hits
-GRAY = "\033[90m"    # dim gray for normal live prints
-RESET = "\033[0m"    # reset color
-
-mnemo_en = Mnemonic("english")               # for ETH
-mnemo_cn = Mnemonic("chinese_simplified")   # for BSC
+mnemo_en = Mnemonic("english")               
+mnemo_cn = Mnemonic("chinese_simplified")   
 executor = ThreadPoolExecutor(max_workers=THREADS)
 hits_fp = open(HITS_FILE, "a", encoding="utf-8")
 seen_addresses = set()  # dedupe
 
-# ---------------- Derivation ----------------
 def derive(seed_bytes):
     bip32 = BIP32.from_seed(seed_bytes)
     priv = bip32.get_privkey_from_path(DERIVATION_PATH)
@@ -56,121 +40,117 @@ def derive(seed_bytes):
     )
     return priv.hex(), checksum_addr
 
-# ---------------- Batch generation ----------------
-def generate_batch():
-    batch = []
-    while len(batch) < BATCH_SIZE:
-        # ETH mnemonic (English)
-        mn_eth = mnemo_en.generate(128)
-        seed_eth = mnemo_en.to_seed(mn_eth)
-        priv_eth, addr_eth = derive(seed_eth)
-        # BSC mnemonic (Chinese)
-        mn_bsc = mnemo_cn.generate(128)
-        seed_bsc = mnemo_cn.to_seed(mn_bsc)
-        priv_bsc, addr_bsc = derive(seed_bsc)
-
-        # dedupe
-        if addr_eth.lower() in seen_addresses or addr_bsc.lower() in seen_addresses:
-            continue
-        seen_addresses.add(addr_eth.lower())
-        seen_addresses.add(addr_bsc.lower())
-
-        batch.append({
-            "mn_eth": mn_eth, "priv_eth": priv_eth, "addr_eth": addr_eth,
-            "mn_bsc": mn_bsc, "priv_bsc": priv_bsc, "addr_bsc": addr_bsc
-        })
-    return batch
-
-# ---------------- RPC / retries ----------------
-def fetch_balance(addr, chain):
+async def fetch_balance(session, addr, chain):
     url = RPCS[chain]
     payload = {"jsonrpc": "2.0","method":"eth_getBalance","params":[addr,"latest"],"id":1}
     for attempt in range(1, RPC_RETRIES+1):
         try:
-            r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-            if r.status_code != 200:
-                print(f"RPC : {chain} ERROR (status {r.status_code}) attempt {attempt}/{RPC_RETRIES}")
-                time.sleep(1.2**attempt)
-                continue
-            data = r.json()
-            result = data.get("result","0x0")
-            bal = int(result,16)/10**18
-            print(f"RPC : {chain} OK (attempt {attempt})")
-            return bal
-        except Exception as e:
-            print(f"RPC : {chain} ERR attempt {attempt}/{RPC_RETRIES}: {e}")
-            time.sleep(1.2**attempt)
-    print(f"RPC : {chain} FAIL after {RPC_RETRIES} attempts")
+            async with session.post(url, json=payload, timeout=REQUEST_TIMEOUT) as r:
+                if r.status != 200:
+                    continue
+                data = await r.json()
+                result = data.get("result","0x0")
+                bal = int(result,16)/10**18
+                return bal
+        except:
+            await asyncio.sleep(1.2**attempt)
     return 0.0
 
-# ---------------- Hit printing ----------------
 def print_hit(mn_eth, priv_eth, addr_eth, eth_bal,
               mn_bsc, priv_bsc, addr_bsc, bsc_bal):
     border = "=" * 53
-    print(GREEN + "\n+" + border + "+")
-    print("| MATCH FOUND".ljust(55) + "|")
-    print("+" + border + "+")
-    print(f"| ETH Mnemonic: {mn_eth}".ljust(55)[:55]+"|")
-    print(f"| ETH Address : {addr_eth}".ljust(55)[:55]+"|")
-    print(f"| ETH PrivKey : {priv_eth}".ljust(55)[:55]+"|")
-    print(f"| ETH Bal     : {eth_bal}".ljust(55)[:55]+"|")
-    print(f"| BSC Mnemonic: {mn_bsc}".ljust(55)[:55]+"|")
-    print(f"| BSC Address : {addr_bsc}".ljust(55)[:55]+"|")
-    print(f"| BSC PrivKey : {priv_bsc}".ljust(55)[:55]+"|")
-    print(f"| BSC Bal     : {bsc_bal}".ljust(55)[:55]+"|")
-    print("+" + border + "+\n" + RESET)
+    hit_lines = [
+        "+" + border + "+",
+        "| MATCH FOUND".ljust(55) + "|",
+        "+" + border + "+",
+        f"| ETH Mnemonic: {mn_eth}".ljust(55)[:55]+"|",
+        f"| ETH Address : {addr_eth}".ljust(55)[:55]+"|",
+        f"| ETH PrivKey : {priv_eth}".ljust(55)[:55]+"|",
+        f"| ETH Bal     : {eth_bal}".ljust(55)[:55]+"|",
+        f"| BSC Mnemonic: {mn_bsc}".ljust(55)[:55]+"|",
+        f"| BSC Address : {addr_bsc}".ljust(55)[:55]+"|",
+        f"| BSC PrivKey : {priv_bsc}".ljust(55)[:55]+"|",
+        f"| BSC Bal     : {bsc_bal}".ljust(55)[:55]+"|",
+        "+" + border + "+"
+    ]
+    print("\n" + "\n".join(hit_lines) + "\n")
     try:
         hits_fp.write(f"{mn_eth},{priv_eth},{addr_eth},{eth_bal},{mn_bsc},{priv_bsc},{addr_bsc},{bsc_bal}\n")
         hits_fp.flush()
-    except Exception as e:
-        print("Failed to write hit:", e)
+    except:
+        pass
 
-# ---------------- Live printing ----------------
 def print_live(addr, bal, chain):
     bal_str = f"{bal}" if bal > 0 else "0.0"
-    print(GRAY + f"{addr} | {chain}:{bal_str}" + RESET)
+    print(f"{addr} | {chain}:{bal_str}")
 
-# ---------------- Main loop ----------------
-def main():
-    print(f"START scanner: threads={THREADS}, batch={BATCH_SIZE}")
-    start_time = time.time()
+async def worker_loop():
     addr_checked = 0
+    start_time = time.time()
+    async with aiohttp.ClientSession() as session:
+        try:
+            while True:
+                mnemonics_eth = [mnemo_en.generate(128) for _ in range(CANDIDATE_CHUNK)]
+                mnemonics_bsc = [mnemo_cn.generate(128) for _ in range(CANDIDATE_CHUNK)]
+
+                tasks = []
+                for mn_eth, mn_bsc in zip(mnemonics_eth, mnemonics_bsc):
+                    seed_eth = mnemo_en.to_seed(mn_eth)
+                    priv_eth, addr_eth = derive(seed_eth)
+
+                    seed_bsc = mnemo_cn.to_seed(mn_bsc)
+                    priv_bsc, addr_bsc = derive(seed_bsc)
+
+                    # dedupe
+                    if addr_eth.lower() in seen_addresses or addr_bsc.lower() in seen_addresses:
+                        continue
+                    seen_addresses.add(addr_eth.lower())
+                    seen_addresses.add(addr_bsc.lower())
+
+                    tasks.append((mn_eth, priv_eth, addr_eth, mn_bsc, priv_bsc, addr_bsc))
+
+                # fetch balances concurrently
+                balance_tasks = []
+                for mn_eth, priv_eth, addr_eth, mn_bsc, priv_bsc, addr_bsc in tasks:
+                    balance_tasks.append(asyncio.gather(
+                        fetch_balance(session, addr_eth, "eth"),
+                        fetch_balance(session, addr_bsc, "bsc"),
+                        return_exceptions=True
+                    ))
+                results = await asyncio.gather(*balance_tasks)
+
+                for i, (mn_eth, priv_eth, addr_eth, mn_bsc, priv_bsc, addr_bsc) in enumerate(tasks):
+                    eth_bal, bsc_bal = results[i]
+                    addr_checked += 2
+
+                    # live prints
+                    print_live(addr_eth, eth_bal, "ETH")
+                    print_live(addr_bsc, bsc_bal, "BSC")
+
+                    elapsed = max(time.time()-start_time, 1)
+                    speed = addr_checked / elapsed
+                    print(f"Addresses/sec: {speed:.2f}")
+
+                    if eth_bal>0 or bsc_bal>0:
+                        print_hit(mn_eth, priv_eth, addr_eth, eth_bal,
+                                  mn_bsc, priv_bsc, addr_bsc, bsc_bal)
+
+        except asyncio.CancelledError:
+            return
+
+async def main():
+    print(f"START scanner: threads={THREADS}")
+    tasks = [asyncio.create_task(worker_loop()) for _ in range(THREADS)]
     try:
-        while True:
-            futures = [executor.submit(generate_batch) for _ in range(THREADS)]
-            all_results = []
-            for f in as_completed(futures):
-                try:
-                    all_results.extend(f.result())
-                except Exception as e:
-                    print("Batch generation error:", e)
-            for item in all_results:
-                eth_bal = fetch_balance(item["addr_eth"], "eth")
-                bsc_bal = fetch_balance(item["addr_bsc"], "bsc")
-                addr_checked += 2  # ETH + BSC
-
-                # Live print
-                print_live(item['addr_eth'], eth_bal, "ETH")
-                print_live(item['addr_bsc'], bsc_bal, "BSC")
-
-                # Print hit if either >0
-                if eth_bal>0 or bsc_bal>0:
-                    print_hit(
-                        item["mn_eth"], item["priv_eth"], item["addr_eth"], eth_bal,
-                        item["mn_bsc"], item["priv_bsc"], item["addr_bsc"], bsc_bal
-                    )
-
-                # Live addresses/sec counter
-                elapsed = max(time.time()-start_time, 1)
-                speed = addr_checked / elapsed
-                print(GRAY + f"Addresses/sec: {speed:.2f}" + RESET)
+        await asyncio.gather(*tasks)
     except KeyboardInterrupt:
+        for t in tasks:
+            t.cancel()
         print("\nStopping scanner (Ctrl+C received).")
     finally:
         try: hits_fp.close()
         except: pass
-        executor.shutdown(wait=False)
         sys.exit(0)
 
 if __name__=="__main__":
-    main()
+    asyncio.run(main())
