@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import asyncio, aiohttp, hashlib, time
+import requests, time, hashlib
 from concurrent.futures import ThreadPoolExecutor
 from mnemonic import Mnemonic
 import coincurve
@@ -18,14 +18,10 @@ mnemo = Mnemonic("english")
 executor = ThreadPoolExecutor(max_workers=WORKERS)
 hits_fp = open(HITS_FILE,"a",encoding="utf-8")
 
-# ---------------- DEDUPLICATION ----------------
 seen_mnemonics = set()
 seen_addresses = set()
-
-# ---------------- SPEED MONITOR ----------------
 total_checked = 0
 start_time = time.time()
-lock = asyncio.Lock()  # safe counter across async
 
 # ---------------- DERIVATION ----------------
 def generate_mnemonic():
@@ -66,53 +62,32 @@ def print_hit(mnemonic, priv, address, eth_bal, bsc_bal):
     except Exception as e:
         print("Failed to write hit:", e)
 
-# ---------------- BALANCE CHECK ----------------
-async def fetch_balance(session,address,chain):
-    payload={"jsonrpc":"2.0","method":"eth_getBalance","params":[address,"latest"],"id":1}
-    for attempt in range(3):
+# ---------------- BALANCE ----------------
+def fetch_balance(addr, chain):
+    payload={"jsonrpc":"2.0","method":"eth_getBalance","params":[addr,"latest"],"id":1}
+    for _ in range(3):
         try:
-            async with session.post(RPCS[chain],json=payload,timeout=10) as resp:
-                data = await resp.json()
-                bal = int(data.get("result","0x0"),16)/10**18
-                return bal,"OK"
+            r = requests.post(RPCS[chain], json=payload, timeout=10)
+            data = r.json()
+            bal = int(data.get("result","0x0"),16)/10**18
+            return bal, "OK"
         except:
-            await asyncio.sleep(1.2**attempt)
+            time.sleep(1)
     return 0.0,"FAIL"
 
-async def check_balances(results):
-    global total_checked, BATCH_SIZE
-    async with aiohttp.ClientSession() as session:
-        tasks=[]
-        mapping=[]
-        for mnemonic,priv,addr in results:
-            for chain in ("eth","bsc"):
-                tasks.append(fetch_balance(session,addr,chain))
-                mapping.append((mnemonic,priv,addr,chain))
-        start_rpc = time.time()
-        res = await asyncio.gather(*tasks)
-        for (mnemonic,priv,addr,chain),(bal,status) in zip(mapping,res):
-            # Update counter & compute speed
-            async with lock:
-                total_checked += 1
-                elapsed = time.time() - start_time
-                speed = total_checked / elapsed if elapsed>0 else 0
-            bal_str = f"{bal}" if bal>0 else "0.0"
-            # Live print per address
-            print(f"{addr} | {chain.upper()} balance: {bal_str} | RPC: {status} | Speed: {speed:.2f} addr/sec")
-            if bal>0:
-                if chain=="eth":
-                    eth_bal=bal
-                    bsc_bal=0
-                else:
-                    eth_bal=0
-                    bsc_bal=bal
-                print_hit(mnemonic,priv,addr,eth_bal,bsc_bal)
-        # Dynamic batch adjustment
-        rpc_elapsed = time.time() - start_rpc
-        if rpc_elapsed < 0.8:  # RPC very fast → increase batch
-            BATCH_SIZE = min(BATCH_SIZE+50, 1000)
-        elif rpc_elapsed > 2.0:  # RPC slow → reduce batch
-            BATCH_SIZE = max(BATCH_SIZE-50, 100)
+def check_balances(results):
+    global total_checked
+    for mnemonic, priv, addr in results:
+        eth_bal, eth_status = fetch_balance(addr,"eth")
+        bsc_bal, bsc_status = fetch_balance(addr,"bsc")
+        total_checked += 1
+        elapsed = time.time()-start_time
+        speed = total_checked/elapsed if elapsed>0 else 0
+        # Live prints
+        print(f"{addr} | ETH: {eth_bal if eth_bal>0 else 0.0} | RPC: {eth_status} | Speed: {speed:.2f} addr/sec")
+        print(f"{addr} | BSC: {bsc_bal if bsc_bal>0 else 0.0} | RPC: {bsc_status} | Speed: {speed:.2f} addr/sec")
+        if eth_bal>0 or bsc_bal>0:
+            print_hit(mnemonic, priv, addr, eth_bal, bsc_bal)
 
 # ---------------- BATCH GENERATION ----------------
 def generate_batch():
@@ -120,24 +95,24 @@ def generate_batch():
     while len(batch)<BATCH_SIZE:
         try:
             m = generate_mnemonic()
-            priv,addr = derive_address(m)
-            batch.append((m,priv,addr))
-        except Exception:
+            priv, addr = derive_address(m)
+            batch.append((m, priv, addr))
+        except:
             continue
     return batch
 
 # ---------------- MAIN LOOP ----------------
-async def main():
-    loop = asyncio.get_event_loop()
+def main():
     while True:
-        futures = [loop.run_in_executor(executor,generate_batch) for _ in range(WORKERS)]
-        results = await asyncio.gather(*futures)
-        flat = [item for sublist in results for item in sublist]
-        await check_balances(flat)
+        futures = [executor.submit(generate_batch) for _ in range(WORKERS)]
+        results = []
+        for f in futures:
+            results.extend(f.result())
+        check_balances(results)
 
 # ---------------- ENTRY ----------------
 if __name__=="__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         hits_fp.close()
