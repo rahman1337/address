@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Ultra-fast ETH mnemonic generator + balance checker (with caching)
+Ultra-fast ETH mnemonic generator + balance checker (no multiprocessing.Lock)
 - Uses coincurve via eth_account
 - Multiprocessing across 6 CPU cores
 - Queries balances via ethereum.publicnode.com
-- Caches checked addresses locally to skip repeats
+- Caches checked addresses using Manager.dict() (process-safe)
 - Prints non-zero balances only
 - Displays speed every 5 seconds
 """
@@ -19,7 +19,7 @@ CORES = 6
 RPC_URL = "https://ethereum.publicnode.com"
 CACHE_FILE = "checked_addrs.txt"
 
-# Load existing cache (if any)
+# Load existing cache
 def load_cache():
     if os.path.exists(CACHE_FILE):
         with open(CACHE_FILE, "r") as f:
@@ -28,7 +28,7 @@ def load_cache():
 
 def save_cache(cache):
     with open(CACHE_FILE, "w") as f:
-        for addr in cache:
+        for addr in cache.keys():
             f.write(addr + "\n")
 
 def get_balance(address):
@@ -47,7 +47,7 @@ def get_balance(address):
     except Exception:
         return 0
 
-def worker(counter, cache, lock):
+def worker(counter, cache):
     local_count = 0
     while True:
         for _ in range(BATCH):
@@ -55,18 +55,17 @@ def worker(counter, cache, lock):
             acct = Account.from_mnemonic(words)
             addr = acct.address
 
-            with lock:
-                if addr in cache:
-                    continue
-                cache.add(addr)
+            # Skip if already checked (Manager.dict() is process-safe)
+            if addr in cache:
+                continue
+            cache[addr] = True
 
             bal = get_balance(addr)
             if bal > 0:
                 eth = bal / 10**18
                 print(f"\n[HIT] {addr} | {eth:.8f} ETH | {words}\n", flush=True)
-                # Save immediately on hit
-                with lock:
-                    save_cache(cache)
+                # Save cache immediately
+                save_cache(cache)
 
             local_count += 1
 
@@ -87,10 +86,9 @@ def speed_display(counter):
 def main():
     print(f"[START] Using {CORES} CPU cores | Batch {BATCH}")
     manager = multiprocessing.Manager()
-    cache = manager.dict()  # shared cache between workers
-    lock = multiprocessing.Lock()
+    cache = manager.dict()
 
-    # Preload existing checked addresses
+    # Preload existing addresses from cache file
     initial = load_cache()
     for a in initial:
         cache[a] = True
@@ -98,13 +96,13 @@ def main():
 
     counter = multiprocessing.Value("Q", 0)
 
-    # Speed monitor
+    # Start speed monitor
     m = multiprocessing.Process(target=speed_display, args=(counter,), daemon=True)
     m.start()
 
-    # Workers
+    # Start worker processes
     workers = [
-        multiprocessing.Process(target=worker, args=(counter, cache, lock))
+        multiprocessing.Process(target=worker, args=(counter, cache))
         for _ in range(CORES)
     ]
     for w in workers: w.start()
