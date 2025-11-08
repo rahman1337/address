@@ -12,11 +12,14 @@ from Crypto.Hash import keccak
 RPC_URL = "https://ethereum-rpc.publicnode.com"
 CONCURRENCY = 5       # number of concurrent workers
 BATCH_SIZE = 100      # keys generated per worker loop
-BATCH_RPC_SIZE = 5    # number of eth_getBalance calls per single POST
+BATCH_RPC_SIZE = 10   # increased RPC batch size from 5 -> 10
 STATS_INTERVAL = 10   # seconds
 MAX_RETRIES = 3
 RPC_TIMEOUT = 20      # seconds for aiohttp ClientTimeout
 FOUND_FILE = "found.txt"
+
+# Clear terminal at start
+os.system("clear")
 
 # -------- UTIL: keccak & checksum -------- #
 def keccak256(data: bytes) -> bytes:
@@ -50,14 +53,15 @@ def privkey_to_address_hex(priv_bytes: bytes) -> Tuple[str, str]:
     checksum = to_checksum_address(addr_hex)
     return priv_bytes.hex(), checksum
 
-# -------- RPC batching & retrying (with debug) -------- #
+# -------- RPC batching & retrying (with debug & response print) -------- #
 async def rpc_post(session: aiohttp.ClientSession, payload, attempt: int):
-    # debug: show the ids being sent and attempt
     ids = [p.get("id") for p in payload] if isinstance(payload, list) else None
     print(f"[DEBUG] Sending RPC batch (attempt {attempt+1}) ids={ids}")
     try:
         async with session.post(RPC_URL, json=payload) as resp:
+            status = resp.status
             text = await resp.text()
+            print(f"[DEBUG] HTTP {status} received, first 200 chars: {text[:200]}")
             try:
                 return await resp.json(content_type=None)
             except Exception:
@@ -160,10 +164,8 @@ async def worker(worker_id: int, session: aiohttp.ClientSession,
                         f"BALANCE: {eth_bal:.18f} ETH\n"
                         f"{border}\n"
                     )
-                    # print and append to file (same exact block)
                     print(block, end="")
 
-                    # append to found.txt using file_lock to serialize writes
                     async with file_lock:
                         try:
                             with open(FOUND_FILE, "a", encoding="utf-8") as fh:
@@ -187,12 +189,10 @@ async def stats_task(stop_event: asyncio.Event, total_keys_lock: asyncio.Lock, s
 
 # -------- SIGNAL HANDLER -------- #
 def install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event):
-    # set stop_event when SIGINT/SIGTERM received
     def _set_done():
         if not stop_event.is_set():
             print("\n[INFO] Ctrl+C received — shutting down...")
             stop_event.set()
-
     for s in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(s, _set_done)
@@ -201,7 +201,6 @@ def install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asyncio
 
 # -------- MAIN -------- #
 async def main():
-    # create stop_event, locks and state in the running event loop
     stop_event = asyncio.Event()
     total_keys_lock = asyncio.Lock()
     file_lock = asyncio.Lock()
@@ -227,7 +226,6 @@ async def main():
         print("[INFO] Shutdown complete.")
 
 if __name__ == "__main__":
-    # create and run a fresh event loop explicitly (avoids asyncio.run loop mismatch on some 3.9 setups)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
