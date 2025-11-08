@@ -7,12 +7,12 @@ from eth_account import Account
 Account.enable_unaudited_hdwallet_features()
 
 # Configuration
-BATCH = 1000             # number of mnemonics per generation batch
-THREADS = 6              # number of balance worker threads
+BATCH = 100             # number of mnemonics per generation batch
+THREADS = 5              # number of balance worker threads
 RPC_URL = "https://ethereum.publicnode.com"
 CACHE_FILE = "checked_addrs.txt"
 CACHE_SAVE_INTERVAL = 30 # seconds
-BALANCE_BATCH_SIZE = 20  # number of addresses per JSON-RPC batch
+BALANCE_BATCH_SIZE = 10  # number of addresses per JSON-RPC batch
 
 mnemo = Mnemonic("english")
 addr_queue = queue.Queue()
