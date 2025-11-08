@@ -2,6 +2,7 @@
 import asyncio
 import signal
 import os
+import argparse
 from typing import List, Tuple, Dict
 import concurrent.futures
 
@@ -18,6 +19,12 @@ STATS_INTERVAL = 60    # seconds
 MAX_RETRIES = 3
 RPC_TIMEOUT = 20
 FOUND_FILE = "found.txt"
+
+# -------- ARGPARSE -------- #
+parser = argparse.ArgumentParser(description="Async Ethereum key scanner")
+parser.add_argument("--debug", action="store_true", help="Enable debug prints (RPC payloads/responses)")
+args = parser.parse_args()
+DEBUG = args.debug
 
 # Clear terminal at start
 os.system("clear")
@@ -54,10 +61,16 @@ def privkey_to_address_hex(priv_bytes: bytes) -> Tuple[str, str]:
     checksum = to_checksum_address(addr_hex)
     return priv_bytes.hex(), checksum
 
-# -------- RPC batching & retrying -------- #
+# -------- RPC batching & retrying (with optional debug) -------- #
 async def rpc_post(session: aiohttp.ClientSession, payload, attempt: int):
+    if DEBUG:
+        ids = [p.get("id") for p in payload] if isinstance(payload, list) else None
+        print(f"[DEBUG] Sending RPC batch (attempt {attempt+1}) ids={ids}")
     try:
         async with session.post(RPC_URL, json=payload) as resp:
+            text = await resp.text()
+            if DEBUG:
+                print(f"[DEBUG] HTTP {resp.status} received, first 200 chars: {text[:200]}")
             return await resp.json(content_type=None)
     except Exception as e:
         if attempt + 1 < MAX_RETRIES:
@@ -69,7 +82,7 @@ async def rpc_post(session: aiohttp.ClientSession, payload, attempt: int):
             return None
 
 def make_batch_payload(addresses: List[str], start_id: int) -> List[Dict]:
-    return [{"jsonrpc": "2.0", "method": "eth_getBalance", "params": [addr, "latest"], "id": start_id + i} 
+    return [{"jsonrpc": "2.0", "method": "eth_getBalance", "params": [addr, "latest"], "id": start_id + i}
             for i, addr in enumerate(addresses)]
 
 # -------- WORKER -------- #
@@ -79,7 +92,7 @@ async def worker(worker_id: int, session: aiohttp.ClientSession,
                  executor: concurrent.futures.ThreadPoolExecutor):
     id_counter = worker_id * 10_000_000
     while not stop_event.is_set():
-        # Generate batch of keys using ThreadPool to parallelize CPU-bound crypto
+        # generate privkeys in ThreadPool (parallel CPU work)
         tasks = [loop.run_in_executor(executor, generate_privkey_bytes) for _ in range(BATCH_SIZE)]
         priv_bytes_list = await asyncio.gather(*tasks)
         batch = [privkey_to_address_hex(priv_bytes) for priv_bytes in priv_bytes_list]
@@ -181,7 +194,6 @@ async def main():
     loop = asyncio.get_event_loop()
     install_signal_handlers(loop, stop_event)
 
-    # ThreadPool for CPU-bound key generation
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY)
 
     timeout = aiohttp.ClientTimeout(total=RPC_TIMEOUT)
