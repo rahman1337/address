@@ -3,9 +3,9 @@ import asyncio
 import aiohttp
 from mnemonic import Mnemonic
 from eth_account import Account
+Account.enable_unaudited_hdwallet_features()
 from concurrent.futures import ThreadPoolExecutor
 import time
-Account.enable_unaudited_hdwallet_features()
 
 # ---------------- SETTINGS ----------------
 RPC_URL = "https://ethereum.publicnode.com"
