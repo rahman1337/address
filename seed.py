@@ -1,206 +1,143 @@
 #!/usr/bin/env python3
-"""
-ETH + BSC Mnemonic Scanner (MAX CPU, RPC Resilient)
-- 6 cores full saturation
-- Dynamic batch sizing
-- coincurve C-backed EC derivation
-- BIP39/BIP32 compatible
-- Live ETH/BSC balances & clean prints
-"""
-
-import asyncio, aiohttp, hashlib, json, threading, traceback, math, random
+import asyncio, aiohttp, hashlib, time
 from concurrent.futures import ThreadPoolExecutor
 from mnemonic import Mnemonic
-from bip32 import BIP32
 import coincurve
-import logging
+from bip32 import BIP32
 
 # ---------------- CONFIG ----------------
 WORKERS = 6
-BASE_BATCH_SIZE = 1000  # will adjust dynamically
+BATCH_SIZE = 500
 DERIVATION_PATH = "m/44'/60'/0'/0/0"
-RPCS = {
-    "eth": "https://ethereum.publicnode.com",
-    "bsc": "https://bsc.publicnode.com"
-}
+RPCS = {"eth":"https://ethereum.publicnode.com",
+        "bsc":"https://bsc.publicnode.com"}
 HITS_FILE = "hits.txt"
-RPC_MAX_RETRIES = 3
-BLOOM_CAPACITY = 30_000_000
-BLOOM_ERROR_RATE = 1e-5
-# ------------------------------
+# ---------------------------------------
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 mnemo = Mnemonic("english")
-checked = 0
-checked_lock = threading.Lock()
-unique_addresses = 0
-unique_addr_lock = threading.Lock()
-hits_fp = open(HITS_FILE, "a", encoding="utf-8")
+executor = ThreadPoolExecutor(max_workers=WORKERS)
+hits_fp = open(HITS_FILE,"a",encoding="utf-8")
 
-# ---------------- Bloom Filter ----------------
-class BloomFilter:
-    def __init__(self, capacity: int, error_rate: float):
-        m = -capacity * math.log(error_rate) / (math.log(2)**2)
-        k = max(1, int(round((m/capacity)*math.log(2))))
-        self.m = int(m)
-        self.k = k
-        self._bits = bytearray((self.m + 7)//8)
-        self._lock = threading.Lock()
-    def _hashes(self, data: bytes):
-        h = hashlib.sha256(data).digest()
-        idxs = []
-        counter = 0
-        while len(idxs) < self.k:
-            chunk = hashlib.sha256(h + counter.to_bytes(2,"big")).digest()
-            for i in range(0,len(chunk),8):
-                if len(idxs) >= self.k: break
-                val = int.from_bytes(chunk[i:i+8],"big")
-                idxs.append(val % self.m)
-            counter+=1
-        return idxs
-    def add(self, data):
-        if isinstance(data,str): data=data.encode("utf-8")
-        idxs = self._hashes(data)
-        with self._lock:
-            for i in idxs: self._bits[i>>3]|=(1<<(i&7))
-    def __contains__(self,data):
-        if isinstance(data,str): data=data.encode("utf-8")
-        idxs=self._hashes(data)
-        with self._lock:
-            for i in idxs:
-                if not (self._bits[i>>3] & (1<<(i&7))): return False
-        return True
+# ---------------- DEDUPLICATION ----------------
+seen_mnemonics = set()
+seen_addresses = set()
 
-mnemonic_bloom = BloomFilter(BLOOM_CAPACITY,BLOOM_ERROR_RATE)
-address_bloom = BloomFilter(BLOOM_CAPACITY,BLOOM_ERROR_RATE)
+# ---------------- SPEED MONITOR ----------------
+total_checked = 0
+start_time = time.time()
+lock = asyncio.Lock()  # safe counter across async
 
-# ---------------- Helpers ----------------
-def generate_unique_mnemonic():
+# ---------------- DERIVATION ----------------
+def generate_mnemonic():
     while True:
-        m = mnemo.generate(128)  # 12 words
-        h = hashlib.sha256(m.encode("utf-8")).digest()
-        if h in mnemonic_bloom: continue
-        mnemonic_bloom.add(h)
-        return m
+        m = mnemo.generate(128)
+        if m not in seen_mnemonics:
+            seen_mnemonics.add(m)
+            return m
 
-def mnemonic_to_priv_and_address_coincurve(mnemonic_phrase):
-    seed = mnemo.to_seed(mnemonic_phrase)
+def derive_address(mnemonic):
+    seed = mnemo.to_seed(mnemonic)
     bip32 = BIP32.from_seed(seed)
-    priv_bytes = bip32.get_privkey_from_path(DERIVATION_PATH)
-    pk = coincurve.PrivateKey(priv_bytes)
-    pub_bytes = pk.public_key.format(compressed=False)[1:]
-    addr_bytes = hashlib.sha3_256(pub_bytes).digest()[-20:]
-    checksum_addr = "0x"+"".join(
-        c.upper() if int(hashlib.sha3_256(pub_bytes).hexdigest()[i],16)>=8 else c
-        for i,c in enumerate(addr_bytes.hex())
-    )
-    return pk.to_hex(), checksum_addr
+    priv = bip32.get_privkey_from_path(DERIVATION_PATH)
+    pk = coincurve.PrivateKey(priv)
+    pub = pk.public_key.format(compressed=False)[1:]
+    addr_bytes = hashlib.sha3_256(pub).digest()[-20:]
+    addr = "0x" + addr_bytes.hex()
+    if addr in seen_addresses:
+        raise ValueError("Address already derived")
+    seen_addresses.add(addr)
+    return priv.hex(), addr
 
-def process_batch(batch_size):
-    global checked, unique_addresses
-    results=[]
-    for _ in range(batch_size):
-        try:
-            mnemonic = generate_unique_mnemonic()
-            privhex,address = mnemonic_to_priv_and_address_coincurve(mnemonic)
-        except Exception as e:
-            logging.error("Derivation error: %s", e)
-            continue
-        addr_lower = address.lower()
-        if addr_lower in address_bloom: continue
-        address_bloom.add(addr_lower)
-        with unique_addr_lock: unique_addresses+=1
-        with checked_lock: checked+=1
-        results.append((mnemonic,address,privhex))
-    return results
-
-def print_hit(mnemonic,address,privhex,eth_bal,bsc_bal):
-    border = "="*53
-    print("\n+"+border+"+")
-    print("| MATCH FOUND".ljust(55)+"|")
-    print("+"+border+"+")
-    print(f"| Mnemonic: {mnemonic}".ljust(55)[:55]+"|")
-    print(f"| Address : {address}".ljust(55)[:55]+"|")
-    print(f"| PrivKey : {privhex}".ljust(55)[:55]+"|")
-    print(f"| ETH Bal : {eth_bal} ETH".ljust(55)[:55]+"|")
-    print(f"| BSC Bal : {bsc_bal} BNB".ljust(55)[:55]+"|")
-    print("+"+border+"+\n")
+# ---------------- HITS ----------------
+def print_hit(mnemonic, priv, address, eth_bal, bsc_bal):
+    border = "=" * 53
+    print("\n+" + border + "+")
+    print("| MATCH FOUND".ljust(55) + "|")
+    print("+" + border + "+")
+    print(f"| Mnemonic: {mnemonic}".ljust(55)[:55] + "|")
+    print(f"| Address : {address}".ljust(55)[:55] + "|")
+    print(f"| PrivKey : {priv}".ljust(55)[:55] + "|")
+    print(f"| ETH Bal : {eth_bal}".ljust(55)[:55] + "|")
+    print(f"| BSC Bal : {bsc_bal}".ljust(55)[:55] + "|")
+    print("+" + border + "+\n")
     try:
-        hits_fp.write(f"{mnemonic},{address},{privhex},{eth_bal},{bsc_bal}\n")
+        hits_fp.write(f"{mnemonic},{priv},{address},{eth_bal},{bsc_bal}\n")
         hits_fp.flush()
-    except Exception:
-        logging.error("Failed to write hit: %s",traceback.format_exc(limit=5))
+    except Exception as e:
+        print("Failed to write hit:", e)
 
-# ---------------- RPC ----------------
-async def fetch_balance(session,address,chain,retries=RPC_MAX_RETRIES):
-    rpc_url = RPCS[chain]
-    payload = {"jsonrpc":"2.0","method":"eth_getBalance","params":[address,"latest"],"id":1}
-    for attempt in range(1,retries+1):
+# ---------------- BALANCE CHECK ----------------
+async def fetch_balance(session,address,chain):
+    payload={"jsonrpc":"2.0","method":"eth_getBalance","params":[address,"latest"],"id":1}
+    for attempt in range(3):
         try:
-            async with session.post(rpc_url,json=payload,timeout=10) as resp:
-                text = await resp.text()
-                if resp.status!=200: raise Exception(f"RPC status {resp.status}")
-                data = json.loads(text)
-                bal_wei = int(data.get("result","0x0"),16)
-                return bal_wei/10**18, "200 OK"
-        except Exception as e:
-            print(f"RPC : {chain} ERROR (attempt {attempt}/{retries})")
+            async with session.post(RPCS[chain],json=payload,timeout=10) as resp:
+                data = await resp.json()
+                bal = int(data.get("result","0x0"),16)/10**18
+                return bal,"OK"
+        except:
             await asyncio.sleep(1.2**attempt)
     return 0.0,"FAIL"
 
-async def check_balances(results,session):
-    hits=[]
-    tasks=[]
-    mapping=[]
-    for idx,(_,addr,_) in enumerate(results):
-        for chain in ("eth","bsc"):
-            tasks.append(fetch_balance(session,addr,chain))
-            mapping.append((idx,chain))
-    pairs = await asyncio.gather(*tasks)
-    per_index=[{"eth":0.0,"bsc":0.0,"eth_status":"","bsc_status":""} for _ in results]
-    for (idx,chain),(bal,status) in zip(mapping,pairs):
-        per_index[idx][chain]=bal
-        per_index[idx][f"{chain}_status"]=status
-    for (mnemonic,address,privhex),info in zip(results,per_index):
-        eth_bal=info["eth"]
-        bsc_bal=info["bsc"]
-        print(f"{address} | ETH:{eth_bal:.18f} | BSC:{bsc_bal:.18f}")
-        print(f"RPC : eth {info['eth_status']} | bsc {info['bsc_status']}")
-        if eth_bal>0 or bsc_bal>0:
-            hits.append((mnemonic,address,privhex,eth_bal,bsc_bal))
-    return hits
-
-# ---------------- Main ----------------
-async def main_loop():
-    logging.info(f"START scanner: workers={WORKERS}, batch={BASE_BATCH_SIZE}")
-    executor = ThreadPoolExecutor(max_workers=WORKERS)
-    pending=set()
-    TARGET_IN_FLIGHT=max(4,WORKERS*2)
+async def check_balances(results):
+    global total_checked, BATCH_SIZE
     async with aiohttp.ClientSession() as session:
-        try:
-            while True:
-                while len(pending)<TARGET_IN_FLIGHT:
-                    fut=asyncio.get_event_loop().run_in_executor(executor,process_batch,BASE_BATCH_SIZE)
-                    pending.add(fut)
-                done,_=await asyncio.wait(pending,return_when=asyncio.FIRST_COMPLETED)
-                for fut in list(done):
-                    pending.discard(fut)
-                    try:
-                        results=fut.result()
-                    except Exception as e:
-                        logging.error("Batch error: %s",e)
-                        continue
-                    hits=await check_balances(results,session)
-                    for mnemonic,address,privhex,eth_bal,bsc_bal in hits:
-                        print_hit(mnemonic,address,privhex,eth_bal,bsc_bal)
-        except KeyboardInterrupt:
-            logging.info("STOP requested by user")
-        finally:
-            executor.shutdown(wait=False)
-            hits_fp.close()
+        tasks=[]
+        mapping=[]
+        for mnemonic,priv,addr in results:
+            for chain in ("eth","bsc"):
+                tasks.append(fetch_balance(session,addr,chain))
+                mapping.append((mnemonic,priv,addr,chain))
+        start_rpc = time.time()
+        res = await asyncio.gather(*tasks)
+        for (mnemonic,priv,addr,chain),(bal,status) in zip(mapping,res):
+            # Update counter & compute speed
+            async with lock:
+                total_checked += 1
+                elapsed = time.time() - start_time
+                speed = total_checked / elapsed if elapsed>0 else 0
+            bal_str = f"{bal}" if bal>0 else "0.0"
+            # Live print per address
+            print(f"{addr} | {chain.upper()} balance: {bal_str} | RPC: {status} | Speed: {speed:.2f} addr/sec")
+            if bal>0:
+                if chain=="eth":
+                    eth_bal=bal
+                    bsc_bal=0
+                else:
+                    eth_bal=0
+                    bsc_bal=bal
+                print_hit(mnemonic,priv,addr,eth_bal,bsc_bal)
+        # Dynamic batch adjustment
+        rpc_elapsed = time.time() - start_rpc
+        if rpc_elapsed < 0.8:  # RPC very fast → increase batch
+            BATCH_SIZE = min(BATCH_SIZE+50, 1000)
+        elif rpc_elapsed > 2.0:  # RPC slow → reduce batch
+            BATCH_SIZE = max(BATCH_SIZE-50, 100)
 
+# ---------------- BATCH GENERATION ----------------
+def generate_batch():
+    batch=[]
+    while len(batch)<BATCH_SIZE:
+        try:
+            m = generate_mnemonic()
+            priv,addr = derive_address(m)
+            batch.append((m,priv,addr))
+        except Exception:
+            continue
+    return batch
+
+# ---------------- MAIN LOOP ----------------
+async def main():
+    loop = asyncio.get_event_loop()
+    while True:
+        futures = [loop.run_in_executor(executor,generate_batch) for _ in range(WORKERS)]
+        results = await asyncio.gather(*futures)
+        flat = [item for sublist in results for item in sublist]
+        await check_balances(flat)
+
+# ---------------- ENTRY ----------------
 if __name__=="__main__":
     try:
-        asyncio.run(main_loop())
-    except Exception as e:
-        logging.error("Fatal error: %s\n%s",e,traceback.format_exc(limit=10))
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        hits_fp.close()
